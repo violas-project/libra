@@ -9,18 +9,22 @@
 //! In our current system design, the Consensus actor informs the ConnectivityManager of
 //! eligible nodes, and the Discovery actor infroms it about updates to addresses of eligible
 //! nodes.
+//!
+//! When dialing a peer with a given list of addresses, we attempt each address
+//! in order with a capped exponential backoff delay until we eventually connect
+//! to the peer.
 use crate::{
     common::NetworkPublicKeys,
-    peer_manager::{PeerManagerError, PeerManagerNotification, PeerManagerRequestSender},
+    peer_manager::{self, conn_status_channel, PeerManagerError, PeerManagerRequestSender},
 };
 use channel;
 use futures::{
     channel::oneshot,
-    compat::Future01CompatExt,
     future::{BoxFuture, FutureExt},
     stream::{FusedStream, FuturesUnordered, Stream, StreamExt},
 };
-use logger::prelude::*;
+use libra_logger::prelude::*;
+use libra_types::PeerId;
 use parity_multiaddr::Multiaddr;
 use std::{
     cmp::min,
@@ -29,16 +33,21 @@ use std::{
     sync::{Arc, RwLock},
     time::{Duration, Instant},
 };
-use tokio::timer;
-use types::PeerId;
+use tokio::time;
 
 #[cfg(test)]
 mod test;
 
 /// The ConnectivityManager actor.
-pub struct ConnectivityManager<TTicker, TSubstream, TBackoff> {
+pub struct ConnectivityManager<TTicker, TBackoff> {
     /// Nodes which are eligible to join the network.
     eligible: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
+    /// For some networks, we need an initial set of seed peers to bootstrap from.
+    /// `ConnectivityManager` will attempt to connect to these seed peers on
+    /// startup. Even after receiving fresher information on peer addresses, we
+    /// will still use these configured seed addresses, just as the lowest
+    /// priority backup when attemping to connect.
+    seed_peers: HashMap<PeerId, Vec<Multiaddr>>,
     /// PeerId and address of remote peers to which this peer is connected.
     connected: HashMap<PeerId, Multiaddr>,
     /// Addresses of peers received from Discovery module.
@@ -46,16 +55,17 @@ pub struct ConnectivityManager<TTicker, TSubstream, TBackoff> {
     /// Ticker to trigger connectivity checks to provide the guarantees stated above.
     ticker: TTicker,
     /// Channel to send requests to PeerManager.
-    peer_mgr_reqs_tx: PeerManagerRequestSender<TSubstream>,
+    peer_mgr_reqs_tx: PeerManagerRequestSender,
     /// Channel to receive notifications from PeerManager.
-    peer_mgr_notifs_rx: channel::Receiver<PeerManagerNotification<TSubstream>>,
+    control_notifs_rx: conn_status_channel::Receiver,
     /// Channel over which we receive requests from other actors.
     requests_rx: channel::Receiver<ConnectivityRequest>,
     /// Peers queued to be dialed, potentially with some delay. The dial can be cancelled by
     /// sending over (or dropping) the associated oneshot sender.
     dial_queue: HashMap<PeerId, oneshot::Sender<()>>,
-    /// Tracks status of backoff strategy for connection attempts for each peer.
-    dial_backoffs: HashMap<PeerId, TBackoff>,
+    /// The state of any currently executing dials. Used to keep track of what
+    /// the next dial delay and dial address should be for a given peer.
+    dial_states: HashMap<PeerId, DialState<TBackoff>>,
     /// Backoff strategy.
     backoff_strategy: TBackoff,
     /// Maximum delay b/w 2 consecutive attempts to connect with a disconnected peer.
@@ -83,35 +93,56 @@ enum DialResult {
     Failed(PeerManagerError),
 }
 
-impl<TTicker, TSubstream, TBackoff> ConnectivityManager<TTicker, TSubstream, TBackoff>
+/// The state needed to compute the next dial delay and dial addr for a given
+/// peer.
+#[derive(Debug, Clone)]
+struct DialState<TBackoff> {
+    /// The current state of this peer's backoff delay.
+    backoff: TBackoff,
+    /// The index of the next address to dial. Index of an address in the peer's
+    /// `peer_addresses` entry.
+    addr_idx: usize,
+}
+
+impl<TTicker, TBackoff> ConnectivityManager<TTicker, TBackoff>
 where
     TTicker: Stream + FusedStream + Unpin + 'static,
-    TSubstream: Debug + Send + 'static,
     TBackoff: Iterator<Item = Duration> + Clone,
 {
     /// Creates a new instance of the [`ConnectivityManager`] actor.
     pub fn new(
+        self_peer_id: PeerId,
         eligible: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
+        seed_peers: HashMap<PeerId, Vec<Multiaddr>>,
         ticker: TTicker,
-        peer_mgr_reqs_tx: PeerManagerRequestSender<TSubstream>,
-        peer_mgr_notifs_rx: channel::Receiver<PeerManagerNotification<TSubstream>>,
+        peer_mgr_reqs_tx: PeerManagerRequestSender,
+        control_notifs_rx: conn_status_channel::Receiver,
         requests_rx: channel::Receiver<ConnectivityRequest>,
         backoff_strategy: TBackoff,
         max_delay_ms: u64,
     ) -> Self {
+        // Ensure seed peers doesn't contain our own address (we want to avoid
+        // pointless self-dials).
+        let peer_addresses = seed_peers
+            .clone()
+            .into_iter()
+            .filter(|(peer_id, _)| *peer_id != self_peer_id)
+            .collect::<HashMap<PeerId, _>>();
+
         Self {
             eligible,
+            seed_peers,
             connected: HashMap::new(),
-            peer_addresses: HashMap::new(),
+            peer_addresses,
             ticker,
             peer_mgr_reqs_tx,
-            peer_mgr_notifs_rx,
+            control_notifs_rx,
             requests_rx,
-            dial_backoffs: HashMap::new(),
             dial_queue: HashMap::new(),
-            event_id: 0,
+            dial_states: HashMap::new(),
             backoff_strategy,
             max_delay_ms,
+            event_id: 0,
         }
     }
 
@@ -124,6 +155,12 @@ where
         // 3. Notifications from PeerManager when we establish a new connection or lose an existing
         //    connection with a peer.
         let mut pending_dials = FuturesUnordered::new();
+
+        // When we first startup, let's attempt to connect with our seed peers.
+        info!("Connecting to {} seed peers...", self.seed_peers.len());
+        self.check_connectivity(&mut pending_dials).await;
+
+        trace!("Starting connection manager");
         loop {
             self.event_id += 1;
             ::futures::select! {
@@ -135,9 +172,9 @@ where
                     trace!("Event Id: {}, type: ConnectivityRequest, req: {:?}", self.event_id, req);
                     self.handle_request(req);
                 },
-                notif = self.peer_mgr_notifs_rx.select_next_some() => {
-                    trace!("Event Id: {}, type: PeerManagerNotification, notif: {:?}", self.event_id, notif);
-                    self.handle_peer_mgr_notification(notif);
+                notif = self.control_notifs_rx.select_next_some() => {
+                    trace!("Event Id: {}, type: peer_manager::ConnectionStatusNotification, notif: {:?}", self.event_id, notif);
+                    self.handle_control_notification(notif);
                 },
                 peer_id = pending_dials.select_next_some() => {
                     trace!("Event Id: {}, type: Dial complete, peer: {}", self.event_id, peer_id.short_str());
@@ -151,6 +188,11 @@ where
         }
     }
 
+    /// Disconnect from all peers that are no longer eligible.
+    ///
+    /// For instance, a validator might leave the validator set after a
+    /// reconfiguration. If we are currently connected to this validator, calling
+    /// this function will close our connection to it.
     async fn close_stale_connections(&mut self) {
         let eligible = self.eligible.read().unwrap().clone();
         let stale_connections: Vec<_> = self
@@ -172,6 +214,11 @@ where
         }
     }
 
+    /// Cancel all pending dials to peers that are no longer eligible.
+    ///
+    /// For instance, a validator might leave the validator set after a
+    /// reconfiguration. If there is a pending dial to this validator, calling
+    /// this function will remove it from the dial queue.
     async fn cancel_stale_dials(&mut self) {
         let eligible = self.eligible.read().unwrap().clone();
         let stale_dials: Vec<_> = self
@@ -193,12 +240,14 @@ where
         let to_connect: Vec<_> = self
             .peer_addresses
             .iter()
-            .filter(|(peer_id, _)| {
-                eligible.contains_key(peer_id)
-                    && self.connected.get(peer_id).is_none()
-                    && self.dial_queue.get(peer_id).is_none()
+            .filter(|(peer_id, addrs)| {
+                eligible.contains_key(peer_id)  // The node is eligible to be dialed.
+                    && self.connected.get(peer_id).is_none() // The node is not already connected.
+                    && self.dial_queue.get(peer_id).is_none() // There is no pending dial to this node.
+                    && !addrs.is_empty() // There is an address to dial.
             })
             .collect();
+
         // We tune max delay depending on the number of peers to which we're not connected. This
         // ensures that if we're disconnected from a large fraction of peers, we keep the retry
         // window smaller.
@@ -211,42 +260,55 @@ where
                             .filter(|(peer_id, _)| self.peer_addresses.contains_key(peer_id))
                             .count() as f64))) as u64,
         );
-        let default_backoff_strategy = self.backoff_strategy.clone();
+
+        // The initial dial state; it has zero dial delay and uses the first
+        // address.
+        let init_dial_state = DialState::new(self.backoff_strategy.clone());
+
         for (p, addrs) in to_connect.into_iter() {
-            info!(
-                "Should be connected to peer: {} at addr(s): {:?}",
-                p.short_str(),
-                addrs,
-            );
             let mut peer_mgr_reqs_tx = self.peer_mgr_reqs_tx.clone();
             let peer_id = *p;
-            let addr = addrs[0].clone();
-            let (cancel_tx, cancel_rx) = oneshot::channel();
+            let dial_state = self
+                .dial_states
+                .entry(peer_id)
+                .or_insert_with(|| init_dial_state.clone());
+
+            // Choose the next addr to dial for this peer. Currently, we just
+            // round-robin the selection, i.e., try the sequence:
+            // addr[0], .., addr[len-1], addr[0], ..
+            let addr = dial_state.next_addr(&addrs).clone();
+
+            // Using the DialState's backoff strategy, compute the delay until
+            // the next dial attempt for this peer.
             let now = Instant::now();
-            let delay = timer::Delay::new(
-                now.checked_add(min(
-                    max_delay,
-                    self.dial_backoffs
-                        .entry(peer_id)
-                        .or_insert_with(|| default_backoff_strategy.clone())
-                        .next()
-                        .unwrap_or(max_delay),
-                ))
-                .unwrap_or_else(Instant::now),
+            let dial_delay = dial_state.next_backoff_delay(max_delay);
+            let f_delay = time::delay_for(dial_delay);
+
+            let (cancel_tx, cancel_rx) = oneshot::channel();
+
+            info!(
+                "Create dial future: peer: {}, at address: {}, after delay: {:?}",
+                peer_id.short_str(),
+                addr,
+                dial_delay,
             );
-            // Create future which completes by either dialing after calculated delay or on
-            // cancellation.
+
+            // Create future which completes by either dialing after calculated
+            // delay or on cancellation.
             let f = async move {
                 info!(
-                    "Will dial peer: {} after {:?}",
+                    "Dial future: dialing peer: {}, at address: {}, after delay: {:?}",
                     peer_id.short_str(),
-                    delay.deadline().duration_since(now)
+                    addr,
+                    f_delay
+                        .deadline()
+                        .duration_since(tokio::time::Instant::from_std(now))
                 );
                 // We dial after a delay. The dial can be cancelled by sending to or dropping
                 // `cancel_rx`.
                 let dial_result = ::futures::select! {
-                    _ = delay.compat().fuse() => {
-                        info!("Dialing peer: {} at address: {}", peer_id.short_str(), addr.clone());
+                    _ = f_delay.fuse() => {
+                        info!("Dialing peer: {}, at addr: {}", peer_id.short_str(), addr);
                         match peer_mgr_reqs_tx.dial_peer(peer_id, addr.clone()).await {
                             Ok(_) => DialResult::Success,
                             Err(e) => DialResult::Failed(e),
@@ -284,9 +346,18 @@ where
     fn handle_request(&mut self, req: ConnectivityRequest) {
         match req {
             ConnectivityRequest::UpdateAddresses(peer_id, addrs) => {
-                self.peer_addresses.insert(peer_id, addrs);
+                trace!(
+                    "Received updated addresses for peer: {}",
+                    peer_id.short_str()
+                );
+                self.update_peer_addrs(peer_id, addrs);
+                // Ensure that the next dial attempt starts from the first addr.
+                if let Some(dial_state) = self.dial_states.get_mut(&peer_id) {
+                    dial_state.reset_addr();
+                }
             }
             ConnectivityRequest::UpdateEligibleNodes(nodes) => {
+                trace!("Received updated list of eligible nodes",);
                 *self.eligible.write().unwrap() = nodes;
             }
             ConnectivityRequest::GetDialQueueSize(sender) => {
@@ -295,16 +366,28 @@ where
         }
     }
 
-    fn handle_peer_mgr_notification(&mut self, notif: PeerManagerNotification<TSubstream>) {
+    fn update_peer_addrs(&mut self, peer_id: PeerId, mut addrs: Vec<Multiaddr>) {
+        // Append any seed addresses for this peer as low-priority backups.
+        if let Some(seed_addrs) = self.seed_peers.get(&peer_id) {
+            for seed_addr in seed_addrs {
+                if !addrs.contains(seed_addr) {
+                    addrs.push(seed_addr.clone());
+                }
+            }
+        }
+
+        self.peer_addresses.insert(peer_id, addrs);
+    }
+
+    fn handle_control_notification(&mut self, notif: peer_manager::ConnectionStatusNotification) {
         match notif {
-            PeerManagerNotification::NewPeer(peer_id, addr) => {
+            peer_manager::ConnectionStatusNotification::NewPeer(peer_id, addr) => {
                 self.connected.insert(peer_id, addr);
-                // Remove status of backoff strategy for the connected peer.
-                self.dial_backoffs.remove(&peer_id);
                 // Cancel possible queued dial to this peer.
+                self.dial_states.remove(&peer_id);
                 self.dial_queue.remove(&peer_id);
             }
-            PeerManagerNotification::LostPeer(peer_id, addr) => {
+            peer_manager::ConnectionStatusNotification::LostPeer(peer_id, addr, _reason) => {
                 match self.connected.get(&peer_id) {
                     Some(curr_addr) if *curr_addr == addr => {
                         // Remove node from connected peers list.
@@ -318,9 +401,6 @@ where
                         );
                     }
                 }
-            }
-            _ => {
-                panic!("Received unexpected notification from peer manager");
             }
         }
     }
@@ -348,12 +428,39 @@ fn log_dial_result(peer_id: PeerId, addr: Multiaddr, dial_result: DialResult) {
             }
             e => {
                 info!(
-                    "Failed to connect to peer: {} at address: {}. Error: {:?}",
+                    "Failed to connect to peer: {} at address: {}; error: {}",
                     peer_id.short_str(),
                     addr,
                     e
                 );
             }
         },
+    }
+}
+
+impl<TBackoff> DialState<TBackoff>
+where
+    TBackoff: Iterator<Item = Duration> + Clone,
+{
+    fn new(backoff: TBackoff) -> Self {
+        Self {
+            backoff,
+            addr_idx: 0,
+        }
+    }
+
+    fn reset_addr(&mut self) {
+        self.addr_idx = 0;
+    }
+
+    fn next_addr<'a>(&mut self, addrs: &'a [Multiaddr]) -> &'a Multiaddr {
+        let addr_idx = self.addr_idx;
+        self.addr_idx = self.addr_idx.wrapping_add(1);
+
+        &addrs[addr_idx % addrs.len()]
+    }
+
+    fn next_backoff_delay(&mut self, max_delay: Duration) -> Duration {
+        min(max_delay, self.backoff.next().unwrap_or(max_delay))
     }
 }

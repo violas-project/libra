@@ -8,9 +8,8 @@
 //! `CompiledModule`.
 
 use crate::{file_format::*, file_format_common::*};
-use failure::*;
-use std::ops::Deref;
-use types::{account_address::AccountAddress, byte_array::ByteArray};
+use anyhow::{bail, Result};
+use libra_types::{account_address::AccountAddress, byte_array::ByteArray, identifier::Identifier};
 
 impl CompiledScript {
     /// Serializes a `CompiledScript` into a binary. The mutable `Vec<u8>` will contain the
@@ -80,7 +79,7 @@ struct CommonSerializer {
     type_signatures: (u32, u32),
     function_signatures: (u32, u32),
     locals_signatures: (u32, u32),
-    string_pool: (u32, u32),
+    identifiers: (u32, u32),
     address_pool: (u32, u32),
     byte_array_pool: (u32, u32),
 }
@@ -161,7 +160,7 @@ trait CommonTables {
     fn get_module_handles(&self) -> &[ModuleHandle];
     fn get_struct_handles(&self) -> &[StructHandle];
     fn get_function_handles(&self) -> &[FunctionHandle];
-    fn get_string_pool(&self) -> &[String];
+    fn get_identifiers(&self) -> &[Identifier];
     fn get_address_pool(&self) -> &[AccountAddress];
     fn get_byte_array_pool(&self) -> &[ByteArray];
     fn get_type_signatures(&self) -> &[TypeSignature];
@@ -182,8 +181,8 @@ impl CommonTables for CompiledScriptMut {
         &self.function_handles
     }
 
-    fn get_string_pool(&self) -> &[String] {
-        &self.string_pool
+    fn get_identifiers(&self) -> &[Identifier] {
+        &self.identifiers
     }
 
     fn get_address_pool(&self) -> &[AccountAddress] {
@@ -220,8 +219,8 @@ impl CommonTables for CompiledModuleMut {
         &self.function_handles
     }
 
-    fn get_string_pool(&self) -> &[String] {
-        &self.string_pool
+    fn get_identifiers(&self) -> &[Identifier] {
+        &self.identifiers
     }
 
     fn get_address_pool(&self) -> &[AccountAddress] {
@@ -249,7 +248,7 @@ impl CommonTables for CompiledModuleMut {
 ///
 /// A `ModuleHandle` gets serialized as follows:
 /// - `ModuleHandle.address` as a ULEB128 (index into the `AddressPool`)
-/// - `ModuleHandle.name` as a ULEB128 (index into the `StringPool`)
+/// - `ModuleHandle.name` as a ULEB128 (index into the `IdentifierPool`)
 fn serialize_module_handle(binary: &mut BinaryData, module_handle: &ModuleHandle) -> Result<()> {
     write_u16_as_uleb128(binary, module_handle.address.0)?;
     write_u16_as_uleb128(binary, module_handle.name.0)?;
@@ -260,20 +259,20 @@ fn serialize_module_handle(binary: &mut BinaryData, module_handle: &ModuleHandle
 ///
 /// A `StructHandle` gets serialized as follows:
 /// - `StructHandle.module` as a ULEB128 (index into the `ModuleHandle` table)
-/// - `StructHandle.name` as a ULEB128 (index into the `StringPool`)
-/// - `StructHandle.is_resource` as a 1 byte boolean (0 for false, 1 for true)
+/// - `StructHandle.name` as a ULEB128 (index into the `IdentifierPool`)
+/// - `StructHandle.is_nominal_resource` as a 1 byte boolean (0 for false, 1 for true)
 fn serialize_struct_handle(binary: &mut BinaryData, struct_handle: &StructHandle) -> Result<()> {
     write_u16_as_uleb128(binary, struct_handle.module.0)?;
     write_u16_as_uleb128(binary, struct_handle.name.0)?;
-    serialize_kind(binary, struct_handle.kind)?;
-    serialize_kinds(binary, &struct_handle.kind_constraints)
+    serialize_nominal_resource_flag(binary, struct_handle.is_nominal_resource)?;
+    serialize_kinds(binary, &struct_handle.type_formals)
 }
 
 /// Serializes a `FunctionHandle`.
 ///
 /// A `FunctionHandle` gets serialized as follows:
 /// - `FunctionHandle.module` as a ULEB128 (index into the `ModuleHandle` table)
-/// - `FunctionHandle.name` as a ULEB128 (index into the `StringPool`)
+/// - `FunctionHandle.name` as a ULEB128 (index into the `IdentifierPool`)
 /// - `FunctionHandle.signature` as a ULEB128 (index into the `FunctionSignaturePool`)
 fn serialize_function_handle(
     binary: &mut BinaryData,
@@ -285,7 +284,7 @@ fn serialize_function_handle(
     Ok(())
 }
 
-/// Serializes a `String`.
+/// Serializes a string (identifier or user string).
 ///
 /// A `String` gets serialized as follows:
 /// - `String` size as a ULEB128
@@ -369,7 +368,7 @@ fn serialize_struct_definition(
 ///
 /// A `FieldDefinition` gets serialized as follows:
 /// - `FieldDefinition.struct_` as a ULEB128 (index into the `StructHandle` table)
-/// - `StructDefinition.name` as a ULEB128 (index into the `StringPool` table)
+/// - `StructDefinition.name` as a ULEB128 (index into the `IdentifierPool` table)
 /// - `StructDefinition.signature` as a ULEB128 (index into the `TypeSignaturePool`)
 fn serialize_field_definition(
     binary: &mut BinaryData,
@@ -393,7 +392,28 @@ fn serialize_function_definition(
 ) -> Result<()> {
     write_u16_as_uleb128(binary, function_definition.function.0)?;
     binary.push(function_definition.flags)?;
+    serialize_struct_definition_indices(binary, &function_definition.acquires_global_resources)?;
     serialize_code_unit(binary, &function_definition.code)
+}
+
+/// Serializes a `Vec<StructDefinitionIndex>`.
+fn serialize_struct_definition_indices(
+    binary: &mut BinaryData,
+    indices: &[StructDefinitionIndex],
+) -> Result<()> {
+    let len = indices.len();
+    if len > u8::max_value() as usize {
+        bail!(
+            "acquires_global_resources size ({}) cannot exceed {}",
+            len,
+            u8::max_value(),
+        )
+    }
+    binary.push(len as u8)?;
+    for def_idx in indices {
+        write_u16_as_uleb128(binary, def_idx.0)?;
+    }
+    Ok(())
 }
 
 /// Serializes a `TypeSignature`.
@@ -419,7 +439,7 @@ fn serialize_function_signature(
     binary.push(SignatureType::FUNCTION_SIGNATURE as u8)?;
     serialize_signature_tokens(binary, &signature.return_types)?;
     serialize_signature_tokens(binary, &signature.arg_types)?;
-    serialize_kinds(binary, &signature.kind_constraints)
+    serialize_kinds(binary, &signature.type_formals)
 }
 
 /// Serializes a `LocalsSignature`.
@@ -456,10 +476,15 @@ fn serialize_signature_tokens(binary: &mut BinaryData, tokens: &[SignatureToken]
 fn serialize_signature_token(binary: &mut BinaryData, token: &SignatureToken) -> Result<()> {
     match token {
         SignatureToken::Bool => binary.push(SerializedType::BOOL as u8)?,
-        SignatureToken::U64 => binary.push(SerializedType::INTEGER as u8)?,
-        SignatureToken::String => binary.push(SerializedType::STRING as u8)?,
+        SignatureToken::U8 => binary.push(SerializedType::U8 as u8)?,
+        SignatureToken::U64 => binary.push(SerializedType::U64 as u8)?,
+        SignatureToken::U128 => binary.push(SerializedType::U128 as u8)?,
         SignatureToken::ByteArray => binary.push(SerializedType::BYTEARRAY as u8)?,
         SignatureToken::Address => binary.push(SerializedType::ADDRESS as u8)?,
+        SignatureToken::Vector(boxed_token) => {
+            binary.push(SerializedType::VECTOR as u8)?;
+            serialize_signature_token(binary, boxed_token)?;
+        }
         SignatureToken::Struct(idx, types) => {
             binary.push(SerializedType::STRUCT as u8)?;
             write_u16_as_uleb128(binary, idx.0)?;
@@ -467,11 +492,11 @@ fn serialize_signature_token(binary: &mut BinaryData, token: &SignatureToken) ->
         }
         SignatureToken::Reference(boxed_token) => {
             binary.push(SerializedType::REFERENCE as u8)?;
-            serialize_signature_token(binary, boxed_token.deref())?;
+            serialize_signature_token(binary, boxed_token)?;
         }
         SignatureToken::MutableReference(boxed_token) => {
             binary.push(SerializedType::MUTABLE_REFERENCE as u8)?;
-            serialize_signature_token(binary, boxed_token.deref())?;
+            serialize_signature_token(binary, boxed_token)?;
         }
         SignatureToken::TypeParameter(idx) => {
             binary.push(SerializedType::TYPE_PARAMETER as u8)?;
@@ -481,10 +506,23 @@ fn serialize_signature_token(binary: &mut BinaryData, token: &SignatureToken) ->
     Ok(())
 }
 
+fn serialize_nominal_resource_flag(
+    binary: &mut BinaryData,
+    is_nominal_resource: bool,
+) -> Result<()> {
+    binary.push(if is_nominal_resource {
+        SerializedNominalResourceFlag::NOMINAL_RESOURCE
+    } else {
+        SerializedNominalResourceFlag::NORMAL_STRUCT
+    } as u8)?;
+    Ok(())
+}
+
 fn serialize_kind(binary: &mut BinaryData, kind: Kind) -> Result<()> {
     binary.push(match kind {
+        Kind::All => SerializedKind::ALL,
         Kind::Resource => SerializedKind::RESOURCE,
-        Kind::Copyable => SerializedKind::COPYABLE,
+        Kind::Unrestricted => SerializedKind::UNRESTRICTED,
     } as u8)?;
     Ok(())
 }
@@ -510,14 +548,6 @@ fn serialize_code_unit(binary: &mut BinaryData, code: &CodeUnit) -> Result<()> {
     serialize_code(binary, &code.code)
 }
 
-/// Serializes a single `Bytecode` instruction into a vector
-pub(crate) fn serialize_instruction(binary: &mut Vec<u8>, opcode: &Bytecode) -> Result<()> {
-    let mut binary_data = BinaryData::from(binary.clone());
-    serialize_instruction_inner(&mut binary_data, opcode)?;
-    *binary = binary_data.into_inner();
-    Ok(())
-}
-
 /// Serializes a single `Bytecode` instruction.
 fn serialize_instruction_inner(binary: &mut BinaryData, opcode: &Bytecode) -> Result<()> {
     let res = match opcode {
@@ -536,10 +566,21 @@ fn serialize_instruction_inner(binary: &mut BinaryData, opcode: &Bytecode) -> Re
             binary.push(Opcodes::BRANCH as u8)?;
             write_u16(binary, *code_offset)
         }
-        Bytecode::LdConst(value) => {
-            binary.push(Opcodes::LD_CONST as u8)?;
+        Bytecode::LdU8(value) => {
+            binary.push(Opcodes::LD_U8 as u8)?;
+            binary.push(*value)
+        }
+        Bytecode::LdU64(value) => {
+            binary.push(Opcodes::LD_U64 as u8)?;
             write_u64(binary, *value)
         }
+        Bytecode::LdU128(value) => {
+            binary.push(Opcodes::LD_U128 as u8)?;
+            write_u128(binary, *value)
+        }
+        Bytecode::CastU8 => binary.push(Opcodes::CAST_U8 as u8),
+        Bytecode::CastU64 => binary.push(Opcodes::CAST_U64 as u8),
+        Bytecode::CastU128 => binary.push(Opcodes::CAST_U128 as u8),
         Bytecode::LdAddr(address_idx) => {
             binary.push(Opcodes::LD_ADDR as u8)?;
             write_u16_as_uleb128(binary, address_idx.0)
@@ -547,10 +588,6 @@ fn serialize_instruction_inner(binary: &mut BinaryData, opcode: &Bytecode) -> Re
         Bytecode::LdByteArray(byte_array_idx) => {
             binary.push(Opcodes::LD_BYTEARRAY as u8)?;
             write_u16_as_uleb128(binary, byte_array_idx.0)
-        }
-        Bytecode::LdStr(string_idx) => {
-            binary.push(Opcodes::LD_STR as u8)?;
-            write_u16_as_uleb128(binary, string_idx.0)
         }
         Bytecode::LdTrue => binary.push(Opcodes::LD_TRUE as u8),
         Bytecode::LdFalse => binary.push(Opcodes::LD_FALSE as u8),
@@ -566,12 +603,20 @@ fn serialize_instruction_inner(binary: &mut BinaryData, opcode: &Bytecode) -> Re
             binary.push(Opcodes::ST_LOC as u8)?;
             binary.push(*local_idx)
         }
-        Bytecode::BorrowLoc(local_idx) => {
-            binary.push(Opcodes::LD_REF_LOC as u8)?;
+        Bytecode::MutBorrowLoc(local_idx) => {
+            binary.push(Opcodes::MUT_BORROW_LOC as u8)?;
             binary.push(*local_idx)
         }
-        Bytecode::BorrowField(field_idx) => {
-            binary.push(Opcodes::LD_REF_FIELD as u8)?;
+        Bytecode::ImmBorrowLoc(local_idx) => {
+            binary.push(Opcodes::IMM_BORROW_LOC as u8)?;
+            binary.push(*local_idx)
+        }
+        Bytecode::MutBorrowField(field_idx) => {
+            binary.push(Opcodes::MUT_BORROW_FIELD as u8)?;
+            write_u16_as_uleb128(binary, field_idx.0)
+        }
+        Bytecode::ImmBorrowField(field_idx) => {
+            binary.push(Opcodes::IMM_BORROW_FIELD as u8)?;
             write_u16_as_uleb128(binary, field_idx.0)
         }
         Bytecode::Call(method_idx, types_idx) => {
@@ -599,6 +644,8 @@ fn serialize_instruction_inner(binary: &mut BinaryData, opcode: &Bytecode) -> Re
         Bytecode::BitOr => binary.push(Opcodes::BIT_OR as u8),
         Bytecode::BitAnd => binary.push(Opcodes::BIT_AND as u8),
         Bytecode::Xor => binary.push(Opcodes::XOR as u8),
+        Bytecode::Shl => binary.push(Opcodes::SHL as u8),
+        Bytecode::Shr => binary.push(Opcodes::SHR as u8),
         Bytecode::Or => binary.push(Opcodes::OR as u8),
         Bytecode::And => binary.push(Opcodes::AND as u8),
         Bytecode::Not => binary.push(Opcodes::NOT as u8),
@@ -618,12 +665,16 @@ fn serialize_instruction_inner(binary: &mut BinaryData, opcode: &Bytecode) -> Re
             write_u16_as_uleb128(binary, class_idx.0)?;
             write_u16_as_uleb128(binary, types_idx.0)
         }
-        Bytecode::BorrowGlobal(class_idx, types_idx) => {
-            binary.push(Opcodes::BORROW_REF as u8)?;
+        Bytecode::MutBorrowGlobal(class_idx, types_idx) => {
+            binary.push(Opcodes::MUT_BORROW_GLOBAL as u8)?;
             write_u16_as_uleb128(binary, class_idx.0)?;
             write_u16_as_uleb128(binary, types_idx.0)
         }
-        Bytecode::ReleaseRef => binary.push(Opcodes::RELEASE_REF as u8),
+        Bytecode::ImmBorrowGlobal(class_idx, types_idx) => {
+            binary.push(Opcodes::IMM_BORROW_GLOBAL as u8)?;
+            write_u16_as_uleb128(binary, class_idx.0)?;
+            write_u16_as_uleb128(binary, types_idx.0)
+        }
         Bytecode::MoveFrom(class_idx, types_idx) => {
             binary.push(Opcodes::MOVE_FROM as u8)?;
             write_u16_as_uleb128(binary, class_idx.0)?;
@@ -634,8 +685,6 @@ fn serialize_instruction_inner(binary: &mut BinaryData, opcode: &Bytecode) -> Re
             write_u16_as_uleb128(binary, class_idx.0)?;
             write_u16_as_uleb128(binary, types_idx.0)
         }
-        Bytecode::CreateAccount => binary.push(Opcodes::CREATE_ACCOUNT as u8),
-        Bytecode::EmitEvent => binary.push(Opcodes::EMIT_EVENT as u8),
         Bytecode::GetTxnSequenceNumber => binary.push(Opcodes::GET_TXN_SEQUENCE_NUMBER as u8),
         Bytecode::GetTxnPublicKey => binary.push(Opcodes::GET_TXN_PUBLIC_KEY as u8),
     };
@@ -679,7 +728,7 @@ impl CommonSerializer {
             type_signatures: (0, 0),
             function_signatures: (0, 0),
             locals_signatures: (0, 0),
-            string_pool: (0, 0),
+            identifiers: (0, 0),
             address_pool: (0, 0),
             byte_array_pool: (0, 0),
         }
@@ -693,7 +742,10 @@ impl CommonSerializer {
         binary.push(self.table_count)?;
 
         let start_offset;
-        if let Some(table_count_op) = self.table_count.checked_mul(9) {
+        if let Some(table_count_op) = self
+            .table_count
+            .checked_mul(BinaryConstants::TABLE_HEADER_SIZE)
+        {
             if let Some(checked_start_offset) =
                 check_index_in_binary(binary.len())?.checked_add(u32::from(table_count_op))
             {
@@ -757,10 +809,10 @@ impl CommonSerializer {
         )?;
         checked_serialize_table(
             binary,
-            TableType::STRING_POOL,
-            self.string_pool.0,
+            TableType::IDENTIFIERS,
+            self.identifiers.0,
             start_offset,
-            self.string_pool.1,
+            self.identifiers.1,
         )?;
         checked_serialize_table(
             binary,
@@ -784,13 +836,15 @@ impl CommonSerializer {
         binary: &mut BinaryData,
         tables: &T,
     ) -> Result<()> {
+        verify!(self.table_count == 0); // Should not be necessary, but it helps MIRAI right now
         self.serialize_module_handles(binary, tables.get_module_handles())?;
         self.serialize_struct_handles(binary, tables.get_struct_handles())?;
         self.serialize_function_handles(binary, tables.get_function_handles())?;
         self.serialize_type_signatures(binary, tables.get_type_signatures())?;
         self.serialize_function_signatures(binary, tables.get_function_signatures())?;
+        verify!(self.table_count < 6); // Should not be necessary, but it helps MIRAI right now
         self.serialize_locals_signatures(binary, tables.get_locals_signatures())?;
-        self.serialize_strings(binary, tables.get_string_pool())?;
+        self.serialize_identifiers(binary, tables.get_identifiers())?;
         self.serialize_addresses(binary, tables.get_address_pool())?;
         self.serialize_byte_arrays(binary, tables.get_byte_array_pool())?;
         Ok(())
@@ -848,15 +902,20 @@ impl CommonSerializer {
         Ok(())
     }
 
-    /// Serializes `StringPool`.
-    fn serialize_strings(&mut self, binary: &mut BinaryData, strings: &[String]) -> Result<()> {
-        if !strings.is_empty() {
+    /// Serializes `Identifiers`.
+    fn serialize_identifiers(
+        &mut self,
+        binary: &mut BinaryData,
+        identifiers: &[Identifier],
+    ) -> Result<()> {
+        if !identifiers.is_empty() {
             self.table_count += 1;
-            self.string_pool.0 = check_index_in_binary(binary.len())?;
-            for string in strings {
-                serialize_string(binary, string)?;
+            self.identifiers.0 = check_index_in_binary(binary.len())?;
+            for identifier in identifiers {
+                // User strings and identifiers use the same serialization.
+                serialize_string(binary, identifier.as_str())?;
             }
-            self.string_pool.1 = checked_calculate_table_size(binary, self.string_pool.0)?;;
+            self.identifiers.1 = checked_calculate_table_size(binary, self.identifiers.0)?;
         }
         Ok(())
     }
@@ -873,7 +932,7 @@ impl CommonSerializer {
             for byte_array in byte_arrays {
                 serialize_byte_array(binary, byte_array)?;
             }
-            self.byte_array_pool.1 = checked_calculate_table_size(binary, self.byte_array_pool.0)?;;
+            self.byte_array_pool.1 = checked_calculate_table_size(binary, self.byte_array_pool.0)?;
         }
         Ok(())
     }
@@ -925,7 +984,7 @@ impl CommonSerializer {
                 serialize_function_signature(binary, signature)?;
             }
             self.function_signatures.1 =
-                checked_calculate_table_size(binary, self.function_signatures.0)?;;
+                checked_calculate_table_size(binary, self.function_signatures.0)?;
         }
         Ok(())
     }
