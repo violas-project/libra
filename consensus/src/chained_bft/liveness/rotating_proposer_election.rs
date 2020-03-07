@@ -1,10 +1,10 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::chained_bft::{
+use crate::chained_bft::liveness::proposer_election::ProposerElection;
+use consensus_types::{
+    block::Block,
     common::{Author, Payload, Round},
-    consensus_types::proposal_msg::ProposalMsg,
-    liveness::proposer_election::ProposerElection,
 };
 
 /// The rotating proposer maps a round to an author according to a round-robin rotation.
@@ -16,6 +16,14 @@ pub struct RotatingProposer {
     // Number of contiguous rounds (i.e. round numbers increase by 1) a proposer is active
     // in a row
     contiguous_rounds: u32,
+}
+
+/// Choose a proposer that is going to be the single leader (relevant for a mock fixed proposer
+/// election only).
+pub fn choose_leader(peers: Vec<Author>) -> Author {
+    // As it is just a tmp hack function, pick the min PeerId to be a proposer.
+    // TODO: VRF will be integrated later.
+    peers.into_iter().min().expect("No trusted peers found!")
 }
 
 impl RotatingProposer {
@@ -46,14 +54,18 @@ impl<T: Payload> ProposerElection<T> for RotatingProposer {
         vec![self.get_proposer(round)]
     }
 
-    fn process_proposal(&self, proposal: ProposalMsg<T>) -> Option<ProposalMsg<T>> {
+    fn process_proposal(&mut self, proposal: Block<T>) -> Option<Block<T>> {
         // This is a simple rotating proposer, the proposal is processed in the context of the
         // caller task, no synchronization required because there is no mutable state.
-        let round_author = self.get_proposer(proposal.proposal.round());
-        if round_author != proposal.proposer() {
+        let round_author = self.get_proposer(proposal.round());
+        if Some(round_author) != proposal.author() {
             None
         } else {
             Some(proposal)
         }
+    }
+
+    fn take_backup_proposal(&mut self, _round: Round) -> Option<Block<T>> {
+        None
     }
 }

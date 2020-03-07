@@ -3,13 +3,13 @@ locals {
   dns_suffix = var.append_workspace_dns ? ".${terraform.workspace}" : ""
 }
 
-resource "aws_route53_record" "prometheus" {
+resource "aws_route53_record" "monitoring" {
   count   = local.zone_id == "" ? 0 : 1
   zone_id = local.zone_id
   name    = "prometheus${local.dns_suffix}"
   type    = "A"
   ttl     = 60
-  records = [aws_instance.prometheus.public_ip]
+  records = [aws_instance.monitoring.public_ip]
 }
 
 resource "aws_lb" "validator-ac" {
@@ -27,7 +27,7 @@ resource "aws_lb_target_group" "validator-ac" {
 }
 
 resource "aws_lb_target_group_attachment" "validator-ac" {
-  count            = length(var.peer_ids)
+  count            = var.cluster_test ? 0 : var.num_validators
   target_group_arn = aws_lb_target_group.validator-ac.arn
   target_id        = element(aws_instance.validator.*.id, count.index)
 }
@@ -40,6 +40,30 @@ resource "aws_lb_listener" "validator-ac" {
   default_action {
     type             = "forward"
     target_group_arn = aws_lb_target_group.validator-ac.arn
+  }
+}
+
+resource "aws_lb_target_group" "fullnode-ac" {
+  name     = "${terraform.workspace}-fullnode"
+  protocol = "TCP"
+  port     = 8000
+  vpc_id   = aws_vpc.testnet.id
+}
+
+resource "aws_lb_target_group_attachment" "fullnode-ac" {
+  count            = var.num_fullnodes
+  target_group_arn = aws_lb_target_group.fullnode-ac.arn
+  target_id        = element(aws_instance.fullnode.*.id, count.index)
+}
+
+resource "aws_lb_listener" "fullnode-ac" {
+  load_balancer_arn = aws_lb.validator-ac.arn
+  port              = 8001
+  protocol          = "TCP"
+
+  default_action {
+    type             = "forward"
+    target_group_arn = aws_lb_target_group.fullnode-ac.arn
   }
 }
 

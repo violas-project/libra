@@ -13,14 +13,14 @@ use proptest::{
 #[derive(Clone, Debug)]
 pub enum KindGen {
     Resource,
-    Copyable,
+    Unrestricted,
 }
 
 impl KindGen {
     pub fn strategy() -> impl Strategy<Value = Self> {
         use KindGen::*;
 
-        static KINDS: &[KindGen] = &[Resource, Copyable];
+        static KINDS: &[KindGen] = &[Resource, Unrestricted];
 
         select(KINDS)
     }
@@ -28,7 +28,7 @@ impl KindGen {
     pub fn materialize(self) -> Kind {
         match self {
             KindGen::Resource => Kind::Resource,
-            KindGen::Copyable => Kind::Copyable,
+            KindGen::Unrestricted => Kind::Unrestricted,
         }
     }
 }
@@ -37,24 +37,25 @@ impl KindGen {
 pub struct FunctionSignatureGen {
     return_types: Vec<SignatureTokenGen>,
     arg_types: Vec<SignatureTokenGen>,
-    kind_constraints: Vec<KindGen>,
+    type_formals: Vec<KindGen>,
 }
 
 impl FunctionSignatureGen {
     pub fn strategy(
         return_count: impl Into<SizeRange>,
         arg_count: impl Into<SizeRange>,
-        kind_count: impl Into<SizeRange>,
+        _kind_count: impl Into<SizeRange>,
     ) -> impl Strategy<Value = Self> {
         (
             vec(SignatureTokenGen::strategy(), return_count),
             vec(SignatureTokenGen::strategy(), arg_count),
-            vec(KindGen::strategy(), kind_count),
+            // TODO: re-enable type formals once we rework prop tests for generics
+            vec(KindGen::strategy(), 0),
         )
-            .prop_map(|(return_types, arg_types, kind_constraints)| Self {
+            .prop_map(|(return_types, arg_types, type_formals)| Self {
                 return_types,
                 arg_types,
-                kind_constraints,
+                type_formals,
             })
     }
 
@@ -64,8 +65,8 @@ impl FunctionSignatureGen {
                 .collect(),
             arg_types: SignatureTokenGen::map_materialize(self.arg_types, struct_handles_len)
                 .collect(),
-            kind_constraints: self
-                .kind_constraints
+            type_formals: self
+                .type_formals
                 .into_iter()
                 .map(KindGen::materialize)
                 .collect(),
@@ -78,7 +79,6 @@ pub enum SignatureTokenGen {
     // Atomic signature tokens.
     Bool,
     Integer,
-    String,
     ByteArray,
     Address,
     TypeParameter(PropIndex),
@@ -119,8 +119,7 @@ impl SignatureTokenGen {
     pub fn owned_non_struct_strategy() -> impl Strategy<Value = Self> {
         use SignatureTokenGen::*;
 
-        static OWNED_NON_STRUCTS: &[SignatureTokenGen] =
-            &[Bool, Integer, String, ByteArray, Address];
+        static OWNED_NON_STRUCTS: &[SignatureTokenGen] = &[Bool, Integer, ByteArray, Address];
 
         select(OWNED_NON_STRUCTS)
     }
@@ -154,7 +153,6 @@ impl SignatureTokenGen {
         match self {
             Bool => SignatureToken::Bool,
             Integer => SignatureToken::U64,
-            String => SignatureToken::String,
             ByteArray => SignatureToken::ByteArray,
             Address => SignatureToken::Address,
             Struct(idx, types) => SignatureToken::Struct(

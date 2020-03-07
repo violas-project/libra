@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::account_address::{AccountAddress, ADDRESS_LENGTH};
-use crypto::HashValue;
-use failure::Error;
-use nextgen_crypto::{test_utils::TEST_SEED, *};
+use anyhow::Error;
+use libra_crypto::{test_utils::TEST_SEED, HashValue, *};
 use rand::{rngs::StdRng, SeedableRng};
 use std::convert::TryFrom;
 
@@ -12,7 +11,7 @@ use std::convert::TryFrom;
 /// validating. This struct can be used for all signing operations including block and network
 /// signing, respectively.
 #[derive(Debug)]
-#[cfg_attr(any(test, feature = "testing"), derive(Clone))]
+#[cfg_attr(any(test, feature = "fuzzing"), derive(Clone))]
 pub struct ValidatorSigner<PrivateKey: SigningKey> {
     author: AccountAddress,
     public_key: PrivateKey::VerifyingKeyMaterial,
@@ -41,15 +40,6 @@ impl<PrivateKey: SigningKey> ValidatorSigner<PrivateKey> {
         Ok(self.private_key.sign_message(&message))
     }
 
-    /// Checks that `signature` is valid for `message` using `public_key`.
-    pub fn verify_message(
-        &self,
-        message: HashValue,
-        signature: &<PrivateKey::VerifyingKeyMaterial as VerifyingKey>::SignatureMaterial,
-    ) -> Result<(), Error> {
-        signature.verify(&message, &self.public_key)
-    }
-
     /// Returns the author associated with this signer.
     pub fn author(&self) -> AccountAddress {
         self.author
@@ -58,6 +48,12 @@ impl<PrivateKey: SigningKey> ValidatorSigner<PrivateKey> {
     /// Returns the public key associated with this signer.
     pub fn public_key(&self) -> PrivateKey::VerifyingKeyMaterial {
         self.public_key.clone()
+    }
+
+    /// Returns the private key associated with this signer. Only available for testing purposes.
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub fn private_key(&self) -> &PrivateKey {
+        &self.private_key
     }
 }
 
@@ -91,11 +87,11 @@ impl<PrivateKey: SigningKey + Uniform> ValidatorSigner<PrivateKey> {
     }
 }
 
-#[cfg(any(test, feature = "testing"))]
+#[cfg(any(test, feature = "fuzzing"))]
 pub mod proptests {
     use super::*;
     #[cfg(test)]
-    use nextgen_crypto::ed25519::*;
+    use libra_crypto::ed25519::*;
     use proptest::{prelude::*, sample, strategy::LazyJust};
 
     #[allow(clippy::redundant_closure)]
@@ -150,12 +146,5 @@ pub mod proptests {
             prop_assert_eq!(public_key, signer.public_key());
         }
 
-        #[test]
-        fn test_signer(signer in arb_signer::<Ed25519PrivateKey>(), message in HashValue::arbitrary()) {
-            let signature = signer.sign_message(message).unwrap();
-            prop_assert!(signer
-                         .verify_message(message, &signature)
-                         .is_ok());
-        }
     }
 }

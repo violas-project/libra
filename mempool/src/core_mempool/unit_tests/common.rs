@@ -1,32 +1,28 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    core_mempool::{CoreMempool, TimelineState, TxnPointer},
-    proto::shared::mempool_status::MempoolAddTransactionStatusCode,
+use crate::core_mempool::{CoreMempool, TimelineState, TxnPointer};
+use anyhow::{format_err, Result};
+use libra_config::config::NodeConfig;
+use libra_crypto::ed25519::*;
+use libra_mempool_shared_proto::proto::mempool_status::MempoolAddTransactionStatusCode;
+use libra_types::{
+    account_address::AccountAddress,
+    transaction::{RawTransaction, Script, SignedTransaction},
 };
-use config::config::NodeConfigHelpers;
-use failure::prelude::*;
-use lazy_static::lazy_static;
-use nextgen_crypto::ed25519::*;
+use once_cell::sync::Lazy;
 use rand::{rngs::StdRng, SeedableRng};
 use std::{collections::HashSet, iter::FromIterator};
-use types::{
-    account_address::AccountAddress,
-    transaction::{Program, RawTransaction, SignedTransaction},
-};
 
 pub(crate) fn setup_mempool() -> (CoreMempool, ConsensusMock) {
     (
-        CoreMempool::new(&NodeConfigHelpers::get_single_node_test_config(true)),
+        CoreMempool::new(&NodeConfig::random()),
         ConsensusMock::new(),
     )
 }
 
-lazy_static! {
-    static ref ACCOUNTS: Vec<AccountAddress> =
-        vec![AccountAddress::random(), AccountAddress::random()];
-}
+static ACCOUNTS: Lazy<Vec<AccountAddress>> =
+    Lazy::new(|| vec![AccountAddress::random(), AccountAddress::random()]);
 
 #[derive(Clone)]
 pub struct TestTransaction {
@@ -70,10 +66,10 @@ impl TestTransaction {
         max_gas_amount: u64,
         exp_time: std::time::Duration,
     ) -> SignedTransaction {
-        let raw_txn = RawTransaction::new(
+        let raw_txn = RawTransaction::new_script(
             TestTransaction::get_address(self.address),
             self.sequence_number,
-            Program::new(vec![], vec![], vec![]),
+            Script::new(vec![], vec![]),
             max_gas_amount,
             self.gas_price,
             exp_time,
@@ -119,6 +115,18 @@ pub(crate) fn add_signed_txn(pool: &mut CoreMempool, transaction: SignedTransact
         MempoolAddTransactionStatusCode::Valid => Ok(()),
         _ => Err(format_err!("insertion failure")),
     }
+}
+
+pub(crate) fn batch_add_signed_txn(
+    pool: &mut CoreMempool,
+    transactions: Vec<SignedTransaction>,
+) -> Result<()> {
+    for txn in transactions.into_iter() {
+        if let Err(e) = add_signed_txn(pool, txn) {
+            return Err(e);
+        }
+    }
+    Ok(())
 }
 
 // helper struct that keeps state between `.get_block` calls. Imitates work of Consensus

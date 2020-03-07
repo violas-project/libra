@@ -1,6 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
+#![forbid(unsafe_code)]
+
 //! `Semaphore` holds a set of permits. Permits are used to synchronize access
 //! to a shared resource. Before accessing the shared resource, callers must
 //! acquire a permit from the semaphore. Once the permit is acquired, the caller
@@ -16,14 +18,10 @@
 //! could potentially deadlock the futures runtime if enough tasks are waiting on
 //! the semaphore.
 
-#![feature(async_await)]
-
-use futures01::{future::Future as Future01, Async as Async01, Poll as Poll01};
-use futures03::compat::Future01CompatExt;
 use std::sync::Arc;
-use tokio_sync::semaphore::{AcquireError, Permit as TokioPermit, Semaphore as TokioSemaphore};
+use tokio::sync::Semaphore as TokioSemaphore;
 
-/// The wrapped tokio_sync [`Semaphore`](TokioSemaphore) and total permit capacity.
+/// The wrapped tokio [`Semaphore`](TokioSemaphore) and total permit capacity.
 #[derive(Debug)]
 struct Inner {
     semaphore: TokioSemaphore,
@@ -41,7 +39,6 @@ pub struct Semaphore {
 #[derive(Debug)]
 pub struct Permit {
     inner: Arc<Inner>,
-    permit: TokioPermit,
 }
 
 impl Semaphore {
@@ -71,99 +68,62 @@ impl Semaphore {
         self.available_permits() == 0
     }
 
-    /// Acquire an available permit from the semaphore, blocking until none are
-    /// available.
+    /// Acquire an available permit from the semaphore.
+    ///
+    /// If there are no permits currently available, the future will wait until
+    /// a permit is released back to the semaphore.
     pub async fn acquire(&self) -> Permit {
-        let permit = Permit {
-            inner: Arc::clone(&self.inner),
-            permit: TokioPermit::new(),
-        };
+        // Acquire a permit and then immediately "forget" it (drop it without
+        // returning the permit to the pool of available permits). We will
+        // manually add a new permit when our `Permit` RAII guard is dropped.
+        //
+        // We do this instead of holding tokio's `SemaphorePermit` in the RAII
+        // guard due to lifetime issues--tokio's `SemaphorePermit` needs a
+        // direct reference to the `Semaphore`; however, we want to send our
+        // `Permit` to other tasks or threads, so we need an `Arc` to the
+        // semaphore so the permit doesn't outlive the semaphore.
+        let permit = self.inner.semaphore.acquire().await;
+        permit.forget();
 
-        PermitFuture01::new(permit)
-            .compat()
-            .await
-            // The TokioSemaphore is not dropped yet and our wrapper never calls
-            // .close(), so the TokioSemaphore can never be closed unless all
-            // references, including this &self, have been dropped.
-            .expect("TokioSemaphore is never closed")
+        Permit {
+            inner: Arc::clone(&self.inner),
+        }
     }
 
     /// Try to acquire an available permit from the semaphore. If no permits are
     /// available, return `None`.
     pub fn try_acquire(&self) -> Option<Permit> {
-        let mut permit = TokioPermit::new();
-        match permit.try_acquire(&self.inner.semaphore) {
-            Ok(()) => Some(Permit {
-                inner: Arc::clone(&self.inner),
-                permit,
-            }),
-            Err(err) => {
-                // The TokioSemaphore is not dropped yet and our wrapper never
-                // calls .close(), so the TokioSemaphore can never be closed
-                // unless all references, including this &self, have been
-                // dropped.
-                assert!(!err.is_closed());
-                assert!(err.is_no_permits());
-                None
+        match self.inner.semaphore.try_acquire() {
+            Ok(permit) => {
+                // See above comment in `Semaphore::acquire`.
+                permit.forget();
+                Some(Permit {
+                    inner: Arc::clone(&self.inner),
+                })
             }
+            Err(_) => None,
         }
-    }
-}
-
-impl Permit {
-    fn release(&mut self) {
-        self.permit.release(&self.inner.semaphore);
     }
 }
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        self.release();
-    }
-}
-
-struct PermitFuture01 {
-    permit: Option<Permit>,
-}
-
-impl PermitFuture01 {
-    fn new(permit: Permit) -> Self {
-        Self {
-            permit: Some(permit),
-        }
-    }
-}
-
-impl Future01 for PermitFuture01 {
-    type Item = Permit;
-    type Error = AcquireError;
-
-    fn poll(&mut self) -> Poll01<Self::Item, Self::Error> {
-        let mut permit = self.permit.take().unwrap();
-
-        match permit.permit.poll_acquire(&permit.inner.semaphore) {
-            Ok(Async01::Ready(())) => Ok(Async01::Ready(permit)),
-            Ok(Async01::NotReady) => {
-                self.permit = Some(permit);
-                Ok(Async01::NotReady)
-            }
-            Err(e) => Err(e),
-        }
+        self.inner.semaphore.add_permits(1);
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
-    use futures03::{
+    use futures::{
         executor::block_on,
-        future::{Future, FutureExt, TryFutureExt},
+        future::{Future, FutureExt},
     };
     use std::{
         sync::atomic::{AtomicU32, Ordering},
-        time::{Duration, Instant},
+        time::Duration,
     };
-    use tokio::{runtime::Runtime, timer::Delay};
+    use tokio::{runtime::Runtime, time::delay_for};
 
     #[test]
     fn basic_functionality_semaphore() {
@@ -197,9 +157,7 @@ mod test {
     }
 
     fn yield_task() -> impl Future<Output = ()> {
-        Delay::new(Instant::now() + Duration::from_millis(1))
-            .compat()
-            .map(|_| ())
+        delay_for(Duration::from_millis(1)).map(|_| ())
     }
 
     // spawn NUM_TASKS futures that acquire a common semaphore, ensuring that no
@@ -212,7 +170,7 @@ mod test {
         static COMPLETED_TASKS: AtomicU32 = AtomicU32::new(0);
         let semaphore = Semaphore::new(MAX_WORKERS as usize);
 
-        let mut rt = Runtime::new().unwrap();
+        let rt = Runtime::new().unwrap();
 
         for _ in 0..NUM_TASKS {
             let semaphore = semaphore.clone();
@@ -235,7 +193,7 @@ mod test {
 
                 // drop _permit and release access
             };
-            rt.spawn(f.boxed().unit_error().compat());
+            rt.spawn(f);
         }
 
         // spin until completed

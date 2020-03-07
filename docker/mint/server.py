@@ -24,13 +24,13 @@ def create_client():
         ac_port = os.environ['AC_PORT']
 
         print("Connecting to ac on: {}:{}".format(ac_host, ac_port))
-        cmd = "/opt/libra/bin/client --host {} --port {} -m {} -s {}".format(
+        cmd = "/opt/libra/bin/cli --host {} --port {} -m {}".format(
             ac_host,
             ac_port,
-            "/opt/libra/etc/mint.key",
-            "/opt/libra/etc/trusted_peers.config.toml")
+            "/opt/libra/etc/mint.key")
 
         application.client = pexpect.spawn(cmd)
+        application.client.delaybeforesend = 0.1
         application.client.expect("Please, input commands")
 
 
@@ -64,6 +64,7 @@ def send_transaction():
 
         application.client.sendline("a la")
         application.client.expect(r"sequence_number: ([0-9]+)", timeout=1)
+        application.client.terminate(True)
     except pexpect.exceptions.ExceptionPexpect:
         application.client.terminate(True)
         raise
