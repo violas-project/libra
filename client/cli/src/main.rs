@@ -11,7 +11,6 @@ use cli::{
     client_proxy::ClientProxy,
     commands::{get_commands, parse_cmd, report_error, Command},
 };
-use libra_logger::set_global_logger;
 use libra_types::waypoint::Waypoint;
 use rustyline::{config::CompletionType, error::ReadlineError, Config, Editor};
 use std::{
@@ -28,8 +27,8 @@ use structopt::StructOpt;
     about = "Libra client to connect to a specific validator"
 )]
 struct Args {
-    /// Admission Control port to connect to.
-    #[structopt(short = "p", long, default_value = "8000")]
+    /// JSON RPC port to connect to.
+    #[structopt(short = "p", long, default_value = "8080")]
     pub port: NonZeroU16,
     /// Host address/name to connect to.
     #[structopt(short = "a", long)]
@@ -72,7 +71,7 @@ struct Args {
 }
 
 fn main() {
-    let _logger = set_global_logger(false /* async */, None);
+    ::libra_logger::Logger::new().init();
     crash_handler::setup_panic_handler();
     let args = Args::from_args();
 
@@ -228,8 +227,8 @@ mod tests {
     #[test]
     fn test_args_port() {
         let args = Args::from_iter(&["test", "--host=h"]);
-        assert_eq!(args.port.get(), 8000);
-        assert_eq!(format!("{}:{}", args.host, args.port.get()), "h:8000");
+        assert_eq!(args.port.get(), 8080);
+        assert_eq!(format!("{}:{}", args.host, args.port.get()), "h:8080");
         let args = Args::from_iter(&["test", "--port=65535", "--host=h"]);
         assert_eq!(args.port.get(), 65535);
     }

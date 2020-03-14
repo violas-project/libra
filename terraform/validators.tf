@@ -135,7 +135,7 @@ locals {
 }
 
 resource "aws_ebs_snapshot" "restore_snapshot" {
-  count = var.restore_vol_id == "" ? 0 : 1
+  count     = var.restore_vol_id == "" ? 0 : 1
   volume_id = var.restore_vol_id
 
   tags = {
@@ -151,7 +151,7 @@ resource "aws_instance" "validator" {
     aws_subnet.testnet.*.id,
     count.index % length(data.aws_availability_zones.available.names),
   )
-  depends_on                  = [aws_main_route_table_association.testnet, aws_iam_role_policy_attachment.ecs_extra]
+  depends_on                  = [aws_main_route_table_association.testnet, aws_iam_role_policy.ecs_extra]
   vpc_security_group_ids      = [aws_security_group.validator.id]
   associate_public_ip_address = local.instance_public_ip
   key_name                    = aws_key_pair.libra.key_name
@@ -193,16 +193,17 @@ data "template_file" "ecs_task_definition" {
   template = file("templates/validator.json")
 
   vars = {
-    image              = local.image_repo
-    image_version      = local.image_version
-    cpu                = (var.enable_logstash ? local.cpu_by_instance[var.validator_type] - 584 : local.cpu_by_instance[var.validator_type]) - 512
-    mem                = (var.enable_logstash ? local.mem_by_instance[var.validator_type] - 1024 : local.mem_by_instance[var.validator_type]) - 256
-    cfg_base_config    = jsonencode(data.template_file.validator_config.rendered)
-    cfg_listen_addr    = var.validator_use_public_ip == true ? element(aws_instance.validator.*.public_ip, count.index) : element(aws_instance.validator.*.private_ip, count.index)
-    cfg_node_index     = count.index
-    cfg_num_validators = var.cfg_num_validators_override == 0 ? var.num_validators : var.cfg_num_validators_override
-    cfg_seed           = var.config_seed
-    cfg_seed_peer_ip   = local.seed_peer_ip
+    image                         = local.image_repo
+    image_version                 = local.image_version
+    cpu                           = (var.enable_logstash ? local.cpu_by_instance[var.validator_type] - 584 : local.cpu_by_instance[var.validator_type]) - 512
+    mem                           = (var.enable_logstash ? local.mem_by_instance[var.validator_type] - 1024 : local.mem_by_instance[var.validator_type]) - 256
+    cfg_base_config               = jsonencode(data.template_file.validator_config.rendered)
+    cfg_listen_addr               = var.validator_use_public_ip == true ? element(aws_instance.validator.*.public_ip, count.index) : element(aws_instance.validator.*.private_ip, count.index)
+    cfg_node_index                = count.index
+    cfg_num_validators            = var.cfg_num_validators_override == 0 ? var.num_validators : var.cfg_num_validators_override
+    cfg_num_validators_in_genesis = var.num_validators_in_genesis
+    cfg_seed                      = var.config_seed
+    cfg_seed_peer_ip              = local.seed_peer_ip
 
     cfg_fullnode_seed = count.index < var.num_fullnode_networks ? var.fullnode_seed : ""
     cfg_num_fullnodes = var.num_fullnodes

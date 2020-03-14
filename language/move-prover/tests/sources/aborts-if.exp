@@ -1,0 +1,77 @@
+Move prover returns: exiting with boogie verification errors
+error:  A postcondition might not hold on this return path.
+
+    ┌── tests/sources/aborts-if.move:15:9 ───
+    │
+ 15 │         aborts_if x <= y;
+    │         ^^^^^^^^^^^^^^^^^
+    │
+    =     at tests/sources/aborts-if.move:12:5: abort02 (entry)
+    =     at tests/sources/aborts-if.move:12:5: abort02 (exit)
+    =         x = <redacted>,
+    =         y = <redacted>
+
+error:  A postcondition might not hold on this return path.
+
+    ┌── tests/sources/aborts-if.move:38:9 ───
+    │
+ 38 │         aborts_if x <= y;
+    │         ^^^^^^^^^^^^^^^^^
+    │
+    =     at tests/sources/aborts-if.move:34:5: abort05 (entry)
+    =     at tests/sources/aborts-if.move:35:9: abort05
+    =         x = <redacted>,
+    =         y = <redacted>
+    =     at tests/sources/aborts-if.move:34:5: abort05 (exit)
+
+error:  A postcondition might not hold on this return path.
+
+    ┌── tests/sources/aborts-if.move:46:9 ───
+    │
+ 46 │         aborts_if x < y;
+    │         ^^^^^^^^^^^^^^^^
+    │
+    =     at tests/sources/aborts-if.move:42:5: abort06 (entry)
+    =     at tests/sources/aborts-if.move:43:9: abort06
+    =         x = <redacted>,
+    =         y = <redacted>
+    =     at tests/sources/aborts-if.move:42:5: abort06 (exit)
+
+error:  A postcondition might not hold on this return path.
+
+    ┌── tests/sources/aborts-if.move:54:9 ───
+    │
+ 54 │         aborts_if x <= y;
+    │         ^^^^^^^^^^^^^^^^^
+    │
+    =     at tests/sources/aborts-if.move:50:5: abort07 (entry)
+    =     at tests/sources/aborts-if.move:51:9: abort07
+    =         x = <redacted>,
+    =         y = <redacted>
+    =     at tests/sources/aborts-if.move:50:5: abort07 (exit)
+
+error:  A postcondition might not hold on this return path.
+
+    ┌── tests/sources/aborts-if.move:71:9 ───
+    │
+ 71 │         aborts_if x < y;
+    │         ^^^^^^^^^^^^^^^^
+    │
+    =     at tests/sources/aborts-if.move:67:5: abort09 (entry)
+    =     at tests/sources/aborts-if.move:68:9: abort09
+    =         x = <redacted>,
+    =         y = <redacted>
+    =     at tests/sources/aborts-if.move:67:5: abort09 (exit)
+
+error:  A postcondition might not hold on this return path.
+
+    ┌── tests/sources/aborts-if.move:80:9 ───
+    │
+ 80 │         aborts_if x < y;
+    │         ^^^^^^^^^^^^^^^^
+    │
+    =     at tests/sources/aborts-if.move:76:5: abort10 (entry)
+    =     at tests/sources/aborts-if.move:77:9: abort10
+    =         x = <redacted>,
+    =         y = <redacted>
+    =     at tests/sources/aborts-if.move:76:5: abort10 (exit)

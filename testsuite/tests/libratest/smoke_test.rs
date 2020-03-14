@@ -2,16 +2,17 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use cli::client_proxy::ClientProxy;
+use debug_interface::{libra_trace, node_debug_service::parse_events, NodeDebugClient};
 use libra_config::config::{NodeConfig, RoleType, VMPublishingOption};
 use libra_crypto::{ed25519::*, hash::CryptoHash, test_utils::KeyPair, SigningKey};
+use libra_json_rpc::views::{ScriptView, TransactionDataView};
 use libra_logger::prelude::*;
 use libra_swarm::swarm::{LibraNode, LibraSwarm};
 use libra_temppath::TempPath;
 use libra_types::{
-    account_address::AccountAddress,
+    account_address::{AccountAddress, AuthenticationKey},
     account_config::association_address,
     ledger_info::LedgerInfo,
-    transaction::{TransactionArgument, TransactionPayload},
     waypoint::Waypoint,
 };
 use num_traits::cast::FromPrimitive;
@@ -32,7 +33,7 @@ struct TestEnvironment {
 
 impl TestEnvironment {
     fn new(num_validators: usize) -> Self {
-        ::libra_logger::init_for_e2e_testing();
+        ::libra_logger::Logger::new().init();
         let mut template = NodeConfig::default();
         template.state_sync.chunk_limit = 2;
         template.vm_config.publishing_options = VMPublishingOption::Open;
@@ -112,7 +113,7 @@ impl TestEnvironment {
         panic!("Max out {} attempts to launch test swarm", num_attempts);
     }
 
-    fn get_ac_client(&self, port: u16, waypoint: Option<Waypoint>) -> ClientProxy {
+    fn get_json_rpc_client(&self, port: u16, waypoint: Option<Waypoint>) -> ClientProxy {
         let mnemonic_file_path = self
             .mnemonic_file
             .path()
@@ -140,8 +141,22 @@ impl TestEnvironment {
         node_index: usize,
         waypoint: Option<Waypoint>,
     ) -> ClientProxy {
-        let port = self.validator_swarm.get_ac_port(node_index);
-        self.get_ac_client(port, waypoint)
+        let port = self.validator_swarm.get_client_port(node_index);
+        self.get_json_rpc_client(port, waypoint)
+    }
+
+    fn get_validator_debug_interface_client(&self, node_index: usize) -> NodeDebugClient {
+        let port = self.validator_swarm.get_validators_debug_ports()[node_index];
+        NodeDebugClient::new("localhost", port)
+    }
+
+    #[allow(dead_code)]
+    fn get_validator_debug_interface_clients(&self) -> Vec<NodeDebugClient> {
+        self.validator_swarm
+            .get_validators_debug_ports()
+            .iter()
+            .map(|port| NodeDebugClient::new("localhost", *port))
+            .collect()
     }
 
     fn get_full_node_ac_client(
@@ -151,8 +166,8 @@ impl TestEnvironment {
     ) -> ClientProxy {
         match &self.full_node_swarm {
             Some(swarm) => {
-                let port = swarm.get_ac_port(node_index);
-                self.get_ac_client(port, waypoint)
+                let port = swarm.get_client_port(node_index);
+                self.get_json_rpc_client(port, waypoint)
             }
             None => {
                 panic!("Full Node swarm is not initialized");
@@ -308,6 +323,29 @@ fn test_concurrent_transfers_single_node() {
         Decimal::from_f64(21.0),
         Decimal::from_str(&client_proxy.get_balance(&["b", "1"]).unwrap()).ok()
     );
+}
+
+#[test]
+fn test_trace() {
+    let (swarm, mut client_proxy) = setup_swarm_and_client_proxy(1, 0);
+    let mut debug_client = swarm.get_validator_debug_interface_client(0);
+    client_proxy.create_next_account(false).unwrap();
+    client_proxy
+        .mint_coins(&["mintb", "0", "100"], true)
+        .unwrap();
+    client_proxy.create_next_account(false).unwrap();
+    client_proxy
+        .transfer_coins(&["t", "0", "1", "1"], false)
+        .unwrap();
+    let events = parse_events(
+        debug_client
+            .get_events()
+            .expect("Failed to get events")
+            .events,
+    );
+    let txn_node = format!("txn::{}::{}", association_address(), 1);
+    println!("Tracing {}", txn_node);
+    libra_trace::trace_node(&events[..], &txn_node);
 }
 
 #[test]
@@ -613,19 +651,25 @@ fn test_external_transaction_signer() {
     let public_key = key_pair.1;
 
     // create transfer parameters
-    let sender_address = AccountAddress::from_public_key(&public_key);
-    let receiver_address = client_proxy
+    let sender_auth_key = AuthenticationKey::from_public_key(&public_key);
+    let sender_address = sender_auth_key.derived_address();
+    let (receiver_address, receiver_auth_key_opt) = client_proxy
         .get_account_address_from_parameter(
             "1bfb3b36384dabd29e38b4a0eafd9797b75141bb007cea7943f8a4714d3d784a",
         )
         .unwrap();
+    assert!(
+        receiver_auth_key_opt.is_some(),
+        "Failed to look up receiver auth key from parameter"
+    );
+    let receiver_auth_key = receiver_auth_key_opt.unwrap();
     let amount = ClientProxy::convert_to_micro_libras("1").unwrap();
     let gas_unit_price = 123;
     let max_gas_amount = 1000;
 
     // mint to the sender address
     client_proxy
-        .mint_coins(&["mintb", &format!("{}", sender_address), "10"], true)
+        .mint_coins(&["mintb", &format!("{}", sender_auth_key), "10"], true)
         .unwrap();
 
     // prepare transfer transaction
@@ -638,6 +682,7 @@ fn test_external_transaction_signer() {
             sender_address,
             sequence_number,
             receiver_address,
+            receiver_auth_key.prefix().to_vec(),
             amount,
             Some(gas_unit_price),
             Some(max_gas_amount),
@@ -664,34 +709,40 @@ fn test_external_transaction_signer() {
             "false",
         ])
         .unwrap()
-        .unwrap()
-        .0;
-    let submitted_signed_txn = txn
-        .as_signed_user_txn()
-        .expect("Query should get user transaction.");
+        .unwrap();
 
-    assert_eq!(submitted_signed_txn.sender(), sender_address);
-    assert_eq!(submitted_signed_txn.sequence_number(), sequence_number);
-    assert_eq!(submitted_signed_txn.gas_unit_price(), gas_unit_price);
-    assert_eq!(submitted_signed_txn.max_gas_amount(), max_gas_amount);
-    match submitted_signed_txn.payload() {
-        TransactionPayload::Script(program) => match program.args().len() {
-            2 => match (&program.args()[0], &program.args()[1]) {
-                (
-                    TransactionArgument::Address(arg_receiver),
-                    TransactionArgument::U64(arg_amount),
-                ) => {
-                    assert_eq!(arg_receiver.clone(), receiver_address);
-                    assert_eq!(arg_amount.clone(), amount);
+    match txn.transaction {
+        TransactionDataView::UserTransaction {
+            sender: p_sender,
+            sequence_number: p_sequence_number,
+            gas_unit_price: p_gas_unit_price,
+            max_gas_amount: p_max_gas_amount,
+            script,
+            ..
+        } => {
+            assert_eq!(p_sender, sender_address.to_string());
+            assert_eq!(p_sequence_number, sequence_number);
+            assert_eq!(p_gas_unit_price, gas_unit_price);
+            assert_eq!(p_max_gas_amount, max_gas_amount);
+            match script {
+                ScriptView::PeerToPeer {
+                    receiver: p_receiver,
+                    amount: p_amount,
+                    arg_auth_key_prefix,
+                } => {
+                    assert_eq!(p_receiver, receiver_address.to_string());
+                    assert_eq!(p_amount, amount);
+                    assert_eq!(
+                        arg_auth_key_prefix
+                            .into_bytes()
+                            .expect("failed to turn key to bytes"),
+                        receiver_auth_key.prefix()
+                    );
                 }
-                _ => panic!(
-                    "The first argument for payment transaction must be recipient address \
-                     and the second argument must be amount."
-                ),
-            },
-            _ => panic!("Signed transaction payload arguments must have two arguments."),
-        },
-        _ => panic!("Signed transaction payload expected to be of struct Script"),
+                _ => panic!("Expected peer-to-peer script for user txn"),
+            }
+        }
+        _ => panic!("Query should get user transaction"),
     }
 }
 
@@ -710,6 +761,10 @@ fn test_full_node_basic_flow() {
     let mut validator_ac_client = env.get_validator_ac_client(1, None);
     let mut full_node_client = env.get_full_node_ac_client(1, None);
     let mut full_node_client_2 = env.get_full_node_ac_client(0, None);
+
+    // ensure the client has up-to-date sequence number after test_smoke_script(3 minting)
+    let sender_account = association_address();
+    full_node_client.wait_for_transaction(sender_account, 4);
     for idx in 0..3 {
         validator_ac_client.create_next_account(false).unwrap();
         full_node_client.create_next_account(false).unwrap();
@@ -724,7 +779,6 @@ fn test_full_node_basic_flow() {
         );
     }
 
-    let sender_account = association_address();
     // mint from full node and check both validator and full node have correct balance
     let account3 = validator_ac_client
         .create_next_account(false)
@@ -733,8 +787,6 @@ fn test_full_node_basic_flow() {
     full_node_client.create_next_account(false).unwrap();
     full_node_client_2.create_next_account(false).unwrap();
 
-    // ensure the client has up-to-date sequence number after test_smoke_script(3 minting)
-    full_node_client.wait_for_transaction(sender_account, 4);
     let sequence_reset = format!("sequence {} true", sender_account);
     let sequence_reset_command: Vec<_> = sequence_reset.split(' ').collect();
     full_node_client

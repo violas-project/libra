@@ -4,9 +4,11 @@
 use crate::{account::AccountData, executor::test_all_genesis, gas_costs};
 use libra_config::config::VMPublishingOption;
 use libra_types::{
-    account_address::AccountAddress, identifier::Identifier, transaction::TransactionStatus,
+    account_address::{AccountAddress, ADDRESS_LENGTH},
+    transaction::TransactionStatus,
     vm_error::StatusCode,
 };
+use move_core_types::identifier::Identifier;
 use vm::file_format::{
     empty_script, AddressPoolIndex, Bytecode, FunctionHandle, FunctionHandleIndex,
     FunctionSignatureIndex, IdentifierIndex, LocalsSignatureIndex, ModuleHandle, ModuleHandleIndex,
@@ -48,10 +50,10 @@ fn script_code_unverifiable() {
         // Check that numbers in store are correct.
         let gas = output.gas_used();
         let balance = 1_000_000 - gas;
-        let updated_sender = executor
-            .read_account_resource(sender.account())
+        let (updated_sender, updated_sender_balance) = executor
+            .read_account_info(sender.account())
             .expect("sender must exist");
-        assert_eq!(balance, updated_sender.balance());
+        assert_eq!(balance, updated_sender_balance.coin());
         assert_eq!(11, updated_sender.sequence_number());
     });
 }
@@ -66,7 +68,9 @@ fn script_non_existing_module_dep() {
         // create a bogus script
         let mut script = empty_script();
         // make a non existent external module
-        script.address_pool.push(AccountAddress::new([1u8; 32]));
+        script
+            .address_pool
+            .push(AccountAddress::new([1u8; ADDRESS_LENGTH]));
         script.identifiers.push(Identifier::new("module").unwrap());
         let module_handle = ModuleHandle {
             address: AddressPoolIndex((script.address_pool.len() - 1) as u16),
@@ -112,10 +116,10 @@ fn script_non_existing_module_dep() {
         // Check that numbers in store are correct.
         let gas = output.gas_used();
         let balance = 1_000_000 - gas;
-        let updated_sender = executor
-            .read_account_resource(sender.account())
+        let (updated_sender, updated_sender_balance) = executor
+            .read_account_info(sender.account())
             .expect("sender must exist");
-        assert_eq!(balance, updated_sender.balance());
+        assert_eq!(balance, updated_sender_balance.coin());
         assert_eq!(11, updated_sender.sequence_number());
     });
 }
@@ -130,7 +134,9 @@ fn script_non_existing_function_dep() {
         // create a bogus script
         let mut script = empty_script();
         // AddressUtil module
-        script.address_pool.push(AccountAddress::new([0u8; 32]));
+        script
+            .address_pool
+            .push(AccountAddress::new([0u8; ADDRESS_LENGTH]));
         script
             .identifiers
             .push(Identifier::new("AddressUtil").unwrap());
@@ -178,10 +184,10 @@ fn script_non_existing_function_dep() {
         // Check that numbers in store are correct.
         let gas = output.gas_used();
         let balance = 1_000_000 - gas;
-        let updated_sender = executor
-            .read_account_resource(sender.account())
+        let (updated_sender, updated_sender_balance) = executor
+            .read_account_info(sender.account())
             .expect("sender must exist");
-        assert_eq!(balance, updated_sender.balance());
+        assert_eq!(balance, updated_sender_balance.coin());
         assert_eq!(11, updated_sender.sequence_number());
     });
 }
@@ -196,7 +202,9 @@ fn script_bad_sig_function_dep() {
         // create a bogus script
         let mut script = empty_script();
         // AddressUtil module
-        script.address_pool.push(AccountAddress::new([0u8; 32]));
+        script
+            .address_pool
+            .push(AccountAddress::new([0u8; ADDRESS_LENGTH]));
         script
             .identifiers
             .push(Identifier::new("AddressUtil").unwrap());
@@ -246,10 +254,10 @@ fn script_bad_sig_function_dep() {
         // Check that numbers in store are correct.
         let gas = output.gas_used();
         let balance = 1_000_000 - gas;
-        let updated_sender = executor
-            .read_account_resource(sender.account())
+        let (updated_sender, updated_sender_balance) = executor
+            .read_account_info(sender.account())
             .expect("sender must exist");
-        assert_eq!(balance, updated_sender.balance());
+        assert_eq!(balance, updated_sender_balance.coin());
         assert_eq!(11, updated_sender.sequence_number());
     });
 }

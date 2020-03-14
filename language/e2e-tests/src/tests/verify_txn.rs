@@ -32,7 +32,7 @@ fn verify_signature() {
         executor.add_account_data(&sender);
         // Generate a new key pair to try and sign things with.
         let (private_key, _public_key) = compat::generate_keypair(None);
-        let program = encode_transfer_script(sender.address(), 100);
+        let program = encode_transfer_script(sender.address(), vec![], 100);
         let signed_txn = transaction_test_helpers::get_test_unchecked_txn(
             *sender.address(),
             0,
@@ -56,7 +56,7 @@ fn verify_reserved_sender() {
         executor.add_account_data(&sender);
         // Generate a new key pair to try and sign things with.
         let (private_key, public_key) = compat::generate_keypair(None);
-        let program = encode_transfer_script(sender.address(), 100);
+        let program = encode_transfer_script(sender.address(), vec![], 100);
         let signed_txn = transaction_test_helpers::get_test_signed_txn(
             CORE_CODE_ADDRESS,
             0,
@@ -418,7 +418,7 @@ pub fn test_no_publishing() {
         ",
     );
 
-    let random_module = compile_module_with_address(sender.address(), &module);
+    let random_module = compile_module_with_address(sender.address(), "file_name", &module);
     let txn = sender
         .account()
         .create_user_txn(random_module, 10, 100_000, 1);
@@ -461,7 +461,7 @@ pub fn test_open_publishing_invalid_address() {
         ",
     );
 
-    let random_module = compile_module_with_address(receiver.address(), &module);
+    let random_module = compile_module_with_address(receiver.address(), "file_name", &module);
     let txn = sender
         .account()
         .create_user_txn(random_module, 10, 100_000, 1);
@@ -512,7 +512,7 @@ pub fn test_open_publishing() {
         ",
     );
 
-    let random_module = compile_module_with_address(sender.address(), &program);
+    let random_module = compile_module_with_address(sender.address(), "file_name", &program);
     let txn = sender
         .account()
         .create_user_txn(random_module, 10, 100_000, 1);
@@ -546,7 +546,7 @@ fn test_dependency_fails_verification() {
         ..Compiler::default()
     };
     let module = compiler
-        .into_compiled_module(bad_module_code)
+        .into_compiled_module("file_name", bad_module_code)
         .expect("Failed to compile");
     executor.add_module(&module.self_id(), &module);
 
@@ -572,7 +572,9 @@ fn test_dependency_fails_verification() {
         )],
         ..Compiler::default()
     };
-    let script = compiler.into_script_blob(code).expect("Failed to compile");
+    let script = compiler
+        .into_script_blob("file_name", code)
+        .expect("Failed to compile");
     let txn = sender.account().create_user_txn(
         TransactionPayload::Script(Script::new(script, vec![])),
         10,

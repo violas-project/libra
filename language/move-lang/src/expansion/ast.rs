@@ -1,14 +1,15 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::parser::ast::{InvariantKind, SpecBlockTarget, SpecConditionKind};
 use crate::{
     parser::ast::{
-        BinOp, Field, FunctionName, FunctionVisibility, Kind, ModuleIdent, ModuleName, ResourceLoc,
-        StructName, UnaryOp, Value, Var,
+        BinOp, Field, FunctionName, FunctionVisibility, InvariantKind, Kind, ModuleIdent,
+        ModuleName, ResourceLoc, SpecBlockTarget, SpecConditionKind, StructName, UnaryOp, Value,
+        Var,
     },
     shared::{ast_debug::*, unique_map::UniqueMap, *},
 };
+use move_ir_types::location::*;
 use std::{
     collections::{BTreeMap, VecDeque},
     fmt,
@@ -30,6 +31,7 @@ pub struct Program {
 
 #[derive(Debug)]
 pub struct ModuleDefinition {
+    pub loc: Loc,
     pub uses: BTreeMap<ModuleIdent, Loc>,
     pub unused_aliases: Vec<ModuleIdent>,
     pub is_source_module: bool,
@@ -46,6 +48,7 @@ pub type Fields<T> = UniqueMap<Field, (usize, T)>;
 
 #[derive(Debug, PartialEq)]
 pub struct StructDefinition {
+    pub loc: Loc,
     pub resource_opt: ResourceLoc,
     pub type_parameters: Vec<(Name, Kind)>,
     pub fields: StructFields,
@@ -78,6 +81,7 @@ pub type FunctionBody = Spanned<FunctionBody_>;
 
 #[derive(PartialEq, Debug)]
 pub struct Function {
+    pub loc: Loc,
     pub visibility: FunctionVisibility,
     pub signature: FunctionSignature,
     pub acquires: Vec<ModuleAccess>,
@@ -310,6 +314,7 @@ impl AstDebug for Program {
 impl AstDebug for ModuleDefinition {
     fn ast_debug(&self, w: &mut AstWriter) {
         let ModuleDefinition {
+            loc: _loc,
             uses,
             unused_aliases,
             is_source_module,
@@ -360,6 +365,7 @@ impl AstDebug for (StructName, &StructDefinition) {
         let (
             name,
             StructDefinition {
+                loc: _loc,
                 resource_opt,
                 type_parameters,
                 fields,
@@ -446,6 +452,7 @@ impl AstDebug for (FunctionName, &Function) {
         let (
             name,
             Function {
+                loc: _loc,
                 visibility,
                 signature,
                 acquires,

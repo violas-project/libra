@@ -6,19 +6,16 @@ use bytecode_verifier::VerifiedModule;
 use criterion::Criterion;
 use libra_state_view::StateView;
 use libra_types::{
-    access_path::AccessPath,
-    account_address::AccountAddress,
-    identifier::{IdentStr, Identifier},
-    language_storage::ModuleId,
+    access_path::AccessPath, account_address::AccountAddress, language_storage::ModuleId,
 };
+use move_core_types::identifier::{IdentStr, Identifier};
 use move_lang::{shared::Address, to_bytecode::translate::CompiledUnit};
+use move_vm_runtime::MoveVM;
+use move_vm_state::{data_cache::BlockDataCache, execution_context::TransactionExecutionContext};
 use std::path::PathBuf;
 use vm::{
     gas_schedule::{CostTable, GasAlgebra, GasUnits},
     transaction_metadata::TransactionMetadata,
-};
-use vm_runtime::{
-    chain_state::TransactionExecutionContext, data_cache::BlockDataCache, move_vm::MoveVM,
 };
 
 /// Entry point for the bench, provide a function name to invoke in Module Bench in bench.move.
@@ -39,7 +36,7 @@ fn compile_module() -> VerifiedModule {
     let (_, mut modules) =
         move_lang::move_compile(&[s], &[], Some(Address::default())).expect("Error compiling...");
     match modules.remove(0) {
-        CompiledUnit::Module(_, module) => {
+        CompiledUnit::Module(_, module, _) => {
             VerifiedModule::new(module).expect("Cannot verify code in file")
         }
         _ => panic!("no module compiled, is the file empty?"),

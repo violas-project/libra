@@ -3,10 +3,7 @@
 
 use crate::chained_bft::{
     network::{NetworkReceivers, NetworkSender},
-    network_interface::{
-        ConsensusMsg, ConsensusNetworkEvents, ConsensusNetworkSender,
-        CONSENSUS_DIRECT_SEND_PROTOCOL, CONSENSUS_RPC_PROTOCOL,
-    },
+    network_interface::{ConsensusMsg, ConsensusNetworkEvents, ConsensusNetworkSender},
     test_utils::{self, consensus_runtime, placeholder_ledger_info},
 };
 use channel::{self, libra_channel, message_queues::QueueStyle};
@@ -22,7 +19,10 @@ use consensus_types::{
 use futures::{channel::mpsc, executor::block_on, SinkExt, StreamExt};
 use libra_types::{block_info::BlockInfo, PeerId};
 use network::{
-    peer_manager::{conn_status_channel, PeerManagerNotification, PeerManagerRequest},
+    peer_manager::{
+        conn_status_channel, ConnectionRequestSender, PeerManagerNotification, PeerManagerRequest,
+        PeerManagerRequestSender,
+    },
     protocols::rpc::InboundRpcRequest,
     ProtocolId,
 };
@@ -132,7 +132,7 @@ impl NetworkPlayground {
 
                     node_consensus_tx
                         .push(
-                            (src, ProtocolId::from_static(CONSENSUS_RPC_PROTOCOL)),
+                            (src, ProtocolId::ConsensusRpc),
                             PeerManagerNotification::RecvRpc(src, inbound_req),
                         )
                         .unwrap();
@@ -225,10 +225,7 @@ impl NetworkPlayground {
         };
 
         node_consensus_tx
-            .push(
-                (src, ProtocolId::from_static(CONSENSUS_DIRECT_SEND_PROTOCOL)),
-                msg_notif,
-            )
+            .push((src, ProtocolId::ConsensusDirectSend), msg_notif)
             .unwrap();
         msg_copy
     }
@@ -339,7 +336,6 @@ impl DropConfig {
         match net_req {
             PeerManagerRequest::SendMessage(dst, _) => self.0.get(src).unwrap().contains(&dst),
             PeerManagerRequest::SendRpc(dst, _) => self.0.get(src).unwrap().contains(&dst),
-            _ => true,
         }
     }
 
@@ -377,11 +373,17 @@ fn test_network_api() {
     for peer in &peers {
         let (network_reqs_tx, network_reqs_rx) =
             libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+        let (connection_reqs_tx, _) =
+            libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
         let (consensus_tx, consensus_rx) =
             libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
         let (conn_mgr_reqs_tx, conn_mgr_reqs_rx) = channel::new_test(8);
         let (_, conn_status_rx) = conn_status_channel::new();
-        let network_sender = ConsensusNetworkSender::new(network_reqs_tx, conn_mgr_reqs_tx);
+        let network_sender = ConsensusNetworkSender::new(
+            PeerManagerRequestSender::new(network_reqs_tx),
+            ConnectionRequestSender::new(connection_reqs_tx),
+            conn_mgr_reqs_tx,
+        );
         let network_events = ConsensusNetworkEvents::new(consensus_rx, conn_status_rx);
 
         playground.add_node(*peer, consensus_tx, network_reqs_rx, conn_mgr_reqs_rx);
@@ -448,11 +450,17 @@ fn test_rpc() {
     for peer in peers.iter() {
         let (network_reqs_tx, network_reqs_rx) =
             libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+        let (connection_reqs_tx, _) =
+            libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
         let (consensus_tx, consensus_rx) =
             libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
         let (conn_mgr_reqs_tx, conn_mgr_reqs_rx) = channel::new_test(8);
         let (_, conn_status_rx) = conn_status_channel::new();
-        let network_sender = ConsensusNetworkSender::new(network_reqs_tx, conn_mgr_reqs_tx);
+        let network_sender = ConsensusNetworkSender::new(
+            PeerManagerRequestSender::new(network_reqs_tx),
+            ConnectionRequestSender::new(connection_reqs_tx),
+            conn_mgr_reqs_tx,
+        );
         let network_events = ConsensusNetworkEvents::new(consensus_rx, conn_status_rx);
 
         playground.add_node(*peer, consensus_tx, network_reqs_rx, conn_mgr_reqs_rx);

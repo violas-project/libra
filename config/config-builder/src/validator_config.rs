@@ -8,10 +8,12 @@ use libra_config::{
         ConsensusType, NodeConfig, RemoteService, SafetyRulesBackend, SafetyRulesService,
         SeedPeersConfig, VaultConfig,
     },
-    generator,
+    generator::{self, ValidatorSwarm},
 };
 use libra_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
-use libra_types::transaction::Transaction;
+use libra_types::{
+    crypto_proxies::ValidatorSet, discovery_set::DiscoverySet, transaction::Transaction,
+};
 use parity_multiaddr::Multiaddr;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{collections::HashMap, net::SocketAddr};
@@ -26,6 +28,7 @@ pub struct ValidatorConfig {
     index: usize,
     listen: Multiaddr,
     nodes: usize,
+    nodes_in_genesis: Option<usize>,
     safety_rules_addr: Option<SocketAddr>,
     safety_rules_backend: Option<String>,
     safety_rules_host: Option<String>,
@@ -42,6 +45,7 @@ impl Default for ValidatorConfig {
             index: 0,
             listen: DEFAULT_LISTEN.parse::<Multiaddr>().unwrap(),
             nodes: 1,
+            nodes_in_genesis: None,
             safety_rules_addr: None,
             safety_rules_backend: None,
             safety_rules_host: None,
@@ -79,6 +83,11 @@ impl ValidatorConfig {
 
     pub fn nodes(&mut self, nodes: usize) -> &mut Self {
         self.nodes = nodes;
+        self
+    }
+
+    pub fn nodes_in_genesis(&mut self, nodes_in_genesis: Option<usize>) -> &mut Self {
+        self.nodes_in_genesis = nodes_in_genesis;
         self
     }
 
@@ -139,7 +148,7 @@ impl ValidatorConfig {
     }
 
     pub fn build_set(&self) -> Result<Vec<NodeConfig>> {
-        let (configs, _) = self.build_common(false)?;
+        let (configs, _) = self.build_common(false, false)?;
         Ok(configs)
     }
 
@@ -148,7 +157,11 @@ impl ValidatorConfig {
         faucet_key
     }
 
-    fn build_common(&self, randomize_ports: bool) -> Result<(Vec<NodeConfig>, Ed25519PrivateKey)> {
+    pub fn build_common(
+        &self,
+        randomize_service_ports: bool,
+        randomize_libranet_ports: bool,
+    ) -> Result<(Vec<NodeConfig>, Ed25519PrivateKey)> {
         ensure!(self.nodes > 0, Error::NonZeroNetwork);
         ensure!(
             self.index < self.nodes,
@@ -159,34 +172,47 @@ impl ValidatorConfig {
         );
 
         let (faucet_key, config_seed) = self.build_faucet();
-        let mut validator_swarm =
-            generator::validator_swarm(&self.template, self.nodes, config_seed, randomize_ports);
-
-        ensure!(
-            validator_swarm.nodes.len() == self.nodes,
-            Error::MissingConfigs {
-                found: validator_swarm.nodes.len()
-            }
+        let ValidatorSwarm {
+            mut nodes,
+            validator_set,
+            discovery_set,
+        } = generator::validator_swarm(
+            &self.template,
+            self.nodes,
+            config_seed,
+            randomize_service_ports,
+            randomize_libranet_ports,
         );
 
-        let validator_set = validator_swarm.validator_set.clone();
-        let discovery_set = vm_genesis::make_placeholder_discovery_set(&validator_set);
+        ensure!(
+            nodes.len() == self.nodes,
+            Error::MissingConfigs { found: nodes.len() }
+        );
+
+        // Optionally choose a limited subset of generated validators to be
+        // present at genesis time.
+        let nodes_in_genesis = self.nodes_in_genesis.unwrap_or(self.nodes);
+        let validator_set =
+            ValidatorSet::new(validator_set.into_iter().take(nodes_in_genesis).collect());
+        let discovery_set =
+            DiscoverySet::new(discovery_set.into_iter().take(nodes_in_genesis).collect());
 
         let genesis = Some(Transaction::UserTransaction(
             vm_genesis::encode_genesis_transaction_with_validator(
                 &faucet_key,
                 faucet_key.public_key(),
+                &nodes,
                 validator_set,
                 discovery_set,
             )
             .into_inner(),
         ));
 
-        for node in &mut validator_swarm.nodes {
+        for node in &mut nodes {
             node.execution.genesis = genesis.clone();
         }
 
-        Ok((validator_swarm.nodes, faucet_key))
+        Ok((nodes, faucet_key))
     }
 
     fn build_faucet(&self) -> (Ed25519PrivateKey, [u8; 32]) {
@@ -232,7 +258,7 @@ impl ValidatorConfig {
 
 impl BuildSwarm for ValidatorConfig {
     fn build_swarm(&self) -> Result<(Vec<NodeConfig>, Ed25519PrivateKey)> {
-        self.build_common(true)
+        self.build_common(true, true)
     }
 }
 

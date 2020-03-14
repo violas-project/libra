@@ -34,13 +34,13 @@ use crate::{
     connectivity_manager::ConnectivityRequest,
     counters,
     error::{NetworkError, NetworkErrorKind},
-    peer_manager::{PeerManagerRequest, PeerManagerRequestSender},
+    peer_manager::{ConnectionRequestSender, PeerManagerRequestSender},
     protocols::network::{Event, NetworkEvents, NetworkSender},
     validator_network::network_builder::NetworkBuilder,
     NetworkPublicKeys, ProtocolId,
 };
 use bytes::Bytes;
-use channel::{libra_channel, message_queues::QueueStyle};
+use channel::message_queues::QueueStyle;
 use futures::{
     sink::SinkExt,
     stream::{FusedStream, Stream, StreamExt},
@@ -68,8 +68,6 @@ use std::{
 #[cfg(test)]
 mod test;
 
-pub const DISCOVERY_DIRECT_SEND_PROTOCOL: &[u8] = b"/libra/direct-send/0.1.0/discovery/0.1.0";
-
 /// The interface from Network to Discovery module.
 ///
 /// `DiscoveryNetworkEvents` is a `Stream` of `PeerManagerNotification` where the
@@ -96,33 +94,34 @@ pub struct DiscoveryNetworkSender {
 pub fn add_to_network(
     network: &mut NetworkBuilder,
 ) -> (DiscoveryNetworkSender, DiscoveryNetworkEvents) {
-    let (sender, receiver, control_notifs_rx) = network.add_protocol_handler(
-        vec![],
-        vec![ProtocolId::from_static(DISCOVERY_DIRECT_SEND_PROTOCOL)],
-        QueueStyle::LIFO,
-        Some(&counters::PENDING_DISCOVERY_NETWORK_EVENTS),
-    );
+    let (sender, receiver, connection_reqs_tx, connection_notifs_rx) = network
+        .add_protocol_handler(
+            vec![],
+            vec![ProtocolId::DiscoveryDirectSend],
+            QueueStyle::LIFO,
+            Some(&counters::PENDING_DISCOVERY_NETWORK_EVENTS),
+        );
     (
-        DiscoveryNetworkSender::new(sender),
-        DiscoveryNetworkEvents::new(receiver, control_notifs_rx),
+        DiscoveryNetworkSender::new(sender, connection_reqs_tx),
+        DiscoveryNetworkEvents::new(receiver, connection_notifs_rx),
     )
 }
 
 impl DiscoveryNetworkSender {
     /// Create a new Discovery sender
-    pub fn new(inner: libra_channel::Sender<(PeerId, ProtocolId), PeerManagerRequest>) -> Self {
+    pub fn new(
+        peer_mgr_reqs_tx: PeerManagerRequestSender,
+        connection_reqs_tx: ConnectionRequestSender,
+    ) -> Self {
         Self {
-            inner: NetworkSender::new(PeerManagerRequestSender::new(inner)),
+            inner: NetworkSender::new(peer_mgr_reqs_tx, connection_reqs_tx),
         }
     }
 
     /// Send a DiscoveryMsg to a peer.
     pub fn send_to(&mut self, peer: PeerId, msg: DiscoveryMsg) -> Result<(), NetworkError> {
-        self.inner.send_to(
-            peer,
-            ProtocolId::from_static(DISCOVERY_DIRECT_SEND_PROTOCOL),
-            msg,
-        )
+        self.inner
+            .send_to(peer, ProtocolId::DiscoveryDirectSend, msg)
     }
 }
 

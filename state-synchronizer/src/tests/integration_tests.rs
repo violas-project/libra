@@ -6,7 +6,7 @@ use crate::{
     StateSynchronizer, SynchronizerState,
 };
 use anyhow::{bail, Result};
-use executor::ExecutedTrees;
+use executor_types::ExecutedTrees;
 use futures::executor::block_on;
 use libra_config::config::RoleType;
 use libra_crypto::{
@@ -16,13 +16,13 @@ use libra_crypto::{
     x25519,
     x25519::{X25519StaticPrivateKey, X25519StaticPublicKey},
 };
-use libra_logger::set_simple_logger;
 use libra_mempool::mocks::MockSharedMempool;
 use libra_types::{
     crypto_proxies::{
         random_validator_verifier, LedgerInfoWithSignatures, ValidatorChangeProof,
         ValidatorPublicKeys, ValidatorSet, ValidatorSigner,
     },
+    event_subscription::EventSubscription,
     proof::TransactionListProof,
     transaction::TransactionListWithProof,
     waypoint::Waypoint,
@@ -69,6 +69,7 @@ impl ExecutorProxyTrait for MockExecutorProxy {
         ledger_info_with_sigs: LedgerInfoWithSignatures,
         intermediate_end_of_epoch_li: Option<LedgerInfoWithSignatures>,
         _synced_trees: &mut ExecutedTrees,
+        _reconfig_event_subscriptions: &mut [Box<dyn EventSubscription>],
     ) -> Result<()> {
         self.storage.write().unwrap().add_txns_with_li(
             txn_list_with_proof.transactions,
@@ -204,7 +205,7 @@ impl SynchronizerEnv {
     }
 
     fn new(num_peers: usize) -> Self {
-        set_simple_logger("state-sync");
+        ::libra_logger::Logger::new().environment_only(true).init();
         let runtime = Runtime::new().unwrap();
         let (signers, network_signers, public_keys) = Self::initial_setup(num_peers);
         let peer_ids = signers.iter().map(|s| s.author()).collect::<Vec<PeerId>>();
@@ -304,6 +305,7 @@ impl SynchronizerEnv {
             waypoint,
             &config.state_sync,
             MockExecutorProxy::new(handler, storage_proxy.clone()),
+            vec![],
         );
         self.mempools
             .push(MockSharedMempool::new(Some(mempool_requests)));
@@ -336,7 +338,7 @@ impl SynchronizerEnv {
         // in commit()
         assert!(Runtime::new()
             .unwrap()
-            .block_on(self.clients[peer_id].commit(committed_txns))
+            .block_on(self.clients[peer_id].commit(committed_txns, vec![]))
             .is_ok());
         let mempool_txns = self.mempools[peer_id].read_timeline(0, signed_txns.len());
         for txn in signed_txns.iter() {

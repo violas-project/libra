@@ -51,7 +51,9 @@ use libra_types::{
         random_validator_verifier, LedgerInfoWithSignatures, ValidatorSigner, ValidatorVerifier,
     },
 };
-use network::peer_manager::conn_status_channel;
+use network::peer_manager::{
+    conn_status_channel, ConnectionRequestSender, PeerManagerRequestSender,
+};
 use safety_rules::{ConsensusState, PersistentSafetyStorage as SafetyStorage, SafetyRulesManager};
 use std::{collections::HashMap, num::NonZeroUsize, sync::Arc, time::Duration};
 use tokio::runtime::Handle;
@@ -120,26 +122,28 @@ impl NodeSetup {
         initial_data: RecoveryData<TestPayload>,
         safety_rules_manager: SafetyRulesManager<TestPayload>,
     ) -> Self {
-        let validators = initial_data.validators();
+        let epoch_info = initial_data.epoch_info();
+        let validators = epoch_info.verifier.clone();
         let (network_reqs_tx, network_reqs_rx) =
+            libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+        let (connection_reqs_tx, _) =
             libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
         let (consensus_tx, consensus_rx) =
             libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
         let (conn_mgr_reqs_tx, conn_mgr_reqs_rx) = channel::new_test(8);
         let (_, conn_status_rx) = conn_status_channel::new();
-        let network_sender = ConsensusNetworkSender::new(network_reqs_tx, conn_mgr_reqs_tx);
+        let network_sender = ConsensusNetworkSender::new(
+            PeerManagerRequestSender::new(network_reqs_tx),
+            ConnectionRequestSender::new(connection_reqs_tx),
+            conn_mgr_reqs_tx,
+        );
         let network_events = ConsensusNetworkEvents::new(consensus_rx, conn_status_rx);
         let author = signer.author();
 
         playground.add_node(author, consensus_tx, network_reqs_rx, conn_mgr_reqs_rx);
 
         let (self_sender, self_receiver) = channel::new_test(8);
-        let network = NetworkSender::new(
-            author,
-            network_sender,
-            self_sender,
-            initial_data.validators(),
-        );
+        let network = NetworkSender::new(author, network_sender, self_sender, validators.clone());
 
         let (task, _receiver) = NetworkTask::<TestPayload>::new(network_events, self_receiver);
 
@@ -176,6 +180,7 @@ impl NodeSetup {
         let proposer_election = Self::create_proposer_election(proposer_author);
 
         let mut event_processor = EventProcessor::new(
+            epoch_info,
             Arc::clone(&block_store),
             last_vote_sent,
             pacemaker,
@@ -186,7 +191,6 @@ impl NodeSetup {
             Box::new(MockTransactionManager::new(None)),
             storage.clone(),
             time_service,
-            validators.clone(),
         );
         block_on(event_processor.start());
         Self {

@@ -1,7 +1,9 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{error::Error, policy::Policy, storage::Storage, value::Value};
+use crate::{
+    error::Error, kv_storage::KVStorage, policy::Policy, value::Value, CryptoKVStorage, Storage,
+};
 use libra_temppath::TempPath;
 use std::{
     collections::HashMap,
@@ -10,12 +12,13 @@ use std::{
     path::PathBuf,
 };
 
-/// InMemoryStorage represents a key value store that is purely in memory and intended for single
-/// threads (or must be wrapped by a Arc<RwLock<>>). This provides no permission checks and simply
-/// is a proof of concept to unblock building of applications without more complex data stores.
-/// Internally, it retains all data, which means that it must make copies of all key material which
-/// violates the Libra code base. It violates it because the anticipation is that data stores would
-/// securely handle key material. This should not be used in production.
+/// OnDiskStorage represents a key value store that is persisted to the local filesystem and is
+/// intended for single threads (or must be wrapped by a Arc<RwLock<>>). This provides no permission
+/// checks and simply offers a proof of concept to unblock building of applications without more
+/// complex data stores. Internally, it reads and writes all data to a file, which means that it
+/// must make copies of all key material which violates the Libra code base. It violates it because
+/// the anticipation is that data stores would securely handle key material. This should not be used
+/// in production.
 pub struct OnDiskStorage {
     file_path: PathBuf,
     temp_path: TempPath,
@@ -54,9 +57,14 @@ impl OnDiskStorage {
         fs::rename(&self.temp_path, &self.file_path)?;
         Ok(())
     }
+
+    /// Public convenience function to return a new OnDiskStorage based Storage.
+    pub fn new_boxed_on_disk_storage(path_buf: PathBuf) -> Box<dyn Storage> {
+        Box::new(OnDiskStorage::new(path_buf))
+    }
 }
 
-impl Storage for OnDiskStorage {
+impl KVStorage for OnDiskStorage {
     fn available(&self) -> bool {
         true
     }
@@ -90,3 +98,5 @@ impl Storage for OnDiskStorage {
         self.write(&HashMap::new())
     }
 }
+
+impl CryptoKVStorage for OnDiskStorage {}

@@ -4,11 +4,11 @@
 //! Interface between StateSynchronizer and Network layers.
 
 use crate::{chunk_request::GetChunkRequest, chunk_response::GetChunkResponse, counters};
-use channel::{libra_channel, message_queues::QueueStyle};
+use channel::message_queues::QueueStyle;
 use libra_types::PeerId;
 use network::{
     error::NetworkError,
-    peer_manager::{PeerManagerRequest, PeerManagerRequestSender},
+    peer_manager::{ConnectionRequestSender, PeerManagerRequestSender},
     protocols::network::{NetworkEvents, NetworkSender},
     validator_network::network_builder::NetworkBuilder,
     ProtocolId,
@@ -21,10 +21,6 @@ pub enum StateSynchronizerMsg {
     GetChunkRequest(Box<GetChunkRequest>),
     GetChunkResponse(Box<GetChunkResponse>),
 }
-
-/// Protocol id for state-synchronizer direct-send calls
-pub const STATE_SYNCHRONIZER_DIRECT_SEND_PROTOCOL: &[u8] =
-    b"/libra/direct-send/0.1.0/state-synchronizer/0.1.0";
 
 /// The interface from Network to StateSynchronizer layer.
 ///
@@ -50,24 +46,26 @@ pub struct StateSynchronizerSender {
 pub fn add_to_network(
     network: &mut NetworkBuilder,
 ) -> (StateSynchronizerSender, StateSynchronizerEvents) {
-    let (sender, receiver, control_notifs_rx) = network.add_protocol_handler(
-        vec![],
-        vec![ProtocolId::from_static(
-            STATE_SYNCHRONIZER_DIRECT_SEND_PROTOCOL,
-        )],
-        QueueStyle::FIFO,
-        Some(&counters::PENDING_STATE_SYNCHRONIZER_NETWORK_EVENTS),
-    );
+    let (sender, receiver, connection_reqs_tx, connection_notifs_rx) = network
+        .add_protocol_handler(
+            vec![],
+            vec![ProtocolId::StateSynchronizerDirectSend],
+            QueueStyle::FIFO,
+            Some(&counters::PENDING_STATE_SYNCHRONIZER_NETWORK_EVENTS),
+        );
     (
-        StateSynchronizerSender::new(sender),
-        StateSynchronizerEvents::new(receiver, control_notifs_rx),
+        StateSynchronizerSender::new(sender, connection_reqs_tx),
+        StateSynchronizerEvents::new(receiver, connection_notifs_rx),
     )
 }
 
 impl StateSynchronizerSender {
-    pub fn new(inner: libra_channel::Sender<(PeerId, ProtocolId), PeerManagerRequest>) -> Self {
+    pub fn new(
+        peer_mgr_reqs_tx: PeerManagerRequestSender,
+        connection_reqs_tx: ConnectionRequestSender,
+    ) -> Self {
         Self {
-            inner: NetworkSender::new(PeerManagerRequestSender::new(inner)),
+            inner: NetworkSender::new(peer_mgr_reqs_tx, connection_reqs_tx),
         }
     }
 
@@ -76,7 +74,7 @@ impl StateSynchronizerSender {
         recipient: PeerId,
         message: StateSynchronizerMsg,
     ) -> Result<(), NetworkError> {
-        let protocol = ProtocolId::from_static(STATE_SYNCHRONIZER_DIRECT_SEND_PROTOCOL);
+        let protocol = ProtocolId::StateSynchronizerDirectSend;
         self.inner.send_to(recipient, protocol, message)
     }
 }

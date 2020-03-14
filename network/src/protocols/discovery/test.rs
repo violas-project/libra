@@ -3,7 +3,10 @@
 
 use super::*;
 use crate::{
-    peer_manager::{self, conn_status_channel, PeerManagerNotification, PeerManagerRequest},
+    peer_manager::{
+        self, conn_status_channel, ConnectionRequestSender, PeerManagerNotification,
+        PeerManagerRequest,
+    },
     protocols::direct_send::Message,
     ProtocolId,
 };
@@ -26,13 +29,13 @@ fn gen_peer_info() -> PeerInfo {
 
 fn get_raw_message(msg: DiscoveryMsg) -> Message {
     Message {
-        protocol: ProtocolId::from_static(DISCOVERY_DIRECT_SEND_PROTOCOL),
+        protocol: ProtocolId::DiscoveryDirectSend,
         mdata: lcs::to_bytes(&msg).unwrap().into(),
     }
 }
 
 fn parse_raw_message(msg: Message) -> Result<DiscoveryMsg, NetworkError> {
-    assert_eq!(msg.protocol, DISCOVERY_DIRECT_SEND_PROTOCOL);
+    assert_eq!(msg.protocol, ProtocolId::DiscoveryDirectSend);
     let msg: DiscoveryMsg = lcs::from_bytes(&msg.mdata)
         .map_err(|err| anyhow!(err).context(NetworkErrorKind::ParsingError))?;
     Ok(msg)
@@ -51,12 +54,14 @@ fn setup_discovery(
     conn_status_channel::Sender,
     channel::Sender<()>,
 ) {
-    let (network_reqs_tx, network_reqs_rx) =
+    let (peer_mgr_reqs_tx, peer_mgr_reqs_rx) =
+        libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(1).unwrap(), None);
+    let (connection_reqs_tx, _) =
         libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(1).unwrap(), None);
     let (conn_mgr_reqs_tx, conn_mgr_reqs_rx) = channel::new_test(1);
     let (network_notifs_tx, network_notifs_rx) =
         libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(1).unwrap(), None);
-    let (control_notifs_tx, control_notifs_rx) = conn_status_channel::new();
+    let (connection_notifs_tx, connection_notifs_rx) = conn_status_channel::new();
     let (ticker_tx, ticker_rx) = channel::new_test(0);
     let role = RoleType::Validator;
     let discovery = {
@@ -67,17 +72,20 @@ fn setup_discovery(
             signer,
             trusted_peers,
             ticker_rx,
-            DiscoveryNetworkSender::new(network_reqs_tx),
-            DiscoveryNetworkEvents::new(network_notifs_rx, control_notifs_rx),
+            DiscoveryNetworkSender::new(
+                PeerManagerRequestSender::new(peer_mgr_reqs_tx),
+                ConnectionRequestSender::new(connection_reqs_tx),
+            ),
+            DiscoveryNetworkEvents::new(network_notifs_rx, connection_notifs_rx),
             conn_mgr_reqs_tx,
         )
     };
     rt.spawn(discovery.start());
     (
-        network_reqs_rx,
+        peer_mgr_reqs_rx,
         conn_mgr_reqs_rx,
         network_notifs_tx,
-        control_notifs_tx,
+        connection_notifs_tx,
         ticker_tx,
     )
 }
@@ -114,7 +122,7 @@ fn generate_network_pub_keys_and_signer(peer_id: PeerId) -> (NetworkPublicKeys, 
 #[test]
 // Test behavior on receipt of an inbound DiscoveryMsg.
 fn inbound() {
-    ::libra_logger::try_init_for_testing();
+    ::libra_logger::Logger::new().environment_only(true).init();
     let mut rt = Runtime::new().unwrap();
 
     // Setup self.
@@ -162,10 +170,7 @@ fn inbound() {
         let msg = DiscoveryMsg {
             notes: vec![other_note],
         };
-        let msg_key = (
-            other_peer_id,
-            ProtocolId::from_static(DISCOVERY_DIRECT_SEND_PROTOCOL),
-        );
+        let msg_key = (other_peer_id, ProtocolId::DiscoveryDirectSend);
         let (delivered_tx, delivered_rx) = oneshot::channel();
         network_notifs_tx
             .push_with_feedback(
@@ -229,7 +234,7 @@ fn inbound() {
 #[test]
 // Test that discovery actor sends a DiscoveryMsg to a neighbor on receiving a clock tick.
 fn outbound() {
-    ::libra_logger::try_init_for_testing();
+    ::libra_logger::Logger::new().environment_only(true).init();
     let mut rt = Runtime::new().unwrap();
 
     // Setup self peer.
@@ -252,7 +257,7 @@ fn outbound() {
         mut network_reqs_rx,
         _conn_mgr_req_rx,
         _network_notifs_tx,
-        mut control_notifs_tx,
+        mut connection_notifs_tx,
         mut ticker_tx,
     ) = setup_discovery(&mut rt, peer_id, addrs.clone(), self_signer, trusted_peers);
 
@@ -260,7 +265,7 @@ fn outbound() {
     let f_network = async move {
         let (delivered_tx, delivered_rx) = oneshot::channel();
         // Notify discovery actor of connection to other peer.
-        control_notifs_tx
+        connection_notifs_tx
             .push_with_feedback(
                 other_peer_id,
                 peer_manager::ConnectionStatusNotification::NewPeer(
@@ -297,7 +302,7 @@ fn outbound() {
 
 #[test]
 fn old_note_higher_epoch() {
-    ::libra_logger::try_init_for_testing();
+    ::libra_logger::Logger::new().environment_only(true).init();
     let mut rt = Runtime::new().unwrap();
 
     // Setup self peer.
@@ -316,14 +321,14 @@ fn old_note_higher_epoch() {
     ));
 
     // Setup discovery.
-    let (mut network_reqs_rx, _, mut network_notifs_tx, mut control_notifs_tx, mut ticker_tx) =
+    let (mut network_reqs_rx, _, mut network_notifs_tx, mut connection_notifs_tx, mut ticker_tx) =
         setup_discovery(&mut rt, peer_id, addrs, self_signer.clone(), trusted_peers);
 
     // Fake connectivity manager and dialer.
     let f_network = async move {
         // Notify discovery actor of connection to other peer.
         let (delivered_tx, delivered_rx) = oneshot::channel();
-        control_notifs_tx
+        connection_notifs_tx
             .push_with_feedback(
                 other_peer_id,
                 peer_manager::ConnectionStatusNotification::NewPeer(
@@ -349,10 +354,7 @@ fn old_note_higher_epoch() {
         let msg = DiscoveryMsg {
             notes: vec![old_note],
         };
-        let msg_key = (
-            other_peer_id,
-            ProtocolId::from_static(DISCOVERY_DIRECT_SEND_PROTOCOL),
-        );
+        let msg_key = (other_peer_id, ProtocolId::DiscoveryDirectSend);
         let (delivered_tx, delivered_rx) = oneshot::channel();
         network_notifs_tx
             .push_with_feedback(
@@ -387,7 +389,7 @@ fn old_note_higher_epoch() {
 
 #[test]
 fn old_note_max_epoch() {
-    ::libra_logger::try_init_for_testing();
+    ::libra_logger::Logger::new().environment_only(true).init();
     let mut rt = Runtime::new().unwrap();
 
     // Setup self.
@@ -406,14 +408,14 @@ fn old_note_max_epoch() {
     ));
 
     // Setup discovery.
-    let (mut network_reqs_rx, _, mut network_notifs_tx, mut control_notifs_tx, mut ticker_tx) =
+    let (mut network_reqs_rx, _, mut network_notifs_tx, mut connection_notifs_tx, mut ticker_tx) =
         setup_discovery(&mut rt, peer_id, addrs, self_signer.clone(), trusted_peers);
 
     // Fake connectivity manager and dialer.
     let f_network = async move {
         // Notify discovery actor of connection to other peer.
         let (delivered_tx, delivered_rx) = oneshot::channel();
-        control_notifs_tx
+        connection_notifs_tx
             .push_with_feedback(
                 other_peer_id,
                 peer_manager::ConnectionStatusNotification::NewPeer(
@@ -438,10 +440,7 @@ fn old_note_max_epoch() {
         let msg = DiscoveryMsg {
             notes: vec![old_note],
         };
-        let msg_key = (
-            other_peer_id,
-            ProtocolId::from_static(DISCOVERY_DIRECT_SEND_PROTOCOL),
-        );
+        let msg_key = (other_peer_id, ProtocolId::DiscoveryDirectSend);
         let (delivered_tx, delivered_rx) = oneshot::channel();
         network_notifs_tx
             .push_with_feedback(

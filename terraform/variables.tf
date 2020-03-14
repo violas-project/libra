@@ -2,6 +2,11 @@ variable "region" {
   default = "us-west-2"
 }
 
+variable "iam_path" {
+  default     = "/testnet/"
+  description = "Path to use when naming IAM objects"
+}
+
 variable "ssh_pub_key" {
   type        = string
   description = "SSH public key for EC2 instance access"
@@ -48,6 +53,11 @@ variable "config_seed" {
 variable "num_validators" {
   default     = 4
   description = "Number of validator nodes to run on this network"
+}
+
+variable "num_validators_in_genesis" {
+  default     = 4
+  description = "Number of validator nodes to include in genesis blob"
 }
 
 # This allows you to use a override number of validators for config generation
@@ -186,4 +196,9 @@ variable "safety_rules_image_tag" {
 variable "restore_vol_id" {
   default     = ""
   description = "volume id to restore validator data from"
+}
+
+variable "permissions_boundary_policy" {
+  default     = ""
+  description = "ARN of IAM policy to set as permissions boundary on created roles"
 }

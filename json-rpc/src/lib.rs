@@ -17,10 +17,12 @@
 #[macro_use]
 mod util;
 
+mod client;
 mod methods;
 mod runtime;
-mod views;
+pub mod views;
 
+pub use client::{JsonRpcAsyncClient, JsonRpcBatch};
 pub use runtime::bootstrap_from_config;
 
 #[cfg(test)]

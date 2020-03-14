@@ -7,14 +7,14 @@ use crate::{aws::Aws, instance::Instance};
 use anyhow::{ensure, format_err, Result};
 use config_builder::ValidatorConfig;
 use generate_keypair::load_key_from_file;
-use libra_config::config::AdmissionControlConfig;
+use libra_config::config::DEFAULT_JSON_RPC_PORT;
 use libra_crypto::{
     ed25519::{Ed25519PrivateKey, Ed25519PublicKey},
     test_utils::KeyPair,
 };
+use libra_logger::*;
 use rand::prelude::*;
 use rusoto_ec2::{DescribeInstancesRequest, Ec2, Filter, Tag};
-use slog_scope::*;
 use std::{collections::HashMap, convert::TryInto, thread, time::Duration};
 
 #[derive(Clone)]
@@ -110,7 +110,7 @@ impl Cluster {
                 }
                 Ok(r) => r,
             };
-            let ac_port = AdmissionControlConfig::default().address.port() as u32;
+            let ac_port = DEFAULT_JSON_RPC_PORT as u32;
             for reservation in result.reservations.expect("no reservations") {
                 for aws_instance in reservation.instances.expect("no instances") {
                     let ip = aws_instance

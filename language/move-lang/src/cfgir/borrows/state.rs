@@ -13,6 +13,7 @@ use crate::{
     parser::ast::{Field, StructName, Var},
     shared::*,
 };
+use move_ir_types::location::*;
 
 use crate::shared::unique_map::UniqueMap;
 use borrow_graph::references::RefID;
@@ -27,7 +28,7 @@ enum Label {
 
 type BorrowGraph = borrow_graph::graph::BorrowGraph<Loc, Label>;
 
-#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Value {
     NonRef,
     Ref(RefID),

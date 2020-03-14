@@ -6,10 +6,11 @@ use crate::{
     expansion::ast::Fields,
     hlir::ast::{self as H, Block},
     naming::ast as N,
-    parser::ast::{BinOp_, Field, FunctionName, ModuleIdent, StructName, Var},
+    parser::ast::{BinOp_, Field, FunctionName, ModuleIdent, StructName, Value_, Var},
     shared::{unique_map::UniqueMap, *},
     typing::ast as T,
 };
+use move_ir_types::location::*;
 use std::collections::VecDeque;
 
 //**************************************************************************************************
@@ -164,6 +165,7 @@ fn module(
     mdef: T::ModuleDefinition,
 ) -> (ModuleIdent, H::ModuleDefinition) {
     let is_source_module = mdef.is_source_module;
+    let dependency_order = mdef.dependency_order;
 
     let structs = mdef.structs.map(|name, s| struct_def(context, name, s));
 
@@ -175,6 +177,7 @@ fn module(
         module_ident,
         H::ModuleDefinition {
             is_source_module,
+            dependency_order,
             structs,
             functions,
         },
@@ -660,6 +663,7 @@ fn exp_impl(context: &mut Context, result: &mut Block, e: T::Exp) -> H::Exp {
     use H::{Command_ as C, Statement_ as S, UnannotatedExp_ as HE};
     use T::UnannotatedExp_ as TE;
 
+    let tloc = e.ty.loc;
     let ty = type_(context, e.ty);
     let sp!(eloc, e_) = e.exp;
     let res = match e_ {
@@ -865,11 +869,13 @@ fn exp_impl(context: &mut Context, result: &mut Block, e: T::Exp) -> H::Exp {
             let e = exp(context, result, None, *te);
             HE::UnaryExp(op, e)
         }
+
         TE::BinopExp(tl, op @ sp!(_, BinOp_::Eq), toperand_ty, tr)
         | TE::BinopExp(tl, op @ sp!(_, BinOp_::Neq), toperand_ty, tr) => {
             let operand_ty = type_(context, *toperand_ty);
             let (el, er) = {
-                let tes = vec![(*tl, Some(operand_ty.clone())), (*tr, Some(operand_ty))];
+                let frozen_ty = freeze_ty(operand_ty);
+                let tes = vec![(*tl, Some(frozen_ty.clone())), (*tr, Some(frozen_ty))];
                 let mut es = exp_evaluation_order(context, result, tes);
                 assert!(es.len() == 2, "ICE exp_evaluation_order changed arity");
                 let er = es.pop().unwrap();
@@ -877,6 +883,36 @@ fn exp_impl(context: &mut Context, result: &mut Block, e: T::Exp) -> H::Exp {
                 (Box::new(el), Box::new(er))
             };
             HE::BinopExp(el, op, er)
+        }
+        TE::BinopExp(tl, op @ sp!(_, BinOp_::And), _, tr) => {
+            if !bind_for_short_circuit(&tr) {
+                let el = exp(context, result, None, *tl);
+                let mut empty_result = Block::new();
+                let er = exp(context, &mut empty_result, None, *tr);
+                assert!(empty_result.is_empty(), "ICE bind_for_short_circuit failed");
+                HE::BinopExp(el, op, er)
+            } else {
+                let tfalse_ = sp(eloc, TE::Value(sp(eloc, Value_::Bool(false))));
+                let tfalse = Box::new(T::exp(N::Type_::bool(eloc), tfalse_));
+                let if_else_ = sp(eloc, TE::IfElse(tl, tr, tfalse));
+                let if_else = T::exp(N::Type_::bool(tloc), if_else_);
+                return exp_impl(context, result, if_else);
+            }
+        }
+        TE::BinopExp(tl, op @ sp!(_, BinOp_::Or), _, tr) => {
+            if !bind_for_short_circuit(&tr) {
+                let el = exp(context, result, None, *tl);
+                let mut empty_result = Block::new();
+                let er = exp(context, &mut empty_result, None, *tr);
+                assert!(empty_result.is_empty(), "ICE bind_for_short_circuit failed");
+                HE::BinopExp(el, op, er)
+            } else {
+                let ttrue_ = sp(eloc, TE::Value(sp(eloc, Value_::Bool(true))));
+                let ttrue = Box::new(T::exp(N::Type_::bool(eloc), ttrue_));
+                let if_else_ = sp(eloc, TE::IfElse(tl, ttrue, tr));
+                let if_else = T::exp(N::Type_::bool(tloc), if_else_);
+                return exp_impl(context, result, if_else);
+            }
         }
         TE::BinopExp(tl, op, _, tr) => {
             let (el, er) = {
@@ -889,6 +925,7 @@ fn exp_impl(context: &mut Context, result: &mut Block, e: T::Exp) -> H::Exp {
             };
             HE::BinopExp(el, op, er)
         }
+
         TE::Pack(_, s, tbs, tfields) => {
             let bs = base_types(context, tbs);
 
@@ -1263,7 +1300,7 @@ fn freeze_ty(sp!(tloc, t): H::Type) -> H::Type {
     use H::Type_ as T;
     match t {
         T::Single(s) => sp(tloc, T::Single(freeze_single(s))),
-        t => panic!("ICE MULTIPLE freezing anything but a mutable ref: {:#?}", t),
+        t => sp(tloc, t),
     }
 }
 
@@ -1271,6 +1308,53 @@ fn freeze_single(sp!(sloc, s): H::SingleType) -> H::SingleType {
     use H::SingleType_ as S;
     match s {
         S::Ref(true, inner) => sp(sloc, S::Ref(false, inner)),
-        t => panic!("ICE SINGLE freezing anything but a mutable ref: {:#?}", t),
+        s => sp(sloc, s),
     }
+}
+
+fn bind_for_short_circuit(e: &T::Exp) -> bool {
+    use T::UnannotatedExp_ as TE;
+    match &e.exp.value {
+        TE::Use(_) | TE::InferredNum(_) => panic!("ICE should have been expanded"),
+        TE::Value(_) | TE::Move { .. } | TE::Copy { .. } | TE::UnresolvedError => false,
+
+        // TODO might want to case ModuleCall for fake natives
+        TE::ModuleCall(_) => true,
+
+        TE::Block(seq) => bind_for_short_circuit_sequence(seq),
+        TE::Annotate(el, _) => bind_for_short_circuit(el),
+
+        TE::Break
+        | TE::Continue
+        | TE::IfElse(_, _, _)
+        | TE::While(_, _)
+        | TE::Loop { .. }
+        | TE::Return(_)
+        | TE::Abort(_)
+        | TE::Builtin(_, _)
+        | TE::Dereference(_)
+        | TE::UnaryExp(_, _)
+        | TE::Borrow(_, _, _)
+        | TE::TempBorrow(_, _)
+        | TE::BinopExp(_, _, _, _) => true,
+
+        TE::Unit
+        | TE::Assign(_, _, _)
+        | TE::Mutate(_, _)
+        | TE::Pack(_, _, _, _)
+        | TE::BorrowLocal(_, _)
+        | TE::ExpList(_)
+        | TE::Cast(_, _) => panic!("ICE unexpected exp in short circuit check: {:?}", e),
+    }
+}
+
+fn bind_for_short_circuit_sequence(seq: &T::Sequence) -> bool {
+    use T::SequenceItem_ as TItem;
+    seq.len() != 1
+        || match &seq[1].value {
+            TItem::Seq(e) => bind_for_short_circuit(e),
+            item @ TItem::Declare(_) | item @ TItem::Bind(_, _, _) => {
+                panic!("ICE unexpected item in short circuit check: {:?}", item)
+            }
+        }
 }

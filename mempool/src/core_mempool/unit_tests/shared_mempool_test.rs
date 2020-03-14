@@ -7,9 +7,7 @@ use crate::{
         CoreMempool, TimelineState,
     },
     mocks::MockSharedMempool,
-    network::{
-        MempoolNetworkEvents, MempoolNetworkSender, MempoolSyncMsg, MEMPOOL_DIRECT_SEND_PROTOCOL,
-    },
+    network::{MempoolNetworkEvents, MempoolNetworkSender, MempoolSyncMsg},
     shared_mempool::{
         start_shared_mempool, ConsensusRequest, SharedMempoolNotification, SyncEvent,
     },
@@ -29,8 +27,8 @@ use libra_config::config::{NetworkConfig, NodeConfig, RoleType};
 use libra_types::{transaction::SignedTransaction, PeerId};
 use network::{
     peer_manager::{
-        conn_status_channel, ConnectionStatusNotification, PeerManagerNotification,
-        PeerManagerRequest,
+        conn_status_channel, ConnectionRequestSender, ConnectionStatusNotification,
+        PeerManagerNotification, PeerManagerRequest, PeerManagerRequestSender,
     },
     DisconnectReason, ProtocolId,
 };
@@ -64,10 +62,15 @@ fn init_single_shared_mempool(smp: &mut SharedMempoolNetwork, peer_id: PeerId, c
     let mempool = Arc::new(Mutex::new(CoreMempool::new(&config)));
     let (network_reqs_tx, network_reqs_rx) =
         libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
+    let (connection_reqs_tx, _) =
+        libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
     let (network_notifs_tx, network_notifs_rx) =
         libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(8).unwrap(), None);
     let (conn_status_tx, conn_status_rx) = conn_status_channel::new();
-    let network_sender = MempoolNetworkSender::new(network_reqs_tx);
+    let network_sender = MempoolNetworkSender::new(
+        PeerManagerRequestSender::new(network_reqs_tx),
+        ConnectionRequestSender::new(connection_reqs_tx),
+    );
     let network_events = MempoolNetworkEvents::new(network_notifs_rx, conn_status_rx);
     let (sender, subscriber) = unbounded();
     let (timer_sender, timer_receiver) = unbounded();
@@ -75,6 +78,8 @@ fn init_single_shared_mempool(smp: &mut SharedMempoolNetwork, peer_id: PeerId, c
     let network_handles = vec![(peer_id, network_sender, network_events)];
     let (_consensus_sender, consensus_events) = mpsc::channel(1_024);
     let (_state_sync_sender, state_sync_events) = mpsc::channel(1_024);
+    let (_reconfig_events, reconfig_events_receiver) =
+        libra_channel::new(QueueStyle::LIFO, NonZeroUsize::new(1).unwrap(), None);
 
     let runtime = Builder::new()
         .thread_name("shared-mem-")
@@ -90,6 +95,7 @@ fn init_single_shared_mempool(smp: &mut SharedMempoolNetwork, peer_id: PeerId, c
         ac_endpoint_receiver,
         consensus_events,
         state_sync_events,
+        reconfig_events_receiver,
         Arc::new(MockStorageReadClient),
         Arc::new(MockVMValidator),
         vec![sender],
@@ -155,7 +161,7 @@ impl SharedMempoolNetwork {
         let mut mempool = self.mempools.get(peer_id).unwrap().lock().unwrap();
         for txn in txns {
             let transaction = txn.make_signed_transaction_with_max_gas_amount(5);
-            mempool.add_txn(transaction, 0, 0, 10, TimelineState::NotReady);
+            mempool.add_txn(transaction, 0, 0, TimelineState::NotReady);
         }
     }
 
@@ -194,7 +200,7 @@ impl SharedMempoolNetwork {
                 let receiver_network_notif_tx = self.network_notifs_txs.get_mut(&peer_id).unwrap();
                 receiver_network_notif_tx
                     .push(
-                        (*peer, ProtocolId::from_static(MEMPOOL_DIRECT_SEND_PROTOCOL)),
+                        (*peer, ProtocolId::MempoolDirectSend),
                         PeerManagerNotification::RecvMessage(*peer, msg),
                     )
                     .unwrap();
@@ -232,7 +238,7 @@ impl SharedMempoolNetwork {
                 let receiver_network_notif_tx = self.network_notifs_txs.get_mut(&peer_id).unwrap();
                 receiver_network_notif_tx
                     .push(
-                        (*peer, ProtocolId::from_static(MEMPOOL_DIRECT_SEND_PROTOCOL)),
+                        (*peer, ProtocolId::MempoolDirectSend),
                         PeerManagerNotification::RecvMessage(*peer, msg),
                     )
                     .unwrap();

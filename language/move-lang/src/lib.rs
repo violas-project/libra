@@ -3,7 +3,9 @@
 
 #![forbid(unsafe_code)]
 
-#[macro_use]
+#[macro_use(sp)]
+extern crate move_ir_types;
+
 pub mod shared;
 
 pub mod errors;
@@ -23,8 +25,9 @@ pub mod test_utils;
 
 use codespan::{ByteIndex, Span};
 use errors::*;
+use move_ir_types::location::*;
 use parser::syntax::parse_file_string;
-use shared::{Address, Loc};
+use shared::Address;
 use std::{
     collections::HashMap,
     fs::File,
@@ -95,6 +98,26 @@ pub fn move_compile_no_report(
     Ok(match compile_program(pprog_res, sender_opt) {
         Err(errors) => (files, Err(errors)),
         Ok(units) => (files, Ok(units)),
+    })
+}
+
+/// Move compile up to expansion phase, returning errors instead of reporting them to stderr
+pub fn move_compile_to_expansion_no_report(
+    targets: &[String],
+    deps: &[String],
+    sender_opt: Option<Address>,
+) -> io::Result<(FilesSourceText, Result<expansion::ast::Program, Errors>)> {
+    let (files, pprog_res) = parse_program(targets, deps)?;
+    Ok(match pprog_res {
+        Ok(pprog) => {
+            let (eprog, errors) = expansion::translate::program(pprog, sender_opt);
+            if errors.is_empty() {
+                (files, Ok(eprog))
+            } else {
+                (files, Err(errors))
+            }
+        }
+        Err(errors) => (files, Err(errors)),
     })
 }
 

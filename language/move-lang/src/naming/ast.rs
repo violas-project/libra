@@ -9,6 +9,7 @@ use crate::{
     },
     shared::{ast_debug::*, unique_map::UniqueMap, *},
 };
+use move_ir_types::location::*;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
@@ -31,10 +32,10 @@ pub struct Program {
 #[derive(Debug)]
 pub struct ModuleDefinition {
     pub uses: BTreeMap<ModuleIdent, Loc>,
-    /// `None` if it is a library dependency
-    /// `Some(order)` if it is a source file. Where `order` is the topological order/rank in the
-    /// depedency graph. `order` is initialized at `0` and set in the uses pass
-    pub is_source_module: Option<usize>,
+    pub is_source_module: bool,
+    /// `dependency_order` is the topological order/rank in the dependency graph.
+    /// `dependency_order` is initialized at `0` and set in the uses pass
+    pub dependency_order: usize,
     pub structs: UniqueMap<StructName, StructDefinition>,
     pub functions: UniqueMap<FunctionName, Function>,
 }
@@ -573,15 +574,18 @@ impl AstDebug for Program {
 impl AstDebug for ModuleDefinition {
     fn ast_debug(&self, w: &mut AstWriter) {
         let ModuleDefinition {
-            uses,
             is_source_module,
+            dependency_order,
+            uses,
             structs,
             functions,
         } = self;
-        match is_source_module {
-            None => w.writeln("library module"),
-            Some(ord) => w.writeln(&format!("source moduel #{}", ord)),
+        if *is_source_module {
+            w.writeln("library module")
+        } else {
+            w.writeln("source module")
         }
+        w.writeln(&format!("dependency order #{}", dependency_order));
         if !uses.is_empty() {
             w.writeln("uses: ");
             w.indent(2, |w| w.comma(uses, |w, (m, _)| w.write(&format!("{}", m))))

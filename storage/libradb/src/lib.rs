@@ -54,8 +54,9 @@ use libra_types::{
     access_path::AccessPath,
     account_address::AccountAddress,
     account_state_blob::{AccountStateBlob, AccountStateWithProof},
-    contract_event::EventWithProof,
+    contract_event::{ContractEvent, EventWithProof},
     crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeProof},
+    event::EventKey,
     get_with_proof::{RequestItem, ResponseItem},
     proof::{
         AccountStateProof, AccumulatorConsistencyProof, EventProof, SparseMerkleProof,
@@ -115,6 +116,63 @@ fn error_if_too_many_requested(num_requested: u64, max_allowed: u64) -> Result<(
     } else {
         Ok(())
     }
+}
+
+/// Trait that is implemented by a DB that supports certain public (to client) read APIs
+/// expected of a Libra DB
+pub trait LibraDBTrait: Send + Sync {
+    /// Given an account address, returns the latest account state. `None` if the account does not
+    /// exist.
+    fn get_latest_account_state(&self, address: AccountAddress)
+        -> Result<Option<AccountStateBlob>>;
+
+    /// Returns the latest version and committed block timestamp
+    fn get_latest_commit_metadata(&self) -> Result<(Version, u64)>;
+
+    fn get_txn_by_account(
+        &self,
+        address: AccountAddress,
+        seq_num: u64,
+        ledger_version: Version,
+        fetch_events: bool,
+    ) -> Result<Option<TransactionWithProof>>;
+
+    fn get_latest_version(&self) -> Result<Version>;
+
+    fn get_transactions(
+        &self,
+        start_version: Version,
+        limit: u64,
+        ledger_version: Version,
+        fetch_events: bool,
+    ) -> Result<TransactionListWithProof>;
+
+    /// Returns events by given event key
+    fn get_events(
+        &self,
+        event_key: &EventKey,
+        start: u64,
+        limit: u64,
+    ) -> Result<Vec<(u64, ContractEvent)>>;
+
+    /// Returns proof of new state relative to version known to client
+    fn get_state_proof(
+        &self,
+        known_version: u64,
+    ) -> Result<(
+        LedgerInfoWithSignatures,
+        ValidatorChangeProof,
+        AccumulatorConsistencyProof,
+    )>;
+
+    /// Returns the account state corresponding to the given version and account address with proof
+    /// based on `ledger_version`
+    fn get_account_state_with_proof(
+        &self,
+        address: AccountAddress,
+        version: Version,
+        ledger_version: Version,
+    ) -> Result<AccountStateWithProof>;
 }
 
 /// This holds a handle to the underlying DB responsible for physical storage and provides APIs for
@@ -206,41 +264,6 @@ impl LibraDB {
     }
 
     // ================================== Public API ==================================
-    /// Returns the account state corresponding to the given version and account address with proof
-    /// based on `ledger_version`
-    fn get_account_state_with_proof(
-        &self,
-        address: AccountAddress,
-        version: Version,
-        ledger_version: Version,
-    ) -> Result<AccountStateWithProof> {
-        ensure!(
-            version <= ledger_version,
-            "The queried version {} should be equal to or older than ledger version {}.",
-            version,
-            ledger_version
-        );
-        let latest_version = self.get_latest_version()?;
-        ensure!(
-            ledger_version <= latest_version,
-            "The ledger version {} is greater than the latest version currently in ledger: {}",
-            ledger_version,
-            latest_version
-        );
-
-        let (txn_info, txn_info_accumulator_proof) = self
-            .ledger_store
-            .get_transaction_info_with_proof(version, ledger_version)?;
-        let (account_state_blob, sparse_merkle_proof) = self
-            .state_store
-            .get_account_state_with_proof_by_version(address, version)?;
-        Ok(AccountStateWithProof::new(
-            version,
-            account_state_blob,
-            AccountStateProof::new(txn_info_accumulator_proof, txn_info, sparse_merkle_proof),
-        ))
-    }
-
     /// Returns events specified by `query_path` with sequence number in range designated by
     /// `start_seq_num`, `ascending` and `limit`. If ascending is true this query will return up to
     /// `limit` events that were emitted after `start_event_seq_num`. Otherwise, it will return up
@@ -253,9 +276,6 @@ impl LibraDB {
         limit: u64,
         ledger_version: Version,
     ) -> Result<(Vec<EventWithProof>, AccountStateWithProof)> {
-        error_if_too_many_requested(limit, MAX_LIMIT)?;
-
-        let get_latest = !ascending && start_seq_num == u64::max_value();
         let account_state_with_proof =
             self.get_account_state_with_proof(query_path.address, ledger_version, ledger_version)?;
 
@@ -268,6 +288,31 @@ impl LibraDB {
                 return Ok((Vec::new(), account_state_with_proof));
             }
         };
+
+        let events_with_proof = self.get_events_by_event_key(
+            &event_key,
+            start_seq_num,
+            ascending,
+            limit,
+            ledger_version,
+        )?;
+
+        // We always need to return the account blob to prove that this is indeed the event that was
+        // being queried.
+        Ok((events_with_proof, account_state_with_proof))
+    }
+
+    fn get_events_by_event_key(
+        &self,
+        event_key: &EventKey,
+        start_seq_num: u64,
+        ascending: bool,
+        limit: u64,
+        ledger_version: Version,
+    ) -> Result<Vec<EventWithProof>> {
+        error_if_too_many_requested(limit, MAX_LIMIT)?;
+        let get_latest = !ascending && start_seq_num == u64::max_value();
+
         let cursor = if get_latest {
             // Caller wants the latest, figure out the latest seq_num.
             // In the case of no events on that path, use 0 and expect empty result below.
@@ -326,33 +371,7 @@ impl LibraDB {
             events_with_proof.reverse();
         }
 
-        // We always need to return the account blob to prove that this is indeed the event that was
-        // being queried.
-        Ok((events_with_proof, account_state_with_proof))
-    }
-
-    /// Returns a transaction that is the `seq_num`-th one associated with the given account. If
-    /// the transaction with given `seq_num` doesn't exist, returns `None`.
-    fn get_txn_by_account(
-        &self,
-        address: AccountAddress,
-        seq_num: u64,
-        ledger_version: Version,
-        fetch_events: bool,
-    ) -> Result<Option<TransactionWithProof>> {
-        self.transaction_store
-            .lookup_transaction_by_account(address, seq_num, ledger_version)?
-            .map(|version| self.get_transaction_with_proof(version, ledger_version, fetch_events))
-            .transpose()
-    }
-
-    /// Gets the latest version number available in the ledger.
-    pub fn get_latest_version(&self) -> Result<Version> {
-        Ok(self
-            .ledger_store
-            .get_latest_ledger_info()?
-            .ledger_info()
-            .version())
+        Ok(events_with_proof)
     }
 
     /// Returns ledger infos reflecting epoch bumps starting with the given epoch. If there are no
@@ -663,20 +682,6 @@ impl LibraDB {
             .get_account_state_with_proof_by_version(address, version)
     }
 
-    /// Given an account address, returns the latest account state. `None` if the account does not
-    /// exist.
-    pub fn get_latest_account_state(
-        &self,
-        address: AccountAddress,
-    ) -> Result<Option<AccountStateBlob>> {
-        let ledger_info_with_sigs = self.ledger_store.get_latest_ledger_info()?;
-        let version = ledger_info_with_sigs.ledger_info().version();
-        let (blob, _proof) = self
-            .state_store
-            .get_account_state_with_proof_by_version(address, version)?;
-        Ok(blob)
-    }
-
     /// Gets information needed from storage during the startup of the executor or state
     /// synchronizer module.
     ///
@@ -733,57 +738,6 @@ impl LibraDB {
         };
 
         Ok(Some(startup_info))
-    }
-
-    // ======================= State Synchronizer Internal APIs ===================================
-    /// Gets a batch of transactions for the purpose of synchronizing state to another node.
-    ///
-    /// This is used by the State Synchronizer module internally.
-    pub fn get_transactions(
-        &self,
-        start_version: Version,
-        limit: u64,
-        ledger_version: Version,
-        fetch_events: bool,
-    ) -> Result<TransactionListWithProof> {
-        error_if_too_many_requested(limit, MAX_LIMIT)?;
-
-        if start_version > ledger_version || limit == 0 {
-            return Ok(TransactionListWithProof::new_empty());
-        }
-
-        let limit = std::cmp::min(limit, ledger_version - start_version + 1);
-
-        let txns = (start_version..start_version + limit)
-            .map(|version| Ok(self.transaction_store.get_transaction(version)?))
-            .collect::<Result<Vec<_>>>()?;
-        let txn_infos = (start_version..start_version + limit)
-            .map(|version| Ok(self.ledger_store.get_transaction_info(version)?))
-            .collect::<Result<Vec<_>>>()?;
-        let events = if fetch_events {
-            Some(
-                (start_version..start_version + limit)
-                    .map(|version| Ok(self.event_store.get_events_by_version(version)?))
-                    .collect::<Result<Vec<_>>>()?,
-            )
-        } else {
-            None
-        };
-        let proof = TransactionListProof::new(
-            self.ledger_store.get_transaction_range_proof(
-                Some(start_version),
-                limit,
-                ledger_version,
-            )?,
-            txn_infos,
-        );
-
-        Ok(TransactionListWithProof::new(
-            txns,
-            events,
-            Some(start_version),
-            proof,
-        ))
     }
 
     // ================================== Backup APIs ===================================
@@ -889,6 +843,184 @@ impl LibraDB {
             events,
             proof,
         })
+    }
+}
+
+impl LibraDBTrait for LibraDB {
+    fn get_latest_account_state(
+        &self,
+        address: AccountAddress,
+    ) -> Result<Option<AccountStateBlob>> {
+        let ledger_info_with_sigs = self.ledger_store.get_latest_ledger_info()?;
+        let version = ledger_info_with_sigs.ledger_info().version();
+        let (blob, _proof) = self
+            .state_store
+            .get_account_state_with_proof_by_version(address, version)?;
+        Ok(blob)
+    }
+
+    fn get_latest_commit_metadata(&self) -> Result<(Version, u64)> {
+        let latest_ledger_info = self.ledger_store.get_latest_ledger_info()?;
+        let ledger_info = latest_ledger_info.ledger_info();
+        Ok((ledger_info.version(), ledger_info.timestamp_usecs()))
+    }
+
+    /// Returns a transaction that is the `seq_num`-th one associated with the given account. If
+    /// the transaction with given `seq_num` doesn't exist, returns `None`.
+    fn get_txn_by_account(
+        &self,
+        address: AccountAddress,
+        seq_num: u64,
+        ledger_version: Version,
+        fetch_events: bool,
+    ) -> Result<Option<TransactionWithProof>> {
+        self.transaction_store
+            .lookup_transaction_by_account(address, seq_num, ledger_version)?
+            .map(|version| self.get_transaction_with_proof(version, ledger_version, fetch_events))
+            .transpose()
+    }
+
+    /// Gets the latest version number available in the ledger.
+    fn get_latest_version(&self) -> Result<Version> {
+        Ok(self
+            .ledger_store
+            .get_latest_ledger_info()?
+            .ledger_info()
+            .version())
+    }
+
+    // ======================= State Synchronizer Internal APIs ===================================
+    /// Gets a batch of transactions for the purpose of synchronizing state to another node.
+    ///
+    /// This is used by the State Synchronizer module internally.
+    fn get_transactions(
+        &self,
+        start_version: Version,
+        limit: u64,
+        ledger_version: Version,
+        fetch_events: bool,
+    ) -> Result<TransactionListWithProof> {
+        error_if_too_many_requested(limit, MAX_LIMIT)?;
+
+        if start_version > ledger_version || limit == 0 {
+            return Ok(TransactionListWithProof::new_empty());
+        }
+
+        let limit = std::cmp::min(limit, ledger_version - start_version + 1);
+
+        let txns = (start_version..start_version + limit)
+            .map(|version| Ok(self.transaction_store.get_transaction(version)?))
+            .collect::<Result<Vec<_>>>()?;
+        let txn_infos = (start_version..start_version + limit)
+            .map(|version| Ok(self.ledger_store.get_transaction_info(version)?))
+            .collect::<Result<Vec<_>>>()?;
+        let events = if fetch_events {
+            Some(
+                (start_version..start_version + limit)
+                    .map(|version| Ok(self.event_store.get_events_by_version(version)?))
+                    .collect::<Result<Vec<_>>>()?,
+            )
+        } else {
+            None
+        };
+        let proof = TransactionListProof::new(
+            self.ledger_store.get_transaction_range_proof(
+                Some(start_version),
+                limit,
+                ledger_version,
+            )?,
+            txn_infos,
+        );
+
+        Ok(TransactionListWithProof::new(
+            txns,
+            events,
+            Some(start_version),
+            proof,
+        ))
+    }
+
+    fn get_events(
+        &self,
+        event_key: &EventKey,
+        start: u64,
+        limit: u64,
+    ) -> Result<Vec<(u64, ContractEvent)>> {
+        let version = self
+            .ledger_store
+            .get_latest_ledger_info()?
+            .ledger_info()
+            .version();
+        let events = self
+            .get_events_by_event_key(event_key, start, false, limit, version)?
+            .into_iter()
+            .map(|e| (e.transaction_version, e.event))
+            .collect();
+        Ok(events)
+    }
+
+    fn get_state_proof(
+        &self,
+        known_version: u64,
+    ) -> Result<(
+        LedgerInfoWithSignatures,
+        ValidatorChangeProof,
+        AccumulatorConsistencyProof,
+    )> {
+        let ledger_info_with_sigs = self.ledger_store.get_latest_ledger_info()?;
+        let ledger_info = ledger_info_with_sigs.ledger_info();
+        let known_epoch = self.ledger_store.get_epoch(known_version)?;
+        let validator_change_proof = if known_epoch < ledger_info.epoch() {
+            let (ledger_infos_with_sigs, more) = self.get_epoch_change_ledger_infos(
+                known_epoch,
+                self.ledger_store.get_epoch(ledger_info.version())?,
+            )?;
+            ValidatorChangeProof::new(ledger_infos_with_sigs, more)
+        } else {
+            ValidatorChangeProof::new(vec![], /* more = */ false)
+        };
+
+        let ledger_consistency_proof = self
+            .ledger_store
+            .get_consistency_proof(known_version, ledger_info.version())?;
+        Ok((
+            ledger_info_with_sigs,
+            validator_change_proof,
+            ledger_consistency_proof,
+        ))
+    }
+
+    fn get_account_state_with_proof(
+        &self,
+        address: AccountAddress,
+        version: Version,
+        ledger_version: Version,
+    ) -> Result<AccountStateWithProof> {
+        ensure!(
+            version <= ledger_version,
+            "The queried version {} should be equal to or older than ledger version {}.",
+            version,
+            ledger_version
+        );
+        let latest_version = self.get_latest_version()?;
+        ensure!(
+            ledger_version <= latest_version,
+            "The ledger version {} is greater than the latest version currently in ledger: {}",
+            ledger_version,
+            latest_version
+        );
+
+        let (txn_info, txn_info_accumulator_proof) = self
+            .ledger_store
+            .get_transaction_info_with_proof(version, ledger_version)?;
+        let (account_state_blob, sparse_merkle_proof) = self
+            .state_store
+            .get_account_state_with_proof_by_version(address, version)?;
+        Ok(AccountStateWithProof::new(
+            version,
+            account_state_blob,
+            AccountStateProof::new(txn_info_accumulator_proof, txn_info, sparse_merkle_proof),
+        ))
     }
 }
 

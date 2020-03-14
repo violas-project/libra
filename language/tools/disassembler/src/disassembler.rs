@@ -7,7 +7,7 @@ use bytecode_source_map::{
     source_map::{FunctionSourceMap, SourceName},
 };
 use bytecode_verifier::control_flow_graph::{ControlFlowGraph, VMControlFlowGraph};
-use libra_types::identifier::{IdentStr, Identifier};
+use move_core_types::identifier::IdentStr;
 use vm::{
     access::ModuleAccess,
     file_format::{
@@ -44,13 +44,13 @@ impl DisassemblerOptions {
     }
 }
 
-pub struct Disassembler<Location: Clone + Eq + Default> {
+pub struct Disassembler<Location: Clone + Eq> {
     source_mapper: SourceMapping<Location>,
     // The various options that we can set for disassembly.
     options: DisassemblerOptions,
 }
 
-impl<Location: Clone + Eq + Default> Disassembler<Location> {
+impl<Location: Clone + Eq> Disassembler<Location> {
     pub fn new(source_mapper: SourceMapping<Location>, options: DisassemblerOptions) -> Self {
         Self {
             source_mapper,
@@ -191,7 +191,7 @@ impl<Location: Clone + Eq + Default> Disassembler<Location> {
                     )
                 })?
                 .0;
-        Ok(name.to_string())
+        Ok(name)
     }
 
     fn type_for_local(
@@ -303,6 +303,7 @@ impl<Location: Clone + Eq + Default> Disassembler<Location> {
         instruction: &Bytecode,
         locals_sigs: &LocalsSignature,
         function_source_map: &FunctionSourceMap<Location>,
+        default_location: &Location,
     ) -> Result<String> {
         match instruction {
             Bytecode::LdAddr(address_idx) => {
@@ -413,11 +414,11 @@ impl<Location: Clone + Eq + Default> Disassembler<Location> {
                     .iter()
                     .map(|sig_tok| {
                         Ok((
-                            Identifier::new(self.disassemble_sig_tok(
+                            self.disassemble_sig_tok(
                                 sig_tok.clone(),
                                 &function_source_map.type_parameters,
-                            )?)?,
-                            Location::default(),
+                            )?,
+                            default_location.clone(),
                         ))
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -437,10 +438,7 @@ impl<Location: Clone + Eq + Default> Disassembler<Location> {
                     method_idx,
                     fcall_name,
                     Self::format_type_params(
-                        &ty_params
-                            .into_iter()
-                            .map(|x| x.0.to_string())
-                            .collect::<Vec<_>>()
+                        &ty_params.into_iter().map(|(s, _)| s).collect::<Vec<_>>()
                     ),
                     type_arguments,
                     Self::format_ret_type(&type_rets)
@@ -469,12 +467,18 @@ impl<Location: Clone + Eq + Default> Disassembler<Location> {
             .source_map
             .get_function_source_map(function_definition_index)?;
 
+        let decl_location = &function_source_map.decl_location;
         let instrs: Vec<String> = function_def
             .code
             .code
             .iter()
             .map(|instruction| {
-                self.disassemble_instruction(instruction, locals_sigs, function_source_map)
+                self.disassemble_instruction(
+                    instruction,
+                    locals_sigs,
+                    function_source_map,
+                    &decl_location,
+                )
             })
             .collect::<Result<Vec<String>>>()?;
 

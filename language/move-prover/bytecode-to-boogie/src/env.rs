@@ -11,12 +11,11 @@ use num::{BigInt, Num};
 
 use bytecode_source_map::source_map::ModuleSourceMap;
 use bytecode_verifier::VerifiedModule;
-use libra_types::{
-    identifier::{IdentStr, Identifier},
-    language_storage::ModuleId,
-};
+use libra_types::language_storage::ModuleId;
+use move_core_types::identifier::{IdentStr, Identifier};
 use move_ir_types::{
-    ast::{Loc, QualifiedStructIdent, Type, TypeVar_},
+    ast::{QualifiedStructIdent, Type, TypeVar_},
+    location::{Loc, Spanned},
     spec_language_ast::{Condition, Invariant, SyntheticDefinition},
 };
 use vm::{
@@ -33,11 +32,14 @@ use vm::{
 };
 
 use crate::cli::Options;
-use codespan::{CodeMap, ColumnIndex, FileMap, FileName, LineIndex};
+use codespan::{ColumnIndex, Files, LineIndex};
 use codespan_reporting::{
-    emit,
-    termcolor::{ColorChoice, StandardStream},
-    Diagnostic, Label, Severity,
+    diagnostic::{Diagnostic, Label, Severity},
+    term::{
+        emit,
+        termcolor::{ColorChoice, StandardStream},
+        Config,
+    },
 };
 use std::fs;
 
@@ -163,7 +165,7 @@ impl GlobalEnv {
             synthetics
                 .into_iter()
                 .map(|syn| {
-                    let ty = module_env.translate_ast_type(syn.span, &syn.type_, &[]);
+                    let ty = module_env.translate_ast_type(syn.loc, &syn.value.type_, &[]);
                     (syn, ty)
                 })
                 .collect_vec()
@@ -220,7 +222,7 @@ impl GlobalEnv {
         let mut other_invariants = vec![];
 
         for inv in invariants {
-            match inv.modifier.as_str() {
+            match inv.value.modifier.as_str() {
                 "" | DATA_MODIFIER => data_invariants.push(inv),
                 UPDATE_MODIFIER => update_invariants.push(inv),
                 PACK_MODIFIER => pack_invariants.push(inv),
@@ -393,14 +395,14 @@ impl<'env> ModuleEnv<'env> {
             return;
         }
         self.ensure_source_available();
-        let mut codemap = CodeMap::new();
-        codemap.add_filemap(
-            FileName::real(&self.data.source_file_path),
+        let mut codemap = Files::new();
+        codemap.add(
+            &self.data.source_file_path,
             self.data.source_text.borrow().as_ref().unwrap().clone(),
         );
         for diag in self.data.diags.borrow().iter() {
-            let writer = StandardStream::stderr(ColorChoice::Auto);
-            emit(writer, &codemap, diag).expect("emitting diagnostic failed")
+            let writer = &mut StandardStream::stderr(ColorChoice::Auto);
+            emit(writer, &Config::default(), &codemap, diag).expect("emitting diagnostic failed")
         }
     }
 
@@ -409,10 +411,12 @@ impl<'env> ModuleEnv<'env> {
         self.ensure_source_available();
         let source = self.data.source_text.borrow();
         let source_ref = source.as_ref().unwrap();
-        let file_map = FileMap::new(FileName::real(&self.data.source_file_path), source_ref);
+        let mut file_map = Files::new();
+        let id = file_map.add(&self.data.source_file_path, source_ref);
+        let location = file_map.location(id, loc.span().start()).unwrap();
         (
             self.data.source_file_path.clone(),
-            file_map.location(loc.start()).unwrap(),
+            (location.line, location.column),
         )
     }
 
@@ -474,7 +478,9 @@ impl<'env> ModuleEnv<'env> {
         // Currently we do a brute-force linear search, may need to speed this up if it appears
         // to be a bottleneck.
         for func_env in self.get_functions() {
-            if func_env.get_loc().contains(loc) {
+            let env_span = func_env.get_loc().span();
+            let loc_span = loc.span();
+            if env_span.start() <= loc_span.start() && loc_span.end() <= env_span.end() {
                 return Some(func_env);
             }
         }
@@ -633,7 +639,7 @@ impl<'env> ModuleEnv<'env> {
         name: &str,
     ) -> Option<&'env (SyntheticDefinition, GlobalType)> {
         for syn in &self.data.synthetics {
-            if syn.0.name.as_str() == name {
+            if syn.0.value.name.as_str() == name {
                 return Some(syn);
             }
         }
@@ -696,7 +702,7 @@ impl<'env> ModuleEnv<'env> {
             .map(|t| self.translate_ast_type(loc, t, type_params))
             .collect_vec();
         if let Some(module_env) = self.env.find_module_by_name(&module_name) {
-            if let Some(struct_env) = module_env.find_struct(struct_name) {
+            if let Some(struct_env) = module_env.find_struct(IdentStr::new(struct_name).unwrap()) {
                 let expected_count = struct_env.get_type_parameters().len();
                 if expected_count != translated_actuals.len() {
                     self.error(
@@ -735,7 +741,7 @@ impl<'env> ModuleEnv<'env> {
         param: &TypeVar_,
         type_params: &[TypeParameter],
     ) -> GlobalType {
-        let name = param.name().as_str();
+        let name = param.name();
         if let Some(pos) = type_params.iter().position(|p| p.0.as_str() == name) {
             GlobalType::TypeParameter(pos as u16)
         } else {
@@ -749,7 +755,9 @@ impl<'env> ModuleEnv<'env> {
 
     /// Reports an error in this module.
     pub fn error<T>(&self, loc: Loc, msg: &str, pass_through: T) -> T {
-        let diag = Diagnostic::new_error(msg).with_label(Label::new_primary(loc));
+        // FIXME real file id
+        let id = Files::new().add(loc.file(), "");
+        let diag = Diagnostic::new_error(msg, Label::new(id, loc.span(), ""));
         self.add_diag(diag);
         pass_through
     }
@@ -812,7 +820,7 @@ impl<'env> StructEnv<'env> {
         {
             source_map.decl_location
         } else {
-            Loc::default()
+            Spanned::unsafe_no_loc(()).loc
         }
     }
 
@@ -1024,7 +1032,7 @@ impl<'env> FunctionEnv<'env> {
         {
             source_map.decl_location
         } else {
-            Loc::default()
+            Spanned::unsafe_no_loc(()).loc
         }
     }
 
@@ -1118,7 +1126,7 @@ impl<'env> FunctionEnv<'env> {
             .get_function_source_map(self.data.def_idx)
         {
             if let Some((ident, _)) = fmap.get_local_name(idx as u64) {
-                return ident.to_string();
+                return ident;
             }
         }
         format!("__t{}", idx)

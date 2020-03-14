@@ -8,8 +8,8 @@ use libra_types::{
     access_path::AccessPath, account_address::AccountAddress, account_config, byte_array::ByteArray,
 };
 use move_vm_types::{
-    loaded_data::struct_def::StructDef,
-    loaded_data::types::Type,
+    identifier::{create_access_path, resource_storage_key},
+    loaded_data::{struct_def::StructDef, types::Type},
     values::{Struct, Value},
 };
 use rand::{
@@ -21,7 +21,6 @@ use vm::{
     access::*,
     file_format::{SignatureToken, StructDefinitionIndex, TableIndex},
 };
-use vm_runtime::identifier::{create_access_path, resource_storage_key};
 
 /// Details about an account.
 #[derive(Debug, Clone, Eq, PartialEq)]

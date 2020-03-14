@@ -15,8 +15,6 @@ module LibraAccount {
         // The current authentication key.
         // This can be different than the key used to create the account
         authentication_key: vector<u8>,
-        // The coins stored in this account
-        balance: LibraCoin::T,
         // If true, the authority to rotate the authentication key of this account resides elsewhere
         delegated_key_rotation_capability: bool,
         // If true, the authority to withdraw funds from this account resides elsewhere
@@ -30,6 +28,11 @@ module LibraAccount {
         sequence_number: u64,
         // Generator for event handles
         event_generator: EventHandleGenerator,
+    }
+
+    // A resource that holds the libra coins stored in this account
+    resource struct Balance {
+        coin: LibraCoin::T,
     }
 
     // The holder of WithdrawalCapability for account_address can withdraw Libra from
@@ -84,20 +87,20 @@ module LibraAccount {
         guid: vector<u8>,
     }
 
-    // Deposits the `to_deposit` coin into the `payee`'s account
-    public fun deposit(payee: address, to_deposit: LibraCoin::T) acquires T {
+    // Deposits the `to_deposit` coin into the `payee`'s account balance
+    public fun deposit(payee: address, to_deposit: LibraCoin::T) acquires T, Balance {
         // Since we don't have vector<u8> literals in the source language at
         // the moment.
         // FIXME: Update this once we have vector<u8> literals
         deposit_with_metadata(payee, to_deposit, Vector::empty());
     }
 
-    // Deposits the `to_deposit` coin into the `payee`'s account with the attached `metadata`
+    // Deposits the `to_deposit` coin into the `payee`'s account balance with the attached `metadata`
     public fun deposit_with_metadata(
         payee: address,
         to_deposit: LibraCoin::T,
         metadata: vector<u8>
-    ) acquires T {
+    ) acquires T, Balance {
         deposit_with_sender_and_metadata(
             payee,
             Transaction::sender(),
@@ -106,14 +109,14 @@ module LibraAccount {
         );
     }
 
-    // Deposits the `to_deposit` coin into the `payee`'s account with the attached `metadata` and
+    // Deposits the `to_deposit` coin into the `payee`'s account balance with the attached `metadata` and
     // sender address
     fun deposit_with_sender_and_metadata(
         payee: address,
         sender: address,
         to_deposit: LibraCoin::T,
         metadata: vector<u8>
-    ) acquires T {
+    ) acquires T, Balance {
         // Check that the `to_deposit` coin is non-zero
         let deposit_value = LibraCoin::value(&to_deposit);
         Transaction::assert(deposit_value > 0, 7);
@@ -132,8 +135,9 @@ module LibraAccount {
 
         // Load the payee's account
         let payee_account_ref = borrow_global_mut<T>(payee);
+        let payee_balance = borrow_global_mut<Balance>(payee);
         // Deposit the `to_deposit` coin
-        LibraCoin::deposit(&mut payee_account_ref.balance, to_deposit);
+        LibraCoin::deposit(&mut payee_balance.coin, to_deposit);
         // Log a received event
         emit_event<ReceivedPaymentEvent>(
             &mut payee_account_ref.received_events,
@@ -145,40 +149,45 @@ module LibraAccount {
         );
     }
 
-    // mint_to_address can only be called by accounts with MintCapability (see LibraCoin)
-    // and those account will be charged for gas. If those account don't have enough gas to pay
+    // mint_to_address can only be called by accounts with MintCapability (see Libra)
+    // and those accounts will be charged for gas. If those accounts don't have enough gas to pay
     // for the transaction cost they will fail minting.
     // However those account can also mint to themselves so that is a decent workaround
-    public fun mint_to_address(payee: address, amount: u64) acquires T {
+    public fun mint_to_address(
+        payee: address,
+        auth_key_prefix: vector<u8>,
+        amount: u64
+    ) acquires T, Balance {
         // Create an account if it does not exist
         if (!exists(payee)) {
-            create_account(payee);
+            create_account(payee, auth_key_prefix);
         };
 
         // Mint and deposit the coin
         deposit(payee, LibraCoin::mint_with_default_capability(amount));
     }
 
-    // Helper to withdraw `amount` from the given `account` and return the resulting LibraCoin::T
-    fun withdraw_from_account(account: &mut T, amount: u64): LibraCoin::T {
-        LibraCoin::withdraw(&mut account.balance, amount)
+    // Helper to withdraw `amount` from the given account balance and return the withdrawn LibraCoin::T
+    fun withdraw_from_balance(balance: &mut Balance, amount: u64): LibraCoin::T {
+        LibraCoin::withdraw(&mut balance.coin, amount)
     }
 
-    // Withdraw `amount` LibraCoin::T from the transaction sender's account
-    public fun withdraw_from_sender(amount: u64): LibraCoin::T acquires T {
+    // Withdraw `amount` LibraCoin::T from the transaction sender's account balance
+    public fun withdraw_from_sender(amount: u64): LibraCoin::T acquires T, Balance {
         let sender_account = borrow_global_mut<T>(Transaction::sender());
+        let sender_balance = borrow_global_mut<Balance>(Transaction::sender());
         // The sender has delegated the privilege to withdraw from her account elsewhere--abort.
         Transaction::assert(!sender_account.delegated_withdrawal_capability, 11);
         // The sender has retained her withdrawal privileges--proceed.
-        withdraw_from_account(sender_account, amount)
+        withdraw_from_balance(sender_balance, amount)
     }
 
-    // Withdraw `amount` LibraCoin::T from account under cap.account_address
+    // Withdraw `amount` LibraCoin::T from the account under cap.account_address
     public fun withdraw_with_capability(
         cap: &WithdrawalCapability, amount: u64
-    ): LibraCoin::T acquires T  {
-        let account = borrow_global_mut<T>(cap.account_address);
-        withdraw_from_account(account, amount)
+    ): LibraCoin::T acquires Balance {
+        let balance = borrow_global_mut<Balance>(cap.account_address);
+        withdraw_from_balance(balance , amount)
     }
 
     // Return a unique capability granting permission to withdraw from the sender's account balance.
@@ -206,15 +215,16 @@ module LibraAccount {
     }
 
     // Withdraws `amount` LibraCoin::T using the passed in WithdrawalCapability, and deposits it
-    // into the `payee`'s account. Creates the `payee` account if it doesn't exist.
+    // into the `payee`'s account balance. Creates the `payee` account if it doesn't exist.
     public fun pay_from_capability(
         payee: address,
+        auth_key_prefix: vector<u8>,
         cap: &WithdrawalCapability,
         amount: u64,
         metadata: vector<u8>
-    ) acquires T {
+    ) acquires T, Balance {
         if (!exists(payee)) {
-            create_account(payee);
+            create_account(payee, auth_key_prefix);
         };
         deposit_with_sender_and_metadata(
             payee,
@@ -224,15 +234,18 @@ module LibraAccount {
         );
     }
 
-    // Withdraw `amount` LibraCoin::T from the transaction sender's account and send the coin
-    // to the `payee` address with the attached `metadata`
-    // Creates the `payee` account if it does not exist
+    // Withdraw `amount` LibraCoin::T from the transaction sender's
+    // account balance and send the coin to the `payee` address with the
+    // attached `metadata` Creates the `payee` account if it does not exist
     public fun pay_from_sender_with_metadata(
         payee: address,
+        auth_key_prefix: vector<u8>,
         amount: u64,
         metadata: vector<u8>
-    ) acquires T {
-        if (!exists(payee)) create_account(payee);
+    ) acquires T, Balance {
+        if (!exists(payee)) {
+            create_account(payee, auth_key_prefix);
+        };
         deposit_with_metadata(
             payee,
             withdraw_from_sender(amount),
@@ -240,15 +253,21 @@ module LibraAccount {
         );
     }
 
-    // Withdraw `amount` LibraCoin::T from the transaction sender's account and send the coin
-    // to the `payee` address
+    // Withdraw `amount` LibraCoin::T from the transaction sender's
+    // account balance  and send the coin to the `payee` address
     // Creates the `payee` account if it does not exist
-    public fun pay_from_sender(payee: address, amount: u64) acquires T {
+    public fun pay_from_sender(
+        payee: address,
+        auth_key_prefix: vector<u8>,
+        amount: u64
+    ) acquires T, Balance {
         // FIXME: Update this once we have vector<u8> literals
-        pay_from_sender_with_metadata(payee, amount, Vector::empty());
+        pay_from_sender_with_metadata(payee, auth_key_prefix, amount, Vector::empty());
     }
 
     fun rotate_authentication_key_for_account(account: &mut T, new_authentication_key: vector<u8>) {
+      // Don't allow rotating to clearly invalid key
+      Transaction::assert(Vector::length(&new_authentication_key) == 32, 12);
       account.authentication_key = new_authentication_key;
     }
 
@@ -297,47 +316,65 @@ module LibraAccount {
         account.delegated_key_rotation_capability = false;
     }
 
-    // Creates a new account at `fresh_address` with an initial balance of zero
-    // Creating an account at 0x0 will cause runtime failure as it is a
+    // Creates a new account at `fresh_address` with an initial balance of zero and authentication
+    // key `auth_key_prefix` | `fresh_address`
+    // Creating an account at address 0x0 will cause runtime failure as it is a
     // reserved address for the MoveVM.
-    public fun create_account(fresh_address: address) {
+    public fun create_account(fresh_address: address, auth_key_prefix: vector<u8>) {
         let generator = EventHandleGenerator {counter: 0};
+        let authentication_key = auth_key_prefix;
+        Vector::append(&mut authentication_key, AddressUtil::address_to_bytes(fresh_address));
+        Transaction::assert(Vector::length(&authentication_key) == 32, 12);
 
         save_account(
-            fresh_address,
+            Balance{
+                coin: LibraCoin::zero()
+            },
             T {
-                authentication_key: AddressUtil::address_to_bytes(fresh_address),
-                balance: LibraCoin::zero(),
+                authentication_key,
                 delegated_key_rotation_capability: false,
                 delegated_withdrawal_capability: false,
                 received_events: new_event_handle_impl<ReceivedPaymentEvent>(&mut generator, fresh_address),
                 sent_events: new_event_handle_impl<SentPaymentEvent>(&mut generator, fresh_address),
                 sequence_number: 0,
                 event_generator: generator,
-            }
+            },
+            fresh_address,
         );
     }
 
     // Creates a new account at `fresh_address` with the `initial_balance` deducted from the
     // transaction sender's account
-    public fun create_new_account(fresh_address: address, initial_balance: u64) acquires T {
-        create_account(fresh_address);
+    public fun create_new_account(
+        fresh_address: address,
+        auth_key_prefix: vector<u8>,
+        initial_balance: u64
+    ) acquires T, Balance {
+        create_account(fresh_address, auth_key_prefix);
         if (initial_balance > 0) {
-            pay_from_sender(fresh_address, initial_balance);
+            deposit_with_metadata(
+                fresh_address,
+                withdraw_from_sender(initial_balance),
+                Vector::empty(),
+            );
         }
     }
 
-    // Save an account to a given address if the address does not have an account resource yet
-    native fun save_account(addr: address, account: Self::T);
+    // Save an account to a given address if the address does not have account resources yet
+    native fun save_account(
+        balance: Balance,
+        account: Self::T,
+        addr: address,
+    );
 
-    // Helper to return u64 value of the `balance` field for given `account`
-    fun balance_for_account(account: &T): u64 {
-        LibraCoin::value(&account.balance)
+    // Helper to return the u64 value of the `balance` for `account`
+    fun balance_for(balance: &Balance): u64 {
+        LibraCoin::value(&balance.coin)
     }
 
-    // Return the current balance of the LibraCoin::T in LibraAccount::T at `addr`
-    public fun balance(addr: address): u64 acquires T {
-        balance_for_account(borrow_global<T>(addr))
+    // Return the current balance of the account at `addr`.
+    public fun balance(addr: address): u64 acquires Balance {
+        balance_for(borrow_global<Balance>(addr))
     }
 
     // Helper to return the sequence number field for given `account`
@@ -350,7 +387,12 @@ module LibraAccount {
         sequence_number_for_account(borrow_global<T>(addr))
     }
 
-   // Return true if the account at `addr` has delegated its key rotation capability
+    // Return the authentication key for this account
+    public fun authentication_key(addr: address): vector<u8> acquires T {
+        *&borrow_global<T>(addr).authentication_key
+    }
+
+    // Return true if the account at `addr` has delegated its key rotation capability
     public fun delegated_key_rotation_capability(addr: address): bool acquires T {
         borrow_global<T>(addr).delegated_key_rotation_capability
     }
@@ -359,7 +401,6 @@ module LibraAccount {
     public fun delegated_withdrawal_capability(addr: address): bool acquires T {
         borrow_global<T>(addr).delegated_withdrawal_capability
     }
-
 
     // Return a reference to the address associated with the given withdrawal capability
     public fun withdrawal_capability_address(cap: &WithdrawalCapability): &address {
@@ -387,7 +428,7 @@ module LibraAccount {
         txn_gas_price: u64,
         txn_max_gas_units: u64,
         txn_expiration_time: u64,
-    ) acquires T {
+    ) acquires T, Balance {
         let transaction_sender = Transaction::sender();
 
         // FUTURE: Make these error codes sequential
@@ -405,8 +446,7 @@ module LibraAccount {
 
         // Check that the account has enough balance for all of the gas
         let max_transaction_fee = txn_gas_price * txn_max_gas_units;
-        let imm_sender_account = freeze(sender_account);
-        let balance_amount = balance_for_account(imm_sender_account);
+        let balance_amount = balance(transaction_sender);
         Transaction::assert(balance_amount >= max_transaction_fee, 6);
 
         // Check that the transaction sequence number matches the sequence number of the account
@@ -422,27 +462,27 @@ module LibraAccount {
         txn_gas_price: u64,
         txn_max_gas_units: u64,
         gas_units_remaining: u64
-    ) acquires T {
-        // Load the transaction sender's account
+    ) acquires T, Balance {
+        // Load the transaction sender's account and balance resources
         let sender_account = borrow_global_mut<T>(Transaction::sender());
+        let sender_balance = borrow_global_mut<Balance>(Transaction::sender());
 
         // Charge for gas
         let transaction_fee_amount = txn_gas_price * (txn_max_gas_units - gas_units_remaining);
-        let imm_sender_account = sender_account;
         Transaction::assert(
-            balance_for_account(imm_sender_account) >= transaction_fee_amount,
+            balance_for(sender_balance) >= transaction_fee_amount,
             6
         );
-        let transaction_fee = withdraw_from_account(
-                sender_account,
+        let transaction_fee = withdraw_from_balance(
+                sender_balance,
                 transaction_fee_amount
             );
 
         // Bump the sequence number
         sender_account.sequence_number = txn_sequence_number + 1;
-        // Pay the transaction fee into the transaction fee pot
-        let transaction_fee_account = borrow_global_mut<T>(0xFEE);
-        LibraCoin::deposit(&mut transaction_fee_account.balance, transaction_fee);
+        // Pay the transaction fee into the transaction fee balance
+        let transaction_fee_balance = borrow_global_mut<Balance>(0xFEE);
+        LibraCoin::deposit(&mut transaction_fee_balance.coin, transaction_fee);
     }
 
     /// Events

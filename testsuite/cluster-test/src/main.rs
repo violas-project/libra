@@ -8,10 +8,9 @@ use std::{
 };
 
 use chrono::{Datelike, Timelike, Utc};
+use libra_logger::{info, warn};
 use rand::{prelude::ThreadRng, Rng};
 use reqwest::Url;
-use slog::{o, Drain};
-use slog_scope::{info, warn};
 use structopt::{clap::ArgGroup, StructOpt};
 use termion::{color, style};
 
@@ -24,7 +23,7 @@ use cluster_test::{
     effects::{Action, Effect, Reboot, RemoveNetworkEffects, StopContainer},
     experiments::{get_experiment, Context, Experiment},
     github::GitHub,
-    health::{DebugPortLogThread, HealthCheckRunner, LogTail, PrintFailures},
+    health::{DebugPortLogThread, HealthCheckRunner, LogTail, PrintFailures, TraceTail},
     instance::Instance,
     prometheus::Prometheus,
     report::SuiteReport,
@@ -38,6 +37,7 @@ use futures::{
     future::{join_all, FutureExt, TryFutureExt},
     select,
 };
+use libra_config::config::DEFAULT_JSON_RPC_PORT;
 use tokio::{
     runtime::{Builder, Runtime},
     time::{delay_for, delay_until, Instant as TokioInstant},
@@ -265,13 +265,7 @@ fn setup_log() {
     if env::var("RUST_LOG").is_err() {
         env::set_var("RUST_LOG", "info");
     }
-    let decorator = slog_term::PlainDecorator::new(std::io::stdout());
-    let drain = slog_term::CompactFormat::new(decorator).build().fuse();
-    let drain = slog_envlogger::new(drain);
-    let drain = std::sync::Mutex::new(drain).fuse();
-    let logger = slog::Logger::root(drain, o!());
-    let logger_guard = slog_scope::set_global_logger(logger);
-    std::mem::forget(logger_guard);
+    ::libra_logger::Logger::new().is_async(true).init();
 }
 
 struct BasicSwarmUtil {
@@ -287,6 +281,7 @@ struct ClusterUtil {
 
 struct ClusterTestRunner {
     logs: LogTail,
+    trace_tail: TraceTail,
     cluster: Cluster,
     health_check_runner: HealthCheckRunner,
     deployment_manager: DeploymentManager,
@@ -305,6 +300,10 @@ struct ClusterTestRunner {
 
 fn parse_host_port(s: &str) -> Result<(String, u32)> {
     let v = s.split(':').collect::<Vec<&str>>();
+    if v.len() == 1 {
+        let default_port = DEFAULT_JSON_RPC_PORT as u32;
+        return Ok((v[0].to_string(), default_port));
+    }
     if v.len() != 2 {
         return Err(format_err!("Failed to parse {:?} in host:port format", s));
     }
@@ -494,7 +493,7 @@ impl ClusterTestRunner {
         let aws = util.aws;
         let cluster_swarm = util.cluster_swarm;
         let log_tail_started = Instant::now();
-        let logs = DebugPortLogThread::spawn_new(&cluster);
+        let (logs, trace_tail) = DebugPortLogThread::spawn_new(&cluster);
         let log_tail_startup_time = Instant::now() - log_tail_started;
         info!(
             "Log tail thread started in {} ms",
@@ -539,6 +538,7 @@ impl ClusterTestRunner {
             };
         Self {
             logs,
+            trace_tail,
             cluster,
             health_check_runner,
             deployment_manager,
@@ -648,9 +648,10 @@ impl ClusterTestRunner {
     pub fn print_report(&self) {
         let json_report =
             serde_json::to_string_pretty(&self.report).expect("Failed to serialize report to json");
-        println!("====json-report-begin===");
-        println!("{}", json_report);
-        println!("====json-report-end===");
+        info!(
+            "\n====json-report-begin===\n{}\n====json-report-end===",
+            json_report
+        );
     }
 
     pub fn perf_run(&mut self) -> String {
@@ -699,6 +700,7 @@ impl ClusterTestRunner {
         let experiment_deadline = Instant::now() + deadline;
         let context = Context::new(
             &mut self.tx_emitter,
+            &mut self.trace_tail,
             &self.prometheus,
             &self.cluster,
             &mut self.report,

@@ -4,19 +4,20 @@
 use crate::{counters, state_replication::StateComputer};
 use anyhow::{ensure, Result};
 use consensus_types::{block::Block, executed_block::ExecutedBlock};
-use executor::{ExecutedTrees, Executor, ProcessedVMOutput};
+use executor::Executor;
+use executor_types::{ExecutedTrees, ProcessedVMOutput};
 use libra_logger::prelude::*;
 use libra_types::{
     crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeProof},
     transaction::{SignedTransaction, Transaction},
 };
+use libra_vm::LibraVM;
 use state_synchronizer::StateSyncClient;
 use std::{
     convert::TryFrom,
     sync::Arc,
     time::{Duration, Instant},
 };
-use vm_runtime::LibraVM;
 
 /// Basic communication with the Execution module;
 /// implements StateComputer traits.
@@ -69,6 +70,7 @@ impl StateComputer for ExecutionProxy {
         // TODO: figure out error handling for the prologue txn
         self.executor
             .execute_block(
+                block.id(),
                 Self::transactions_from_block(block),
                 parent_executed_trees,
                 committed_trees,
@@ -112,11 +114,15 @@ impl StateComputer for ExecutionProxy {
             })
             .collect();
 
-        let committed_txns =
+        let (committed_txns, reconfig_events) =
             self.executor
                 .commit_blocks(committable_blocks, finality_proof, committed_trees)?;
         counters::BLOCK_COMMIT_DURATION_S.observe_duration(pre_commit_instant.elapsed());
-        if let Err(e) = self.synchronizer.commit(committed_txns).await {
+        if let Err(e) = self
+            .synchronizer
+            .commit(committed_txns, reconfig_events)
+            .await
+        {
             error!("failed to notify state synchronizer: {:?}", e);
         }
         Ok(())

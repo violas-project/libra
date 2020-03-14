@@ -13,13 +13,13 @@ use libra_config::config::{NetworkConfig, NodeConfig, RoleType};
 use libra_json_rpc::bootstrap_from_config as bootstrap_rpc;
 use libra_logger::prelude::*;
 use libra_metrics::metric_server;
+use libra_vm::LibraVM;
 use network::validator_network::network_builder::{NetworkBuilder, TransportType};
 use state_synchronizer::StateSynchronizer;
 use std::{collections::HashMap, net::ToSocketAddrs, sync::Arc, thread, time::Instant};
 use storage_client::{StorageReadServiceClient, StorageWriteServiceClient};
 use storage_service::{init_libra_db, start_storage_service_with_db};
 use tokio::runtime::{Builder, Runtime};
-use vm_runtime::LibraVM;
 
 const AC_SMP_CHANNEL_BUFFER_SIZE: usize = 1_024;
 const INTRA_NODE_CHANNEL_BUFFER_SIZE: usize = 1;
@@ -166,7 +166,6 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
     let mut instant = Instant::now();
     let libra_db = init_libra_db(&node_config);
     let storage = start_storage_service_with_db(&node_config, Arc::clone(&libra_db));
-    let rpc_runtime = bootstrap_rpc(&node_config, libra_db);
 
     debug!(
         "Storage service started in {} ms",
@@ -180,6 +179,10 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
     let mut state_sync_network_handles = vec![];
     let mut mempool_network_handles = vec![];
     let mut validator_network_provider = None;
+    let mut reconfig_event_subscriptions = vec![];
+    let (mempool_reconfig_subscription, mempool_reconfig_events) =
+        libra_mempool::generate_reconfig_subscription();
+    reconfig_event_subscriptions.push(mempool_reconfig_subscription);
 
     if let Some(network) = node_config.validator_network.as_mut() {
         let (runtime, mut network_builder) = setup_network(network, RoleType::Validator);
@@ -210,17 +213,6 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
         debug!("Network started for peer_id: {}", full_node_network.peer_id);
     }
 
-    let debug_if = setup_debug_interface(&node_config);
-
-    let metrics_port = node_config.debug_interface.metrics_server_port;
-    let metric_host = node_config.debug_interface.address.clone();
-    thread::spawn(move || metric_server::start_server(metric_host, metrics_port, false));
-    let public_metrics_port = node_config.debug_interface.public_metrics_server_port;
-    let public_metric_host = node_config.debug_interface.address.clone();
-    thread::spawn(move || {
-        metric_server::start_server(public_metric_host, public_metrics_port, true)
-    });
-
     // for state sync to send requests to mempool
     let (state_sync_to_mempool_sender, state_sync_requests) =
         channel(INTRA_NODE_CHANNEL_BUFFER_SIZE);
@@ -229,9 +221,13 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
         state_sync_to_mempool_sender,
         Arc::clone(&executor),
         &node_config,
+        reconfig_event_subscriptions,
     );
-    let (ac_sender, client_events) = channel(AC_SMP_CHANNEL_BUFFER_SIZE);
-    let admission_control_runtime = AdmissionControlService::bootstrap(&node_config, ac_sender);
+    let (mp_client_sender, mp_client_events) = channel(AC_SMP_CHANNEL_BUFFER_SIZE);
+
+    let admission_control_runtime =
+        AdmissionControlService::bootstrap(&node_config, mp_client_sender.clone());
+    let rpc_runtime = bootstrap_rpc(&node_config, libra_db, mp_client_sender);
 
     let mut consensus = None;
     let (consensus_to_mempool_sender, consensus_requests) = channel(INTRA_NODE_CHANNEL_BUFFER_SIZE);
@@ -240,9 +236,10 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
     let mempool = libra_mempool::bootstrap(
         node_config,
         mempool_network_handles,
-        client_events,
+        mp_client_events,
         consensus_requests,
         state_sync_requests,
+        mempool_reconfig_events,
     );
     debug!("Mempool started in {} ms", instant.elapsed().as_millis());
 
@@ -287,6 +284,17 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
         consensus = Some(consensus_provider);
         debug!("Consensus started in {} ms", instant.elapsed().as_millis());
     }
+
+    let debug_if = setup_debug_interface(&node_config);
+
+    let metrics_port = node_config.debug_interface.metrics_server_port;
+    let metric_host = node_config.debug_interface.address.clone();
+    thread::spawn(move || metric_server::start_server(metric_host, metrics_port, false));
+    let public_metrics_port = node_config.debug_interface.public_metrics_server_port;
+    let public_metric_host = node_config.debug_interface.address.clone();
+    thread::spawn(move || {
+        metric_server::start_server(public_metric_host, public_metrics_port, true)
+    });
 
     LibraHandle {
         _network_runtimes: network_runtimes,

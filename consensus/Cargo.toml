@@ -26,15 +26,16 @@ serde = { version = "1.0.99", default-features = false }
 serde_json = "1.0"
 thiserror = "1.0"
 termion = { version = "1.5.3", default-features = false }
-tokio = { version = "0.2.12", features = ["full"] }
-prometheus = { version = "0.7.0", default-features = false }
+tokio = { version = "0.2.13", features = ["full"] }
+prometheus = { version = "0.8.0", default-features = false }
 proptest = { version = "0.9.4", optional = true }
 
 channel = { path = "../common/channel", version = "0.1.0" }
 consensus-types = { path = "consensus-types", version = "0.1.0", default-features = false }
 crash-handler = { path = "../common/crash-handler", version = "0.1.0" }
 debug-interface = { path = "../common/debug-interface", version = "0.1.0" }
-executor = { path = "../executor", version = "0.1.0" }
+executor = { path = "../execution/executor", version = "0.1.0" }
+executor-types = { path = "../execution/executor-types", version = "0.1.0" }
 lcs = { path = "../common/lcs", version = "0.1.0", package = "libra-canonical-serialization" }
 libra-config = { path = "../config", version = "0.1.0" }
 libra-crypto = { path = "../crypto/crypto", version = "0.1.0" }
@@ -49,7 +50,7 @@ safety-rules = { path = "safety-rules", version = "0.1.0" }
 state-synchronizer = { path = "../state-synchronizer", version = "0.1.0" }
 schemadb = { path = "../storage/schemadb", version = "0.1.0" }
 storage-client = { path = "../storage/storage-client", version = "0.1.0" }
-vm-runtime = { path = "../language/vm/vm-runtime", version = "0.1.0" }
+libra-vm = { path = "../language/libra-vm", version = "0.1.0" }
 
 [dev-dependencies]
 cached = "0.11.0"

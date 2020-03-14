@@ -4,7 +4,8 @@
 use crate::{
     peer::DisconnectReason,
     peer_manager::{
-        ConnectionNotification, PeerManager, PeerManagerNotification, PeerManagerRequest,
+        ConnectionNotification, ConnectionRequest, PeerManager, PeerManagerNotification,
+        PeerManagerRequest,
     },
     protocols::identity::{exchange_identity, Identity},
     ProtocolId,
@@ -32,7 +33,7 @@ use std::{
 };
 use tokio::runtime::Handle;
 
-const HELLO_PROTOCOL: &[u8] = b"/hello-world/1.0.0";
+const TEST_PROTOCOL: ProtocolId = ProtocolId::ConsensusRpc;
 
 // Builds a concrete typed transport (instead of using impl Trait) for testing PeerManager.
 // Specifically this transport is compatible with the `build_test_connection` test helper making
@@ -88,10 +89,12 @@ fn build_test_peer_manager(
         Yamux<MemorySocket>,
     >,
     libra_channel::Sender<(PeerId, ProtocolId), PeerManagerRequest>,
+    libra_channel::Sender<PeerId, ConnectionRequest>,
     libra_channel::Receiver<(PeerId, ProtocolId), PeerManagerNotification>,
 ) {
-    let hello_protocol = ProtocolId::from_static(HELLO_PROTOCOL);
     let (peer_manager_request_tx, peer_manager_request_rx) =
+        libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(1).unwrap(), None);
+    let (connection_reqs_tx, connection_reqs_rx) =
         libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(1).unwrap(), None);
     let (hello_tx, hello_rx) =
         libra_channel::new(QueueStyle::FIFO, NonZeroUsize::new(1).unwrap(), None);
@@ -103,21 +106,28 @@ fn build_test_peer_manager(
         RoleType::Validator,
         "/memory/0".parse().unwrap(),
         peer_manager_request_rx,
-        HashSet::from_iter([hello_protocol.clone()].iter().cloned()), /* rpc protocols */
-        HashSet::new(),                                               /* direct-send protocols */
-        HashMap::from_iter([(hello_protocol, hello_tx)].iter().cloned()),
+        connection_reqs_rx,
+        HashSet::from_iter([TEST_PROTOCOL].iter().cloned()), /* rpc protocols */
+        HashSet::new(),                                      /* direct-send protocols */
+        HashMap::from_iter([(TEST_PROTOCOL, hello_tx)].iter().cloned()),
         vec![],
         1024, /* max concurrent network requests */
         1024, /* max concurrent network notifications */
         1024, /* channel size */
     );
 
-    (peer_manager, peer_manager_request_tx, hello_rx)
+    (
+        peer_manager,
+        peer_manager_request_tx,
+        connection_reqs_tx,
+        hello_rx,
+    )
 }
 
 async fn open_hello_substream<T: Control>(connection: &mut T) -> io::Result<()> {
     let outbound = connection.open_stream().await?;
-    let (_, _) = negotiate_outbound_interactive(outbound, [HELLO_PROTOCOL]).await?;
+    let (_, _) =
+        negotiate_outbound_interactive(outbound, [lcs::to_bytes(&TEST_PROTOCOL).unwrap()]).await?;
     Ok(())
 }
 
@@ -183,7 +193,13 @@ async fn check_correct_connection_is_live(
     }
 
     assert!(open_hello_substream(&mut dropped_connection).await.is_err());
-    assert!(open_hello_substream(&mut live_connection).await.is_ok());
+    if let Err(err) = open_hello_substream(&mut live_connection).await {
+        assert!(
+            false,
+            "Failed to open substream on connection that should be live: {:?}",
+            err
+        );
+    }
 
     live_connection.close().await.unwrap();
     assert_peer_disconnected_event(
@@ -197,12 +213,12 @@ async fn check_correct_connection_is_live(
 
 #[test]
 fn peer_manager_simultaneous_dial_two_inbound() {
-    ::libra_logger::try_init_for_testing();
+    ::libra_logger::Logger::new().environment_only(true).init();
     let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
-    let (mut peer_manager, _request_tx, _hello_rx) =
+    let (mut peer_manager, _request_tx, _connection_reqs_tx, _hello_rx) =
         build_test_peer_manager(runtime.handle().clone(), ids[1]);
 
     let test = async move {
@@ -247,7 +263,7 @@ fn peer_manager_simultaneous_dial_inbound_outbound_remote_id_larger() {
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
-    let (mut peer_manager, _request_tx, _hello_rx) =
+    let (mut peer_manager, _request_tx, _connection_reqs_tx, _hello_rx) =
         build_test_peer_manager(runtime.handle().clone(), ids[0]);
 
     let test = async move {
@@ -293,7 +309,7 @@ fn peer_manager_simultaneous_dial_inbound_outbound_own_id_larger() {
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
-    let (mut peer_manager, _request_tx, _hello_rx) =
+    let (mut peer_manager, _request_tx, _connection_reqs_tx, _hello_rx) =
         build_test_peer_manager(runtime.handle().clone(), ids[1]);
 
     let test = async move {
@@ -339,7 +355,7 @@ fn peer_manager_simultaneous_dial_outbound_inbound_remote_id_larger() {
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
-    let (mut peer_manager, _request_tx, _hello_rx) =
+    let (mut peer_manager, _request_tx, _connection_reqs_tx, _hello_rx) =
         build_test_peer_manager(runtime.handle().clone(), ids[0]);
 
     let test = async move {
@@ -381,11 +397,12 @@ fn peer_manager_simultaneous_dial_outbound_inbound_remote_id_larger() {
 
 #[test]
 fn peer_manager_simultaneous_dial_outbound_inbound_own_id_larger() {
+    ::libra_logger::Logger::new().environment_only(true).init();
     let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
-    let (mut peer_manager, _request_tx, _hello_rx) =
+    let (mut peer_manager, _request_tx, _connection_reqs_tx, _hello_rx) =
         build_test_peer_manager(runtime.handle().clone(), ids[1]);
 
     let test = async move {
@@ -427,11 +444,12 @@ fn peer_manager_simultaneous_dial_outbound_inbound_own_id_larger() {
 
 #[test]
 fn peer_manager_simultaneous_dial_two_outbound() {
+    ::libra_logger::Logger::new().environment_only(true).init();
     let mut runtime = ::tokio::runtime::Runtime::new().unwrap();
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
-    let (mut peer_manager, _request_tx, _hello_rx) =
+    let (mut peer_manager, _request_tx, _connection_reqs_tx, _hello_rx) =
         build_test_peer_manager(runtime.handle().clone(), ids[1]);
 
     let test = async move {
@@ -465,7 +483,6 @@ fn peer_manager_simultaneous_dial_two_outbound() {
         )
         .await;
     };
-
     runtime.block_on(test);
 }
 
@@ -475,7 +492,7 @@ fn peer_manager_simultaneous_dial_disconnect_event() {
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
-    let (mut peer_manager, _request_tx, _hello_rx) =
+    let (mut peer_manager, _request_tx, _connection_reqs_tx, _hello_rx) =
         build_test_peer_manager(runtime.handle().clone(), ids[1]);
 
     let test = async move {
@@ -510,7 +527,7 @@ fn test_dial_disconnect() {
 
     // Create a list of ordered PeerIds so we can ensure how PeerIds will be compared.
     let ids = ordered_peer_ids(2);
-    let (mut peer_manager, _request_tx, _hello_rx) =
+    let (mut peer_manager, _request_tx, _connection_reqs_tx, _hello_rx) =
         build_test_peer_manager(runtime.handle().clone(), ids[1]);
 
     let test = async move {
@@ -526,7 +543,7 @@ fn test_dial_disconnect() {
         // Send DisconnectPeer request to PeerManager.
         let (disconnect_resp_tx, disconnect_resp_rx) = oneshot::channel();
         peer_manager
-            .handle_request(PeerManagerRequest::DisconnectPeer(
+            .handle_connection_request(ConnectionRequest::DisconnectPeer(
                 ids[0],
                 disconnect_resp_tx,
             ))
@@ -544,5 +561,6 @@ fn test_dial_disconnect() {
         // Sender of disconnect request should receive acknowledgement once connection is closed.
         disconnect_resp_rx.await.unwrap().unwrap();
     };
+
     runtime.block_on(test);
 }

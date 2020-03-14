@@ -275,6 +275,7 @@ fn get_transaction_parameters<'a>(
     config: &'a TransactionConfig,
 ) -> TransactionParameters<'a> {
     let account_resource = exec.read_account_resource(config.sender).unwrap();
+    let account_balance = exec.read_balance_resource(config.sender).unwrap();
 
     TransactionParameters {
         sender_addr: *config.sender.address(),
@@ -284,12 +285,9 @@ fn get_transaction_parameters<'a>(
             .sequence_number
             .unwrap_or_else(|| account_resource.sequence_number()),
         max_gas_amount: config.max_gas.unwrap_or_else(|| {
-            std::cmp::min(
-                MAXIMUM_NUMBER_OF_GAS_UNITS.get(),
-                account_resource.balance(),
-            )
+            std::cmp::min(MAXIMUM_NUMBER_OF_GAS_UNITS.get(), account_balance.coin())
         }),
-        gas_unit_price: 1,
+        gas_unit_price: config.gas_price.unwrap_or(1),
         // TTL is 86400s. Initial time was set to 0.
         expiration_time: config
             .expiration_time
@@ -360,7 +358,7 @@ fn run_transaction(
                     Err(ErrorKind::VMExecutionFailure(output).into())
                 }
             }
-            TransactionStatus::Discard(_) => {
+            TransactionStatus::Discard(_) | TransactionStatus::Retry => {
                 checked_verify!(output.write_set().is_empty());
                 Err(ErrorKind::DiscardedTransaction(output).into())
             }

@@ -22,11 +22,16 @@ use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use getrandom::getrandom;
 use language_e2e_tests::executor::FakeExecutor;
 use libra_config::config::VMConfig;
+use libra_logger::{debug, error, info};
 use libra_state_view::StateView;
-use libra_types::{account_address::AccountAddress, byte_array::ByteArray, vm_error::StatusCode};
+use libra_types::{
+    account_address::{AccountAddress, ADDRESS_LENGTH},
+    byte_array::ByteArray,
+    vm_error::StatusCode,
+};
+use libra_vm::LibraVM;
 use move_vm_types::values::Value;
 use rand::{rngs::StdRng, Rng, SeedableRng};
-use slog_scope::{debug, error, info};
 use std::{fs, io::Write, panic, thread};
 use utils::module_generation::generate_module;
 use vm::{
@@ -35,7 +40,6 @@ use vm::{
     file_format::{CompiledModule, CompiledModuleMut, FunctionDefinitionIndex, SignatureToken},
     transaction_metadata::TransactionMetadata,
 };
-use vm_runtime::LibraVM;
 
 /// This function calls the Bytecode verifier to test it
 fn run_verifier(module: CompiledModule) -> Result<VerifiedModule, String> {
@@ -60,7 +64,7 @@ fn run_vm(module: VerifiedModule) -> VMResult<()> {
         .arg_types
         .iter()
         .map(|sig_tok| match sig_tok {
-            SignatureToken::Address => Value::address(AccountAddress::new([0; 32])),
+            SignatureToken::Address => Value::address(AccountAddress::new([0u8; ADDRESS_LENGTH])),
             SignatureToken::U64 => Value::u64(0),
             SignatureToken::Bool => Value::bool(true),
             SignatureToken::ByteArray => Value::byte_array(ByteArray::new(vec![])),

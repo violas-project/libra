@@ -12,11 +12,14 @@ use libra_config::{
     config::{VMConfig, VMPublishingOption},
     generator,
 };
+use libra_crypto::HashValue;
 use libra_state_view::StateView;
 use libra_types::{
     access_path::AccessPath,
-    account_config::AccountResource,
+    account_config::{AccountResource, BalanceResource},
+    block_metadata::BlockMetadata,
     crypto_proxies::ValidatorSet,
+    discovery_set::mock::mock_discovery_set,
     language_storage::ModuleId,
     transaction::{
         SignedTransaction, Transaction, TransactionOutput, TransactionPayload, TransactionStatus,
@@ -24,10 +27,11 @@ use libra_types::{
     vm_error::{StatusCode, VMStatus},
     write_set::WriteSet,
 };
+use libra_vm::{LibraVM, VMExecutor, VMVerifier};
+use std::collections::BTreeMap;
 use stdlib::{stdlib_modules, StdLibOptions};
 use vm::CompiledModule;
 use vm_genesis::GENESIS_KEYPAIR;
-use vm_runtime::{LibraVM, VMExecutor, VMVerifier};
 
 /// Provides an environment to run a VM instance.
 ///
@@ -36,6 +40,7 @@ use vm_runtime::{LibraVM, VMExecutor, VMVerifier};
 pub struct FakeExecutor {
     config: VMConfig,
     data_store: FakeDataStore,
+    block_time: u64,
 }
 
 pub fn test_all_genesis_impl<T, F>(
@@ -85,6 +90,7 @@ impl FakeExecutor {
         let mut executor = FakeExecutor {
             config,
             data_store: FakeDataStore::default(),
+            block_time: 0,
         };
         executor.apply_write_set(write_set);
         executor
@@ -110,6 +116,7 @@ impl FakeExecutor {
         FakeExecutor {
             config: VMConfig::default(),
             data_store: FakeDataStore::default(),
+            block_time: 0,
         }
     }
 
@@ -123,14 +130,16 @@ impl FakeExecutor {
         let genesis_write_set = if genesis_modules.is_none() && validator_set.is_none() {
             GENESIS_WRITE_SET.clone()
         } else {
-            let validator_set = validator_set
-                .unwrap_or_else(|| generator::validator_swarm_for_testing(10).validator_set);
-            let discovery_set = vm_genesis::make_placeholder_discovery_set(&validator_set);
+            let validator_set_len: usize = validator_set.as_ref().map_or(10, |s| s.len());
+            let swarm = generator::validator_swarm_for_testing(validator_set_len);
+            let validator_set = validator_set.unwrap_or(swarm.validator_set);
+            let discovery_set = mock_discovery_set(&validator_set);
             let stdlib_modules =
                 genesis_modules.unwrap_or_else(|| stdlib_modules(StdLibOptions::Staged).to_vec());
             match vm_genesis::encode_genesis_transaction_with_validator_and_modules(
                 &GENESIS_KEYPAIR.0,
                 GENESIS_KEYPAIR.1.clone(),
+                &swarm.nodes,
                 validator_set,
                 discovery_set,
                 &stdlib_modules,
@@ -175,11 +184,29 @@ impl FakeExecutor {
 
     /// Reads the resource [`Value`] for an account from this executor's data store.
     pub fn read_account_resource(&self, account: &Account) -> Option<AccountResource> {
-        let ap = account.make_access_path();
+        let ap = account.make_account_access_path();
         let data_blob = StateView::get(&self.data_store, &ap)
             .expect("account must exist in data store")
             .expect("data must exist in data store");
         lcs::from_bytes(data_blob.as_slice()).ok()
+    }
+
+    /// Reads the balance resource value for an account from this executor's data store.
+    pub fn read_balance_resource(&self, account: &Account) -> Option<BalanceResource> {
+        let ap = account.make_balance_access_path();
+        let data_blob = StateView::get(&self.data_store, &ap)
+            .expect("account must exist in data store")
+            .expect("data must exist in data store");
+        lcs::from_bytes(data_blob.as_slice()).ok()
+    }
+
+    /// Reads the AccountResource and BalanceResource for this account. These are coupled together.
+    pub fn read_account_info(
+        &self,
+        account: &Account,
+    ) -> Option<(AccountResource, BalanceResource)> {
+        self.read_account_resource(account)
+            .and_then(|ar| self.read_balance_resource(account).map(|br| (ar, br)))
     }
 
     /// Executes the given block of transactions.
@@ -217,6 +244,7 @@ impl FakeExecutor {
                 output
             }
             TransactionStatus::Discard(status) => panic!("transaction discarded with {:?}", status),
+            TransactionStatus::Retry => panic!("transaction status is retry"),
         }
     }
 
@@ -254,5 +282,24 @@ impl FakeExecutor {
     }
     pub fn config(&self) -> &VMConfig {
         &self.config
+    }
+
+    pub fn new_block(&mut self) {
+        let validator_address =
+            *generator::validator_swarm_for_testing(10).validator_set[0].account_address();
+        self.block_time += 1;
+        let new_block = BlockMetadata::new(
+            HashValue::zero(),
+            self.block_time,
+            BTreeMap::new(),
+            validator_address,
+        );
+        self.apply_write_set(
+            self.execute_transaction_block(vec![Transaction::BlockMetadata(new_block)])
+                .expect("Executing block prologue should succeed")
+                .get(0)
+                .expect("Failed to get the execution result for Block Prologue")
+                .write_set(),
+        );
     }
 }

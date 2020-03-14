@@ -16,10 +16,11 @@ pub mod crypto_proxies;
 pub mod discovery_info;
 pub mod discovery_set;
 pub mod event;
+pub mod event_subscription;
 pub mod get_with_proof;
-pub mod identifier;
 pub mod language_storage;
 pub mod ledger_info;
+pub mod mempool_status;
 pub mod proof;
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod proptest_types;
@@ -27,6 +28,7 @@ pub mod proto;
 #[cfg(any(test, feature = "fuzzing"))]
 pub mod test_helpers;
 pub mod transaction;
+pub mod trusted_state;
 pub mod validator_change;
 pub mod validator_public_keys;
 pub mod validator_set;

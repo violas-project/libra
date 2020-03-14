@@ -15,7 +15,7 @@
 //! to the peer.
 use crate::{
     common::NetworkPublicKeys,
-    peer_manager::{self, conn_status_channel, PeerManagerError, PeerManagerRequestSender},
+    peer_manager::{self, conn_status_channel, ConnectionRequestSender, PeerManagerError},
 };
 use channel;
 use futures::{
@@ -54,10 +54,10 @@ pub struct ConnectivityManager<TTicker, TBackoff> {
     peer_addresses: HashMap<PeerId, Vec<Multiaddr>>,
     /// Ticker to trigger connectivity checks to provide the guarantees stated above.
     ticker: TTicker,
-    /// Channel to send requests to PeerManager.
-    peer_mgr_reqs_tx: PeerManagerRequestSender,
+    /// Channel to send connection requests to PeerManager.
+    connection_reqs_tx: ConnectionRequestSender,
     /// Channel to receive notifications from PeerManager.
-    control_notifs_rx: conn_status_channel::Receiver,
+    connection_notifs_rx: conn_status_channel::Receiver,
     /// Channel over which we receive requests from other actors.
     requests_rx: channel::Receiver<ConnectivityRequest>,
     /// Peers queued to be dialed, potentially with some delay. The dial can be cancelled by
@@ -115,8 +115,8 @@ where
         eligible: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
         seed_peers: HashMap<PeerId, Vec<Multiaddr>>,
         ticker: TTicker,
-        peer_mgr_reqs_tx: PeerManagerRequestSender,
-        control_notifs_rx: conn_status_channel::Receiver,
+        connection_reqs_tx: ConnectionRequestSender,
+        connection_notifs_rx: conn_status_channel::Receiver,
         requests_rx: channel::Receiver<ConnectivityRequest>,
         backoff_strategy: TBackoff,
         max_delay_ms: u64,
@@ -135,8 +135,8 @@ where
             connected: HashMap::new(),
             peer_addresses,
             ticker,
-            peer_mgr_reqs_tx,
-            control_notifs_rx,
+            connection_reqs_tx,
+            connection_notifs_rx,
             requests_rx,
             dial_queue: HashMap::new(),
             dial_states: HashMap::new(),
@@ -172,7 +172,7 @@ where
                     trace!("Event Id: {}, type: ConnectivityRequest, req: {:?}", self.event_id, req);
                     self.handle_request(req);
                 },
-                notif = self.control_notifs_rx.select_next_some() => {
+                notif = self.connection_notifs_rx.select_next_some() => {
                     trace!("Event Id: {}, type: peer_manager::ConnectionStatusNotification, notif: {:?}", self.event_id, notif);
                     self.handle_control_notification(notif);
                 },
@@ -204,7 +204,7 @@ where
         for p in stale_connections.into_iter() {
             info!("Should no longer be connected to peer: {}", p.short_str());
             // Close existing connection.
-            if let Err(e) = self.peer_mgr_reqs_tx.disconnect_peer(p).await {
+            if let Err(e) = self.connection_reqs_tx.disconnect_peer(p).await {
                 info!(
                     "Failed to disconnect from peer: {}. Error: {:?}",
                     p.short_str(),
@@ -266,7 +266,7 @@ where
         let init_dial_state = DialState::new(self.backoff_strategy.clone());
 
         for (p, addrs) in to_connect.into_iter() {
-            let mut peer_mgr_reqs_tx = self.peer_mgr_reqs_tx.clone();
+            let mut connction_reqs_tx = self.connection_reqs_tx.clone();
             let peer_id = *p;
             let dial_state = self
                 .dial_states
@@ -309,7 +309,7 @@ where
                 let dial_result = ::futures::select! {
                     _ = f_delay.fuse() => {
                         info!("Dialing peer: {}, at addr: {}", peer_id.short_str(), addr);
-                        match peer_mgr_reqs_tx.dial_peer(peer_id, addr.clone()).await {
+                        match connction_reqs_tx.dial_peer(peer_id, addr.clone()).await {
                             Ok(_) => DialResult::Success,
                             Err(e) => DialResult::Failed(e),
                         }

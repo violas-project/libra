@@ -1,33 +1,20 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::spec_language_ast::{Condition, Invariant, SyntheticDefinition};
-use anyhow::Result;
-use codespan::{ByteIndex, Span};
-use libra_types::{
-    account_address::AccountAddress,
-    byte_array::ByteArray,
-    identifier::{IdentStr, Identifier},
-    language_storage::ModuleId,
+use crate::{
+    location::*,
+    spec_language_ast::{Condition, Invariant, SyntheticDefinition},
 };
+use anyhow::Result;
+use libra_types::{
+    account_address::AccountAddress, byte_array::ByteArray, language_storage::ModuleId,
+};
+use move_core_types::identifier::Identifier;
 use once_cell::sync::Lazy;
 use std::{
     collections::{HashSet, VecDeque},
     fmt,
-    ops::Deref,
 };
-
-/// Generic wrapper that keeps file locations for any ast-node
-#[derive(Debug, Copy, Clone, Eq, PartialEq, Default)]
-pub struct Spanned<T> {
-    /// The file location
-    pub span: Loc,
-    /// The value being wrapped
-    pub value: T,
-}
-
-/// The file location type
-pub type Loc = Span<ByteIndex>;
 
 //**************************************************************************************************
 // Program
@@ -64,6 +51,9 @@ pub enum ScriptOrModule {
 pub struct Script {
     /// The dependencies of `main`, i.e. of the transaction script
     pub imports: Vec<ImportDefinition>,
+    /// Explicit declaration of dependencies. If not provided, will be inferred based on given
+    /// dependencies to the IR compiler
+    pub explicit_dependency_declarations: Vec<ModuleDependency>,
     /// The transaction script's `main` procedure
     pub main: Function,
 }
@@ -74,7 +64,7 @@ pub struct Script {
 
 /// Newtype for a name of a module
 #[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
-pub struct ModuleName(Identifier);
+pub struct ModuleName(String);
 
 /// Newtype of the address + the module name
 /// `addr.m`
@@ -93,6 +83,9 @@ pub struct ModuleDefinition {
     pub name: ModuleName,
     /// the module's dependencies
     pub imports: Vec<ImportDefinition>,
+    /// Explicit declaration of dependencies. If not provided, will be inferred based on given
+    /// dependencies to the IR compiler
+    pub explicit_dependency_declarations: Vec<ModuleDependency>,
     /// the structs (including resources) that the module defines
     pub structs: Vec<StructDefinition>,
     /// the procedure that the module defines
@@ -107,6 +100,17 @@ pub struct ModuleDefinition {
 pub enum ModuleIdent {
     Transaction(ModuleName),
     Qualified(QualifiedModuleIdent),
+}
+
+/// Explicitly given dependency
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModuleDependency {
+    /// Qualified identifer of the dependency
+    pub name: ModuleName,
+    /// The structs (including resources) that the dependency defines
+    pub structs: Vec<StructDependency>,
+    /// The signatures of functions that the dependency defines
+    pub functions: Vec<FunctionDependency>,
 }
 
 //**************************************************************************************************
@@ -130,14 +134,14 @@ pub struct ImportDefinition {
 
 /// Newtype for a variable/local
 #[derive(Debug, PartialEq, Hash, Eq, Clone, Ord, PartialOrd)]
-pub struct Var_(Identifier);
+pub struct Var_(String);
 
 /// The type of a variable with a location
 pub type Var = Spanned<Var_>;
 
 /// New type that represents a type variable. Used to declare type formals & reference them.
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
-pub struct TypeVar_(Identifier);
+pub struct TypeVar_(String);
 
 /// The type of a type variable with a location.
 pub type TypeVar = Spanned<TypeVar_>;
@@ -204,7 +208,8 @@ pub struct QualifiedStructIdent {
 }
 
 /// The field newtype
-pub type Field_ = libra_types::access_path::Field;
+#[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
+pub struct Field_(String);
 
 /// A field coupled with source location information
 pub type Field = Spanned<Field_>;
@@ -214,7 +219,7 @@ pub type Fields<T> = Vec<(Field, T)>;
 
 /// Newtype for the name of a struct
 #[derive(Clone, Debug, Eq, Hash, PartialEq, PartialOrd, Ord)]
-pub struct StructName(Identifier);
+pub struct StructName(String);
 
 /// A Move struct
 #[derive(Clone, Debug, PartialEq)]
@@ -231,9 +236,20 @@ pub struct StructDefinition_ {
     /// the invariants for this struct
     pub invariants: Vec<Invariant>,
 }
-
 /// The type of a StructDefinition along with its source location information
 pub type StructDefinition = Spanned<StructDefinition_>;
+
+/// An explicit struct dependency
+#[derive(Clone, Debug, PartialEq)]
+pub struct StructDependency {
+    /// The struct will have kind resource if `is_nominal_resource` is true
+    /// and will be dependent on it's type arguments otherwise
+    pub is_nominal_resource: bool,
+    /// Human-readable name for the struct that also serves as a nominal type
+    pub name: StructName,
+    /// Kind constraints of the type parameters
+    pub type_formals: Vec<(TypeVar, Kind)>,
+}
 
 /// The fields of a Move struct definition
 #[derive(Clone, Debug, PartialEq)]
@@ -250,7 +266,7 @@ pub enum StructDefinitionFields {
 
 /// Newtype for the name of a function
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Clone)]
-pub struct FunctionName(Identifier);
+pub struct FunctionName(String);
 
 /// The signature of a function
 #[derive(PartialEq, Debug, Clone)]
@@ -261,6 +277,15 @@ pub struct FunctionSignature {
     pub return_type: Vec<Type>,
     /// Possibly-empty list of (TypeVar, Kind) pairs.s.
     pub type_formals: Vec<(TypeVar, Kind)>,
+}
+
+/// An explicit function dependency
+#[derive(PartialEq, Debug, Clone)]
+pub struct FunctionDependency {
+    /// Name of the function dependency
+    pub name: FunctionName,
+    /// Signature of the function dependency
+    pub signature: FunctionSignature,
 }
 
 /// Public or internal modifier for a procedure
@@ -283,6 +308,10 @@ pub enum FunctionBody {
     Move {
         locals: Vec<(Var, Type)>,
         code: Block_,
+    },
+    Bytecode {
+        locals: Vec<(Var, Type)>,
+        code: BytecodeBlocks,
     },
     /// The body is provided by the runtime
     Native,
@@ -567,6 +596,75 @@ pub enum Exp_ {
 pub type Exp = Spanned<Exp_>;
 
 //**************************************************************************************************
+// Bytecode
+//**************************************************************************************************
+
+pub type BytecodeBlocks = Vec<(Label, BytecodeBlock)>;
+pub type BytecodeBlock = Vec<Bytecode>;
+
+#[derive(Debug, Clone, Hash, Eq, PartialEq)]
+pub struct Label(pub String);
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Bytecode_ {
+    Pop,
+    Ret,
+    BrTrue(Label),
+    BrFalse(Label),
+    Branch(Label),
+    LdU8(u8),
+    LdU64(u64),
+    LdU128(u128),
+    CastU8,
+    CastU64,
+    CastU128,
+    LdByteArray(ByteArray),
+    LdAddr(AccountAddress),
+    LdTrue,
+    LdFalse,
+    CopyLoc(Var),
+    MoveLoc(Var),
+    StLoc(Var),
+    Call(ModuleName, FunctionName, Vec<Type>),
+    Pack(StructName, Vec<Type>),
+    Unpack(StructName, Vec<Type>),
+    ReadRef,
+    WriteRef,
+    FreezeRef,
+    MutBorrowLoc(Var),
+    ImmBorrowLoc(Var),
+    MutBorrowField(StructName, Field),
+    ImmBorrowField(StructName, Field),
+    MutBorrowGlobal(StructName, Vec<Type>),
+    ImmBorrowGlobal(StructName, Vec<Type>),
+    Add,
+    Sub,
+    Mul,
+    Mod,
+    Div,
+    BitOr,
+    BitAnd,
+    Xor,
+    Or,
+    And,
+    Not,
+    Eq,
+    Neq,
+    Lt,
+    Gt,
+    Le,
+    Ge,
+    Abort,
+    GetTxnSenderAddress,
+    Exists(StructName, Vec<Type>),
+    MoveFrom(StructName, Vec<Type>),
+    MoveToSender(StructName, Vec<Type>),
+    Shl,
+    Shr,
+}
+pub type Bytecode = Spanned<Bytecode_>;
+
+//**************************************************************************************************
 // impls
 //**************************************************************************************************
 
@@ -574,7 +672,8 @@ fn get_external_deps(imports: &[ImportDefinition]) -> Vec<ModuleId> {
     let mut deps = HashSet::new();
     for dep in imports.iter() {
         if let ModuleIdent::Qualified(id) = &dep.ident {
-            deps.insert(ModuleId::new(id.address, id.name.clone().into_inner()));
+            let identifier = Identifier::new(id.name.0.clone()).unwrap();
+            deps.insert(ModuleId::new(id.address, identifier));
         }
     }
     deps.into_iter().collect()
@@ -589,15 +688,24 @@ impl Program {
 
 impl Script {
     /// Create a new `Script` from the imports and the main function
-    pub fn new(imports: Vec<ImportDefinition>, main: Function) -> Self {
-        Script { imports, main }
+    pub fn new(
+        imports: Vec<ImportDefinition>,
+        explicit_dependency_declarations: Vec<ModuleDependency>,
+        main: Function,
+    ) -> Self {
+        Script {
+            imports,
+            explicit_dependency_declarations,
+            main,
+        }
     }
 
     /// Accessor for the body of the 'main' procedure
     pub fn body(&self) -> &Block_ {
-        match self.main.body {
+        match self.main.value.body {
             FunctionBody::Move { ref code, .. } => &code,
-            FunctionBody::Native => panic!("main() can't be native"),
+            FunctionBody::Bytecode { .. } => panic!("Invalid body access on bytecode main()"),
+            FunctionBody::Native => panic!("main() cannot be native"),
         }
     }
 
@@ -607,22 +715,17 @@ impl Script {
     }
 }
 
-static SELF_MODULE_NAME: Lazy<Identifier> = Lazy::new(|| Identifier::new("Self").unwrap());
+static SELF_MODULE_NAME: Lazy<String> = Lazy::new(|| "Self".to_owned());
 
 impl ModuleName {
-    /// Create a new `ModuleName` from an identifier
-    pub fn new(name: Identifier) -> Self {
+    /// Create a new `ModuleName` from a string
+    pub fn new(name: String) -> Self {
         assert!(!name.is_empty());
         ModuleName(name)
     }
 
-    /// Creates a new `ModuleName` from a raw string. Intended for use by the parser.
-    pub fn parse(s: impl Into<Box<str>>) -> Result<Self> {
-        Ok(ModuleName::new(parse_identifier(s.into())?))
-    }
-
     /// Name for the current module handle
-    pub fn self_name() -> &'static IdentStr {
+    pub fn self_name() -> &'static str {
         &*SELF_MODULE_NAME
     }
 
@@ -631,13 +734,13 @@ impl ModuleName {
         ModuleName::new(ModuleName::self_name().into())
     }
 
-    /// Converts self into an identifier.
-    pub fn into_inner(self) -> Identifier {
+    /// Converts self into a string.
+    pub fn into_inner(self) -> String {
         self.0
     }
 
     /// Accessor for the name of the module
-    pub fn as_inner(&self) -> &IdentStr {
+    pub fn as_inner(&self) -> &str {
         &self.0
     }
 }
@@ -674,15 +777,17 @@ impl ModuleDefinition {
     /// and procedures
     /// Does not verify the correctness of any internal properties of its elements
     pub fn new(
-        name: impl Into<Box<str>>,
+        name: impl ToString,
         imports: Vec<ImportDefinition>,
+        explicit_dependency_declarations: Vec<ModuleDependency>,
         structs: Vec<StructDefinition>,
         functions: Vec<(FunctionName, Function)>,
         synthetics: Vec<SyntheticDefinition>,
     ) -> Result<Self> {
         Ok(ModuleDefinition {
-            name: ModuleName::parse(name.into())?,
+            name: ModuleName::new(name.to_string()),
             imports,
+            explicit_dependency_declarations,
             structs,
             functions,
             synthetics,
@@ -756,24 +861,36 @@ impl ImportDefinition {
     }
 }
 
-impl StructName {
-    /// Create a new `StructName` from an identifier
-    pub fn new(name: Identifier) -> Self {
-        StructName(name)
+impl Field_ {
+    /// Create a new `Field_` from a string
+    pub fn new(name: String) -> Self {
+        Field_(name)
     }
 
-    /// Creates a new `StructName` from a raw string. Intended for use by the parser.
-    pub fn parse(s: impl Into<Box<str>>) -> Result<Self> {
-        Ok(StructName::new(parse_identifier(s.into())?))
-    }
-
-    /// Converts self into an identifier.
-    pub fn into_inner(self) -> Identifier {
+    /// Converts self into a string.
+    pub fn into_inner(self) -> String {
         self.0
     }
 
     /// Accessor for the name of the struct
-    pub fn as_inner(&self) -> &IdentStr {
+    pub fn as_inner(&self) -> &str {
+        &self.0
+    }
+}
+
+impl StructName {
+    /// Create a new `StructName` from a string
+    pub fn new(name: String) -> Self {
+        StructName(name)
+    }
+
+    /// Converts self into a string.
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+
+    /// Accessor for the name of the struct
+    pub fn as_inner(&self) -> &str {
         &self.0
     }
 }
@@ -786,14 +903,14 @@ impl StructDefinition_ {
     /// fields do not have reference types
     pub fn move_declared(
         is_nominal_resource: bool,
-        name: impl Into<Box<str>>,
+        name: impl ToString,
         type_formals: Vec<(TypeVar, Kind)>,
         fields: Fields<Type>,
         invariants: Vec<Invariant>,
     ) -> Result<Self> {
         Ok(StructDefinition_ {
             is_nominal_resource,
-            name: StructName::parse(name)?,
+            name: StructName::new(name.to_string()),
             type_formals,
             fields: StructDefinitionFields::Move { fields },
             invariants,
@@ -805,12 +922,12 @@ impl StructDefinition_ {
     /// types
     pub fn native(
         is_nominal_resource: bool,
-        name: impl Into<Box<str>>,
+        name: impl std::string::ToString,
         type_formals: Vec<(TypeVar, Kind)>,
     ) -> Result<Self> {
         Ok(StructDefinition_ {
             is_nominal_resource,
-            name: StructName::parse(name)?,
+            name: StructName::new(name.to_string()),
             type_formals,
             fields: StructDefinitionFields::Native,
             invariants: vec![],
@@ -819,23 +936,18 @@ impl StructDefinition_ {
 }
 
 impl FunctionName {
-    /// Create a new `FunctionName` from an identifier
-    pub fn new(name: Identifier) -> Self {
+    /// Create a new `FunctionName` from a string
+    pub fn new(name: String) -> Self {
         FunctionName(name)
     }
 
-    /// Creates a new `FunctionName` from a raw string. Intended for use by the parser.
-    pub fn parse(s: impl Into<Box<str>>) -> Result<Self> {
-        Ok(FunctionName::new(parse_identifier(s.into())?))
-    }
-
-    /// Converts self into an identifier.
-    pub fn into_inner(self) -> Identifier {
+    /// Converts self into a string.
+    pub fn into_inner(self) -> String {
         self.0
     }
 
     /// Accessor for the name of the function
-    pub fn as_inner(&self) -> &IdentStr {
+    pub fn as_inner(&self) -> &str {
         &self.0
     }
 }
@@ -879,35 +991,35 @@ impl Function_ {
 }
 
 impl Var_ {
-    /// Creates a new `Var` from an identifier.
-    pub fn new(s: Identifier) -> Self {
+    /// Creates a new `Var` from a string.
+    pub fn new(s: String) -> Self {
         Var_(s)
     }
 
-    /// Creates a new `Var` from a raw string. Intended for use by the parser.
-    pub fn parse(s: impl Into<Box<str>>) -> Result<Self> {
-        Ok(Var_::new(parse_identifier(s.into())?))
+    /// Converts self into a string.
+    pub fn into_inner(self) -> String {
+        self.0
     }
 
     /// Accessor for the name of the var
-    pub fn name(&self) -> &IdentStr {
+    pub fn name(&self) -> &str {
         &self.0
     }
 }
 
 impl TypeVar_ {
-    /// Creates a new `TypeVar` from an identifier.
-    pub fn new(s: Identifier) -> Self {
+    /// Creates a new `TypeVar` from an String.
+    pub fn new(s: String) -> Self {
         TypeVar_(s)
     }
 
-    /// Creates a new `TypeVar` from a raw string. Intended for use by the parser.
-    pub fn parse(s: impl Into<Box<str>>) -> Result<Self> {
-        Ok(TypeVar_::new(parse_identifier(s.into())?))
+    /// Converts self into a string.
+    pub fn into_inner(self) -> String {
+        self.0
     }
 
     /// Accessor for the name of the var.
-    pub fn name(&self) -> &IdentStr {
+    pub fn name(&self) -> &str {
         &self.0
     }
 }
@@ -924,14 +1036,14 @@ impl FunctionCall_ {
 
     /// Creates a `FunctionCall::Builtin` variant with no location information
     pub fn builtin(bif: Builtin) -> FunctionCall {
-        Spanned::no_loc(FunctionCall_::Builtin(bif))
+        Spanned::unsafe_no_loc(FunctionCall_::Builtin(bif))
     }
 }
 
 impl Cmd_ {
     /// Creates a command that returns no values
     pub fn return_empty() -> Self {
-        Cmd_::Return(Box::new(Spanned::no_loc(Exp_::ExprList(vec![]))))
+        Cmd_::Return(Box::new(Spanned::unsafe_no_loc(Exp_::ExprList(vec![]))))
     }
 
     /// Creates a command that returns a single value
@@ -996,12 +1108,14 @@ impl Block_ {
 impl Exp_ {
     /// Creates a new address `Exp` with no location information
     pub fn address(addr: AccountAddress) -> Exp {
-        Spanned::no_loc(Exp_::Value(Spanned::no_loc(CopyableVal_::Address(addr))))
+        Spanned::unsafe_no_loc(Exp_::Value(Spanned::unsafe_no_loc(CopyableVal_::Address(
+            addr,
+        ))))
     }
 
     /// Creates a new value `Exp` with no location information
     pub fn value(b: CopyableVal_) -> Exp {
-        Spanned::no_loc(Exp_::Value(Spanned::no_loc(b)))
+        Spanned::unsafe_no_loc(Exp_::Value(Spanned::unsafe_no_loc(b)))
     }
 
     /// Creates a new u64 `Exp` with no location information
@@ -1021,12 +1135,12 @@ impl Exp_ {
 
     /// Creates a new pack/struct-instantiation `Exp` with no location information
     pub fn instantiate(n: StructName, tys: Vec<Type>, s: ExpFields) -> Exp {
-        Spanned::no_loc(Exp_::Pack(n, tys, s))
+        Spanned::unsafe_no_loc(Exp_::Pack(n, tys, s))
     }
 
     /// Creates a new binary operator `Exp` with no location information
     pub fn binop(lhs: Exp, op: BinOp, rhs: Exp) -> Exp {
-        Spanned::no_loc(Exp_::BinopExp(Box::new(lhs), op, Box::new(rhs)))
+        Spanned::unsafe_no_loc(Exp_::BinopExp(Box::new(lhs), op, Box::new(rhs)))
     }
 
     /// Creates a new `e+e` `Exp` with no location information
@@ -1041,12 +1155,12 @@ impl Exp_ {
 
     /// Creates a new `*e` `Exp` with no location information
     pub fn dereference(e: Exp) -> Exp {
-        Spanned::no_loc(Exp_::Dereference(Box::new(e)))
+        Spanned::unsafe_no_loc(Exp_::Dereference(Box::new(e)))
     }
 
     /// Creates a new borrow field `Exp` with no location information
     pub fn borrow(is_mutable: bool, exp: Box<Exp>, field: Field_) -> Exp {
-        Spanned::no_loc(Exp_::Borrow {
+        Spanned::unsafe_no_loc(Exp_::Borrow {
             is_mutable,
             exp,
             field,
@@ -1055,31 +1169,22 @@ impl Exp_ {
 
     /// Creates a new copy-local `Exp` with no location information
     pub fn copy(v: Var) -> Exp {
-        Spanned::no_loc(Exp_::Copy(v))
+        Spanned::unsafe_no_loc(Exp_::Copy(v))
     }
 
     /// Creates a new move-local `Exp` with no location information
     pub fn move_(v: Var) -> Exp {
-        Spanned::no_loc(Exp_::Move(v))
+        Spanned::unsafe_no_loc(Exp_::Move(v))
     }
 
     /// Creates a new function call `Exp` with no location information
     pub fn function_call(f: FunctionCall, e: Exp) -> Exp {
-        Spanned::no_loc(Exp_::FunctionCall(f, Box::new(e)))
+        Spanned::unsafe_no_loc(Exp_::FunctionCall(f, Box::new(e)))
     }
 
     pub fn expr_list(exps: Vec<Exp>) -> Exp {
-        Spanned::no_loc(Exp_::ExprList(exps))
+        Spanned::unsafe_no_loc(Exp_::ExprList(exps))
     }
-}
-
-/// Parses a field.
-pub fn parse_field_(s: impl Into<Box<str>>) -> Result<Field_> {
-    Ok(Field_::new(parse_identifier(s.into())?))
-}
-
-fn parse_identifier(s: Box<str>) -> Result<Identifier> {
-    Identifier::new(s)
 }
 
 //**************************************************************************************************
@@ -1092,6 +1197,7 @@ impl Iterator for Script {
     fn next(&mut self) -> Option<Statement> {
         match self.main.value.body {
             FunctionBody::Move { ref mut code, .. } => code.stmts.pop_front(),
+            FunctionBody::Bytecode { .. } => panic!("main() cannot currently be bytecode"),
             FunctionBody::Native => panic!("main() cannot be native code"),
         }
     }
@@ -1099,30 +1205,7 @@ impl Iterator for Script {
 
 impl PartialEq for Script {
     fn eq(&self, other: &Script) -> bool {
-        self.imports == other.imports && self.main.body == other.main.body
-    }
-}
-
-impl<T> Deref for Spanned<T> {
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        &self.value
-    }
-}
-
-impl<T> AsRef<T> for Spanned<T> {
-    fn as_ref(&self) -> &T {
-        &self.value
-    }
-}
-
-impl<T> Spanned<T> {
-    pub fn no_loc(value: T) -> Spanned<T> {
-        Spanned {
-            value,
-            span: Span::default(),
-        }
+        self.imports == other.imports && self.main.value.body == other.main.value.body
     }
 }
 
@@ -1137,15 +1220,6 @@ impl Iterator for Block_ {
 //**************************************************************************************************
 // Display
 //**************************************************************************************************
-
-impl<T> fmt::Display for Spanned<T>
-where
-    T: fmt::Display,
-{
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.value)
-    }
-}
 
 impl fmt::Display for TypeVar_ {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1190,15 +1264,13 @@ impl fmt::Display for Script {
     }
 }
 
-impl fmt::Display for ImportDefinition {
+impl fmt::Display for ModuleIdent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use ModuleIdent::*;
-        write!(f, "ImportDefinition(")?;
-        match &self.ident {
-            Transaction(module_name) => write!(f, "{}", module_name)?,
-            Qualified(qual_module_ident) => write!(f, "{}", qual_module_ident)?,
-        };
-        write!(f, " => {})", self.alias)
+        match self {
+            Transaction(module_name) => write!(f, "{}", module_name),
+            Qualified(qual_module_ident) => write!(f, "{}", qual_module_ident),
+        }
     }
 }
 
@@ -1217,15 +1289,73 @@ impl fmt::Display for QualifiedModuleIdent {
 impl fmt::Display for ModuleDefinition {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         writeln!(f, "Module({}, ", self.name)?;
-        write!(f, "Structs(")?;
+
+        writeln!(f, "Imports(")?;
+        for import in &self.imports {
+            writeln!(f, "{};", import)?;
+        }
+        writeln!(f, ")")?;
+
+        writeln!(f, "Dependency(")?;
+        for dependency in &self.explicit_dependency_declarations {
+            writeln!(f, "{},", dependency)?;
+        }
+        writeln!(f, ")")?;
+
+        writeln!(f, "Structs(")?;
         for struct_def in &self.structs {
-            write!(f, "{}, ", struct_def)?;
+            writeln!(f, "{}, ", struct_def)?;
         }
-        write!(f, "Functions(")?;
+        writeln!(f, ")")?;
+
+        writeln!(f, "Functions(")?;
         for (fun_name, fun) in &self.functions {
-            write!(f, "({}, {}), ", fun_name, fun)?;
+            writeln!(f, "({}, {}), ", fun_name, fun)?;
         }
-        write!(f, ")")
+        writeln!(f, ")")?;
+
+        writeln!(f, ")")
+    }
+}
+
+impl fmt::Display for ImportDefinition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "import {} as {}", &self.ident, &self.alias)
+    }
+}
+
+impl fmt::Display for ModuleDependency {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Dependency({}, ", &self.name)?;
+        for sdep in &self.structs {
+            writeln!(f, "{}, ", sdep)?
+        }
+        for fdep in &self.functions {
+            writeln!(f, "{}, ", fdep)?
+        }
+        writeln!(f, ")")
+    }
+}
+
+impl fmt::Display for StructDependency {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "StructDep({} {}{}",
+            if self.is_nominal_resource {
+                "resource"
+            } else {
+                ""
+            },
+            &self.name,
+            format_type_formals(&self.type_formals)
+        )
+    }
+}
+
+impl fmt::Display for FunctionDependency {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "FunctionDep({}{}", &self.name, &self.signature)
     }
 }
 
@@ -1248,6 +1378,12 @@ impl fmt::Display for StructDefinition_ {
 impl fmt::Display for Function_ {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{} ({})", self.signature, self.body)
+    }
+}
+
+impl fmt::Display for Field_ {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -1274,6 +1410,20 @@ impl fmt::Display for FunctionBody {
                     write!(f, "let {}: {};", local, ty)?;
                 }
                 writeln!(f, "{}", code)
+            }
+            FunctionBody::Bytecode { locals, code } => {
+                write!(f, "locals: [")?;
+                for (local, ty) in locals {
+                    write!(f, "{}: {},", local, ty)?;
+                }
+                writeln!(f, "]")?;
+                for (label, block) in code {
+                    writeln!(f, "label {}:", &label.0)?;
+                    for instr in block {
+                        writeln!(f, "  {}", instr)?;
+                    }
+                }
+                Ok(())
             }
             FunctionBody::Native => write!(f, "native"),
         }
@@ -1603,6 +1753,73 @@ impl fmt::Display for Exp_ {
                     write!(f, "({})", intersperse(exps, ", "))
                 }
             }
+        }
+    }
+}
+
+impl fmt::Display for Bytecode_ {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Bytecode_::Pop => write!(f, "Pop"),
+            Bytecode_::Ret => write!(f, "Ret"),
+            Bytecode_::BrTrue(lbl) => write!(f, "BrTrue {}", &lbl.0),
+            Bytecode_::BrFalse(lbl) => write!(f, "BrFalse {}", &lbl.0),
+            Bytecode_::Branch(lbl) => write!(f, "Branch {}", &lbl.0),
+            Bytecode_::LdU8(u) => write!(f, "LdU8 {}", u),
+            Bytecode_::LdU64(u) => write!(f, "LdU64 {}", u),
+            Bytecode_::LdU128(u) => write!(f, "LdU128 {}", u),
+            Bytecode_::CastU8 => write!(f, "CastU8"),
+            Bytecode_::CastU64 => write!(f, "CastU64"),
+            Bytecode_::CastU128 => write!(f, "CastU128"),
+            Bytecode_::LdByteArray(b) => write!(f, "LdByteArray {}", b),
+            Bytecode_::LdAddr(a) => write!(f, "LdAddr {}", a),
+            Bytecode_::LdTrue => write!(f, "LdTrue"),
+            Bytecode_::LdFalse => write!(f, "LdFalse"),
+            Bytecode_::CopyLoc(v) => write!(f, "CopyLoc {}", v),
+            Bytecode_::MoveLoc(v) => write!(f, "MoveLoc {}", v),
+            Bytecode_::StLoc(v) => write!(f, "StLoc {}", v),
+            Bytecode_::Call(m, n, tys) => write!(f, "Call {}.{}{}", m, n, format_type_actuals(tys)),
+            Bytecode_::Pack(n, tys) => write!(f, "Pack {}{}", n, format_type_actuals(tys)),
+            Bytecode_::Unpack(n, tys) => write!(f, "Unpack {}{}", n, format_type_actuals(tys)),
+            Bytecode_::ReadRef => write!(f, "ReadRef"),
+            Bytecode_::WriteRef => write!(f, "WriteRef"),
+            Bytecode_::FreezeRef => write!(f, "FreezeRef"),
+            Bytecode_::MutBorrowLoc(v) => write!(f, "MutBorrowLoc {}", v),
+            Bytecode_::ImmBorrowLoc(v) => write!(f, "ImmBorrowLoc {}", v),
+            Bytecode_::MutBorrowField(n, field) => write!(f, "MutBorrowField {}.{}", n, field),
+            Bytecode_::ImmBorrowField(n, field) => write!(f, "ImmBorrowField {}.{}", n, field),
+            Bytecode_::MutBorrowGlobal(n, tys) => {
+                write!(f, "MutBorrowGlobal {}{}", n, format_type_actuals(tys))
+            }
+            Bytecode_::ImmBorrowGlobal(n, tys) => {
+                write!(f, "ImmBorrowGlobal {}{}", n, format_type_actuals(tys))
+            }
+            Bytecode_::Add => write!(f, "Add"),
+            Bytecode_::Sub => write!(f, "Sub"),
+            Bytecode_::Mul => write!(f, "Mul"),
+            Bytecode_::Mod => write!(f, "Mod"),
+            Bytecode_::Div => write!(f, "Div"),
+            Bytecode_::BitOr => write!(f, "BitOr"),
+            Bytecode_::BitAnd => write!(f, "BitAnd"),
+            Bytecode_::Xor => write!(f, "Xor"),
+            Bytecode_::Or => write!(f, "Or"),
+            Bytecode_::And => write!(f, "And"),
+            Bytecode_::Not => write!(f, "Not"),
+            Bytecode_::Eq => write!(f, "Eq"),
+            Bytecode_::Neq => write!(f, "Neq"),
+            Bytecode_::Lt => write!(f, "Lt"),
+            Bytecode_::Gt => write!(f, "Gt"),
+            Bytecode_::Le => write!(f, "Le"),
+            Bytecode_::Ge => write!(f, "Ge"),
+            Bytecode_::Abort => write!(f, "Abort"),
+            Bytecode_::GetTxnSenderAddress => write!(f, "GetTxnSenderAddress"),
+            Bytecode_::Exists(n, tys) => write!(f, "Exists {}{}", n, format_type_actuals(tys)),
+            Bytecode_::MoveFrom(n, tys) => write!(f, "MoveFrom {}{}", n, format_type_actuals(tys)),
+            Bytecode_::MoveToSender(n, tys) => {
+                write!(f, "MoveToSender {}{}", n, format_type_actuals(tys))
+            }
+            Bytecode_::Shl => write!(f, "Shl"),
+            Bytecode_::Shr => write!(f, "Shr"),
         }
     }
 }
