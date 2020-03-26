@@ -9,16 +9,25 @@ use crate::genesis_gas_schedule::initial_gas_schedule;
 use anyhow::Result;
 use bytecode_verifier::VerifiedModule;
 use libra_config::config::NodeConfig;
-use libra_crypto::{ed25519::*, traits::ValidKey};
+use libra_crypto::{
+    ed25519::*,
+    traits::ValidKey,
+    x25519::{X25519StaticPrivateKey, X25519StaticPublicKey},
+};
 use libra_state_view::StateView;
 use libra_types::{
     access_path::AccessPath,
-    account_address::{AccountAddress, AuthenticationKey},
+    account_address::AccountAddress,
     account_config,
     contract_event::ContractEvent,
-    crypto_proxies::ValidatorSet,
+    discovery_info::DiscoveryInfo,
     discovery_set::DiscoverySet,
-    transaction::{ChangeSet, RawTransaction, SignatureCheckedTransaction},
+    language_storage::ModuleId,
+    on_chain_config::VMPublishingOption,
+    transaction::{
+        authenticator::AuthenticationKey, ChangeSet, RawTransaction, SignatureCheckedTransaction,
+    },
+    validator_set::ValidatorSet,
 };
 use libra_vm::system_module_names::*;
 use move_core_types::identifier::Identifier;
@@ -29,8 +38,10 @@ use move_vm_state::{
 };
 use move_vm_types::{chain_state::ChainState, values::Value};
 use once_cell::sync::Lazy;
+use parity_multiaddr::Multiaddr;
 use rand::{rngs::StdRng, SeedableRng};
-use stdlib::{stdlib_modules, StdLibOptions};
+use std::str::FromStr;
+use stdlib::{stdlib_modules, transaction_scripts::StdlibScript, StdLibOptions};
 use vm::{
     access::ModuleAccess,
     gas_schedule::{CostTable, GasAlgebra, GasUnits},
@@ -46,6 +57,14 @@ pub const ASSOCIATION_INIT_BALANCE: u64 = 1_000_000_000_000_000;
 pub static GENESIS_KEYPAIR: Lazy<(Ed25519PrivateKey, Ed25519PublicKey)> = Lazy::new(|| {
     let mut rng = StdRng::from_seed(GENESIS_SEED);
     compat::generate_keypair(&mut rng)
+});
+// TODO(philiphayes): remove this when we add discovery set to genesis config.
+static PLACEHOLDER_PUBKEY: Lazy<X25519StaticPublicKey> = Lazy::new(|| {
+    let salt = None;
+    let seed = [69u8; 32];
+    let app_info = None;
+    let (_, pubkey) = X25519StaticPrivateKey::derive_keypair_from_seed(salt, &seed, app_info);
+    pubkey
 });
 
 // Identifiers for well-known functions.
@@ -71,30 +90,67 @@ static ROTATE_AUTHENTICATION_KEY: Lazy<Identifier> =
     Lazy::new(|| Identifier::new("rotate_authentication_key").unwrap());
 static EPILOGUE: Lazy<Identifier> = Lazy::new(|| Identifier::new("epilogue").unwrap());
 
+static SCRIPT_WHITELIST_MODULE: Lazy<ModuleId> = Lazy::new(|| {
+    ModuleId::new(
+        account_config::CORE_CODE_ADDRESS,
+        Identifier::new("ScriptWhitelist").unwrap(),
+    )
+});
+
+static LIBRA_TIME_MODULE: Lazy<ModuleId> = Lazy::new(|| {
+    ModuleId::new(
+        account_config::CORE_CODE_ADDRESS,
+        Identifier::new("LibraTimestamp").unwrap(),
+    )
+});
+
+// TODO(philiphayes): remove this after integrating on-chain discovery with config.
+/// Make a placeholder `DiscoverySet` from the `ValidatorSet`.
+pub fn make_placeholder_discovery_set(validator_set: &ValidatorSet) -> DiscoverySet {
+    let mock_addr = Multiaddr::from_str("/ip4/127.0.0.1/tcp/1234").unwrap();
+    let discovery_set = validator_set
+        .iter()
+        .map(|validator_pubkeys| DiscoveryInfo {
+            account_address: *validator_pubkeys.account_address(),
+            validator_network_identity_pubkey: validator_pubkeys
+                .network_identity_public_key()
+                .clone(),
+            validator_network_address: mock_addr.clone(),
+            fullnodes_network_identity_pubkey: PLACEHOLDER_PUBKEY.clone(),
+            fullnodes_network_address: mock_addr.clone(),
+        })
+        .collect::<Vec<_>>();
+    DiscoverySet::new(discovery_set)
+}
+
 pub fn encode_genesis_transaction_with_validator(
     private_key: &Ed25519PrivateKey,
     public_key: Ed25519PublicKey,
     nodes: &[NodeConfig],
     validator_set: ValidatorSet,
     discovery_set: DiscoverySet,
+    vm_publishing_option: Option<VMPublishingOption>,
 ) -> SignatureCheckedTransaction {
-    encode_genesis_transaction_with_validator_and_modules(
+    encode_genesis_transaction(
         private_key,
         public_key,
         nodes,
         validator_set,
         discovery_set,
         stdlib_modules(StdLibOptions::Staged), // Must use staged stdlib
+        vm_publishing_option
+            .unwrap_or_else(|| VMPublishingOption::Locked(StdlibScript::whitelist())),
     )
 }
 
-pub fn encode_genesis_transaction_with_validator_and_modules(
+pub fn encode_genesis_transaction(
     private_key: &Ed25519PrivateKey,
     public_key: Ed25519PublicKey,
     nodes: &[NodeConfig],
     validator_set: ValidatorSet,
     discovery_set: DiscoverySet,
     stdlib_modules: &[VerifiedModule],
+    vm_publishing_option: VMPublishingOption,
 ) -> SignatureCheckedTransaction {
     // create a MoveVM
     let move_vm = MoveVM::new();
@@ -135,6 +191,12 @@ pub fn encode_genesis_transaction_with_validator_and_modules(
                 &validator_set,
                 &discovery_set,
             );
+            setup_publishing_option(
+                &move_vm,
+                &gas_schedule,
+                &mut interpreter_context,
+                vm_publishing_option,
+            );
             reconfigure(&move_vm, &gas_schedule, &mut interpreter_context);
             publish_stdlib(&mut interpreter_context, stdlib_modules);
 
@@ -163,6 +225,18 @@ fn create_and_initialize_main_accounts(
     let association_addr = account_config::association_address();
     let mut txn_data = TransactionMetadata::default();
     txn_data.sender = association_addr;
+
+    // create  the LBR module
+    move_vm
+        .execute_function(
+            &account_config::LBR_MODULE,
+            &INITIALIZE,
+            &gas_schedule,
+            interpreter_context,
+            &txn_data,
+            vec![],
+        )
+        .expect("Failure initializing LBR");
 
     // create the association account
     move_vm
@@ -204,17 +278,6 @@ fn create_and_initialize_main_accounts(
                 transaction_fee_address, e
             )
         });
-
-    move_vm
-        .execute_function(
-            &account_config::COIN_MODULE,
-            &INITIALIZE,
-            &gas_schedule,
-            interpreter_context,
-            &txn_data,
-            vec![],
-        )
-        .expect("Failure initializing LibraCoin");
 
     move_vm
         .execute_function(
@@ -264,7 +327,7 @@ fn create_and_initialize_main_accounts(
         )
         .expect("Failure minting to association");
 
-    let genesis_auth_key = AuthenticationKey::from_public_key(public_key).to_vec();
+    let genesis_auth_key = AuthenticationKey::ed25519(public_key).to_vec();
     move_vm
         .execute_function(
             &account_config::ACCOUNT_MODULE,
@@ -428,7 +491,7 @@ fn get_validator_authentication_key(
             .as_ref()
             .unwrap()
             .public();
-        let validator_authentication_key = AuthenticationKey::from_public_key(public_key);
+        let validator_authentication_key = AuthenticationKey::ed25519(public_key);
         let derived_address = validator_authentication_key.derived_address();
         if derived_address == *address {
             return Some(validator_authentication_key);
@@ -522,6 +585,29 @@ fn initialize_validators(
     }
 }
 
+fn setup_publishing_option(
+    move_vm: &MoveVM,
+    gas_schedule: &CostTable,
+    interpreter_context: &mut TransactionExecutionContext,
+    publishing_option: VMPublishingOption,
+) {
+    let mut txn_data = TransactionMetadata::default();
+    txn_data.sender = account_config::association_address();
+
+    let option_bytes =
+        lcs::to_bytes(&publishing_option).expect("Cannot serialize publishing option");
+    move_vm
+        .execute_function(
+            &SCRIPT_WHITELIST_MODULE,
+            &INITIALIZE,
+            &gas_schedule,
+            interpreter_context,
+            &txn_data,
+            vec![Value::vector_u8(option_bytes)],
+        )
+        .expect("Failure setting up publishing option");
+}
+
 /// Publish the standard library.
 fn publish_stdlib(interpreter_context: &mut dyn ChainState, stdlib: &[VerifiedModule]) {
     for module in stdlib {
@@ -539,7 +625,19 @@ fn reconfigure(
     gas_schedule: &CostTable,
     interpreter_context: &mut TransactionExecutionContext,
 ) {
-    let txn_data = TransactionMetadata::default();
+    let mut txn_data = TransactionMetadata::default();
+    txn_data.sender = account_config::association_address();
+
+    move_vm
+        .execute_function(
+            &LIBRA_TIME_MODULE,
+            &INITIALIZE,
+            &gas_schedule,
+            interpreter_context,
+            &txn_data,
+            vec![],
+        )
+        .expect("Failure reconfiguring the system");
 
     move_vm
         .execute_function(

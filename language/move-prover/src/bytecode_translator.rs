@@ -14,7 +14,10 @@ use spec_lang::{
     ty::{PrimitiveType, Type},
 };
 use stackless_bytecode_generator::{
-    stackless_bytecode::StacklessBytecode::{self, *},
+    stackless_bytecode::{
+        StacklessBytecode::{self, *},
+        TempIndex,
+    },
     stackless_bytecode_generator::{StacklessFunction, StacklessModuleGenerator},
 };
 
@@ -28,11 +31,11 @@ use crate::{
     code_writer::CodeWriter,
     spec_translator::SpecTranslator,
 };
-use bytecode_to_boogie::{
+use num::Zero;
+use stackless_bytecode_generator::{
     lifetime_analysis::LifetimeAnalysis, stackless_control_flow_graph::StacklessControlFlowGraph,
 };
-use num::Zero;
-use vm::file_format::{CodeOffset, LocalIndex};
+use vm::file_format::CodeOffset;
 
 pub struct BoogieTranslator<'env> {
     env: &'env GlobalEnv,
@@ -71,7 +74,7 @@ struct BytecodeContext<'l> {
     /// at a given bytecode offset.
     /// TODO: the analysis currently represents references via `LocalIndex == u8`, but this might(?)
     /// overflow because the stackless bytcode can introduce temporaries larger than u8.
-    offset_to_dead_refs: BTreeMap<CodeOffset, BTreeSet<LocalIndex>>,
+    offset_to_dead_refs: BTreeMap<CodeOffset, BTreeSet<TempIndex>>,
 }
 
 impl<'l> BytecodeContext<'l> {
@@ -433,7 +436,11 @@ impl<'env> ModuleTranslator<'env> {
         // Set the location to internal so it won't be counted for execution traces
         self.writer
             .set_location(&self.module_env.env.internal_loc());
-
+        emitln!(self.writer, "{");
+        self.writer.indent();
+        emitln!(self.writer, "call $InitVerification();");
+        let spec_translator = SpecTranslator::new(self.writer, &func_env.module_env, false);
+        spec_translator.assume_preconditions(func_env);
         let args = func_env
             .get_type_parameters()
             .iter()
@@ -448,25 +455,25 @@ impl<'env> ModuleTranslator<'env> {
         let rets = (0..func_env.get_return_count())
             .map(|i| format!("$ret{}", i))
             .join(", ");
-        let assumptions = "    call $InitVerification();\n";
         if rets.is_empty() {
-            emit!(
+            emitln!(
                 self.writer,
-                "\n{{\n{}    call {}({});\n}}\n\n",
-                assumptions,
+                "call {}({});",
                 boogie_function_name(func_env),
                 args
             )
         } else {
-            emit!(
+            emitln!(
                 self.writer,
-                "\n{{\n{}    call {} := {}({});\n}}\n\n",
-                assumptions,
+                "call {} := {}({});",
                 rets,
                 boogie_function_name(func_env),
                 args
             )
         }
+        self.writer.unindent();
+        emitln!(self.writer, "}");
+        emitln!(self.writer);
     }
 
     /// This generates boogie code for everything after the function signature
@@ -819,6 +826,14 @@ impl<'env> ModuleTranslator<'env> {
                     str_local(dest),
                     src,
                 );
+                emit!(
+                    self.writer,
+                    &boogie_type_check(
+                        self.module_env.env,
+                        str_local(dest).as_str(),
+                        &self.get_local_type(func_env, *dest)
+                    )
+                );
                 save_borrowed_value(ctx, dest);
             }
             ReadRef(dest, src) => {
@@ -850,6 +865,15 @@ impl<'env> ModuleTranslator<'env> {
             ),
             Call(dests, callee_index, type_actuals, args) => {
                 let callee_env = self.module_env.get_called_function(*callee_index);
+                // If this is a call to a function from another module, assume the module invariants
+                // if any.
+                if callee_env.module_env.get_id() != func_env.module_env.get_id()
+                    && !callee_env.module_env.get_module_invariants().is_empty()
+                {
+                    let spec_translator =
+                        SpecTranslator::new(self.writer, &callee_env.module_env, false);
+                    spec_translator.assume_module_invariants(&callee_env);
+                }
                 let mut dest_str = String::new();
                 let mut args_str = String::new();
                 let mut dest_type_assumptions = vec![];
@@ -929,7 +953,7 @@ impl<'env> ModuleTranslator<'env> {
                         "{}, {}, {}",
                         func_env.module_env.env.file_id_to_idx(loc.file_id()),
                         loc.span().start(),
-                        self.compute_effective_dest(func_env, ctx.code, offset, *dest),
+                        effective_dest,
                     )
                 } else {
                     "0, 0, 0".to_string()
@@ -992,6 +1016,14 @@ impl<'env> ModuleTranslator<'env> {
                     str_local(src),
                     boogie_field_name(field_env)
                 );
+                emit!(
+                    self.writer,
+                    &boogie_type_check(
+                        self.module_env.env,
+                        str_local(dest).as_str(),
+                        &self.get_local_type(func_env, *dest)
+                    )
+                );
             }
             Exists(dest, addr, struct_def_index, type_actuals) => {
                 let resource_type = boogie_struct_type_value(
@@ -1021,6 +1053,14 @@ impl<'env> ModuleTranslator<'env> {
                     str_local(dest),
                     addr,
                     resource_type,
+                );
+                emit!(
+                    self.writer,
+                    &boogie_type_check(
+                        self.module_env.env,
+                        str_local(dest).as_str(),
+                        &self.get_local_type(func_env, *dest)
+                    )
                 );
                 emitln!(self.writer, &propagate_abort());
                 save_borrowed_value(ctx, dest);
@@ -1068,6 +1108,7 @@ impl<'env> ModuleTranslator<'env> {
                 // In contrast to other instructions, we need to evaluate invariants BEFORE
                 // the return.
                 self.enforce_invariants_for_dead_refs(func_env, ctx, offset);
+                invariants_evaluated = true;
                 for (i, r) in rets.iter().enumerate() {
                     if self.get_local_type(func_env, *r).is_reference() {
                         emitln!(self.writer, "$ret{} := {};", i, str_local(r));

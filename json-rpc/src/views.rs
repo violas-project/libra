@@ -3,6 +3,7 @@
 
 use anyhow::{format_err, Error};
 use hex;
+use libra_crypto::HashValue;
 use libra_types::{
     account_config::{
         received_payment_tag, sent_payment_tag, AccountResource, BalanceResource,
@@ -10,10 +11,12 @@ use libra_types::{
     },
     account_state_blob::AccountStateWithProof,
     contract_event::ContractEvent,
-    crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeProof},
     language_storage::TypeTag,
+    ledger_info::LedgerInfoWithSignatures,
     proof::{AccountStateProof, AccumulatorConsistencyProof},
     transaction::{Transaction, TransactionArgument, TransactionPayload},
+    validator_change::ValidatorChangeProof,
+    vm_error::StatusCode,
 };
 use serde::{Deserialize, Serialize};
 use std::convert::TryFrom;
@@ -134,14 +137,17 @@ impl From<&Vec<u8>> for BytesView {
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct TransactionView {
     pub version: u64,
     pub transaction: TransactionDataView,
     pub events: Vec<EventView>,
+    pub vm_status: StatusCode,
+    pub gas_used: u64,
 }
 
-#[derive(Deserialize, Serialize)]
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(tag = "type")]
 pub enum TransactionDataView {
     #[serde(rename = "blockmetadata")]
@@ -151,12 +157,14 @@ pub enum TransactionDataView {
     #[serde(rename = "user")]
     UserTransaction {
         sender: String,
+        signature_scheme: String,
         signature: String,
         public_key: String,
         sequence_number: u64,
         max_gas_amount: u64,
         gas_unit_price: u64,
         expiration_time: u64,
+        script_hash: String,
         script: ScriptView,
     },
     #[serde(rename = "unknown")]
@@ -180,10 +188,16 @@ pub enum ScriptView {
     #[serde(rename = "peer_to_peer_transaction")]
     PeerToPeer {
         receiver: String,
-        arg_auth_key_prefix: BytesView,
+        auth_key_prefix: BytesView,
+        amount: u64,
+        metadata: BytesView,
+    },
+    #[serde(rename = "mint_transaction")]
+    Mint {
+        receiver: String,
+        auth_key_prefix: BytesView,
         amount: u64,
     },
-
     #[serde(rename = "unknown_transaction")]
     Unknown {},
 }
@@ -193,7 +207,8 @@ impl ScriptView {
     pub fn get_name(&self) -> String {
         match self {
             ScriptView::PeerToPeer { .. } => "peer to peer transaction".to_string(),
-            ScriptView::Unknown {} => "unknown transaction".to_string(),
+            ScriptView::Mint { .. } => "mint transaction".to_string(),
+            ScriptView::Unknown { .. } => "unknown transaction".to_string(),
         }
     }
 }
@@ -207,16 +222,26 @@ impl From<Transaction> for TransactionDataView {
                 })
             }
             Transaction::WriteSet(_) => Ok(TransactionDataView::WriteSet {}),
-            Transaction::UserTransaction(t) => Ok(TransactionDataView::UserTransaction {
-                sender: t.sender().to_string(),
-                signature: t.signature().to_string(),
-                public_key: t.public_key().to_string(),
-                sequence_number: t.sequence_number(),
-                max_gas_amount: t.max_gas_amount(),
-                gas_unit_price: t.gas_unit_price(),
-                expiration_time: t.expiration_time().as_secs(),
-                script: t.into_raw_transaction().into_payload().into(),
-            }),
+            Transaction::UserTransaction(t) => {
+                let script_hash = match t.payload() {
+                    TransactionPayload::Script(s) => HashValue::from_sha3_256(s.code()),
+                    _ => HashValue::zero(),
+                }
+                .to_hex();
+
+                Ok(TransactionDataView::UserTransaction {
+                    sender: t.sender().to_string(),
+                    signature_scheme: t.authenticator().scheme().to_string(),
+                    signature: hex::encode(t.authenticator().signature_bytes()),
+                    public_key: hex::encode(t.authenticator().public_key_bytes()),
+                    sequence_number: t.sequence_number(),
+                    max_gas_amount: t.max_gas_amount(),
+                    gas_unit_price: t.gas_unit_price(),
+                    expiration_time: t.expiration_time().as_secs(),
+                    script_hash,
+                    script: t.into_raw_transaction().into_payload().into(),
+                })
+            }
         };
 
         x.unwrap_or(TransactionDataView::UnknownTransaction {})
@@ -226,6 +251,7 @@ impl From<Transaction> for TransactionDataView {
 impl From<TransactionPayload> for ScriptView {
     fn from(value: TransactionPayload) -> Self {
         let empty_vec: Vec<TransactionArgument> = vec![];
+
         let (code, args) = match value {
             TransactionPayload::Program => ("deprecated".to_string(), empty_vec),
             TransactionPayload::WriteSet(_) => ("genesis".to_string(), empty_vec),
@@ -237,12 +263,40 @@ impl From<TransactionPayload> for ScriptView {
 
         let res = match code.as_str() {
             "peer_to_peer_transaction" => {
-                if let [TransactionArgument::Address(receiver), TransactionArgument::U8Vector(arg_auth_key_prefix), TransactionArgument::U64(amount)] =
+                if let [TransactionArgument::Address(receiver), TransactionArgument::U8Vector(auth_key_prefix), TransactionArgument::U64(amount)] =
                     &args[..]
                 {
                     Ok(ScriptView::PeerToPeer {
                         receiver: receiver.to_string(),
-                        arg_auth_key_prefix: BytesView::from(arg_auth_key_prefix),
+                        auth_key_prefix: BytesView::from(auth_key_prefix),
+                        amount: *amount,
+                        metadata: BytesView::from(&[0u8; 0][..]),
+                    })
+                } else {
+                    Err(format_err!("Unable to parse PeerToPeer arguments"))
+                }
+            }
+            "peer_to_peer_with_metadata_transaction" => {
+                if let [TransactionArgument::Address(receiver), TransactionArgument::U8Vector(auth_key_prefix), TransactionArgument::U64(amount), TransactionArgument::U8Vector(metadata)] =
+                    &args[..]
+                {
+                    Ok(ScriptView::PeerToPeer {
+                        receiver: receiver.to_string(),
+                        auth_key_prefix: BytesView::from(auth_key_prefix),
+                        amount: *amount,
+                        metadata: BytesView::from(metadata),
+                    })
+                } else {
+                    Err(format_err!("Unable to parse PeerToPeer arguments"))
+                }
+            }
+            "mint_transaction" => {
+                if let [TransactionArgument::Address(receiver), TransactionArgument::U8Vector(auth_key_prefix), TransactionArgument::U64(amount)] =
+                    &args[..]
+                {
+                    Ok(ScriptView::Mint {
+                        receiver: receiver.to_string(),
+                        auth_key_prefix: BytesView::from(auth_key_prefix),
                         amount: *amount,
                     })
                 } else {

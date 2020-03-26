@@ -6,7 +6,7 @@ use codespan::{ByteIndex, Span};
 use std::{fmt, str::FromStr};
 
 use crate::lexer::*;
-use libra_types::{account_address::AccountAddress, byte_array::ByteArray};
+use libra_types::account_address::AccountAddress;
 use move_core_types::identifier::{IdentStr, Identifier};
 use move_ir_types::{ast::*, location::*, spec_language_ast::*};
 
@@ -260,10 +260,10 @@ fn parse_copyable_val<'input>(
         }
         Tok::ByteArrayValue => {
             let s = tokens.content();
-            let buf = ByteArray::new(hex::decode(&s[2..s.len() - 1]).unwrap_or_else(|_| {
+            let buf = hex::decode(&s[2..s.len() - 1]).unwrap_or_else(|_| {
                 // The lexer guarantees this, but tracking this knowledge all the way to here is tedious
                 unreachable!("The string {:?} is not a valid hex-encoded byte array", s)
-            }));
+            });
             tokens.advance()?;
             CopyableVal_::ByteArray(buf)
         }
@@ -1180,10 +1180,6 @@ fn parse_type<'input>(tokens: &mut Lexer<'input>) -> Result<Type, ParseError<Loc
             tokens.advance()?;
             Type::Bool
         }
-        Tok::Bytearray => {
-            tokens.advance()?;
-            Type::ByteArray
-        }
         Tok::Vector => {
             tokens.advance()?;
             consume_token(tokens, Tok::Less)?;
@@ -1816,69 +1812,6 @@ fn parse_field_decl<'input>(
     Ok((f, t))
 }
 
-// Modules: Vec<ModuleDefinition> = {
-//     "modules:" <c: Module*> "script:" => c,
-// }
-
-fn parse_modules<'input>(
-    tokens: &mut Lexer<'input>,
-) -> Result<Vec<ModuleDefinition>, ParseError<Loc, anyhow::Error>> {
-    consume_token(tokens, Tok::Modules)?;
-    let mut c: Vec<ModuleDefinition> = vec![];
-    while tokens.peek() == Tok::Module {
-        c.push(parse_module(tokens)?);
-    }
-    consume_token(tokens, Tok::Script)?;
-    Ok(c)
-}
-
-// pub Program : Program = {
-//     <m: Modules?> <s: Script> => { ... },
-//     <m: Module> => { ... }
-// }
-
-fn parse_program<'input>(
-    tokens: &mut Lexer<'input>,
-) -> Result<Program, ParseError<Loc, anyhow::Error>> {
-    if tokens.peek() == Tok::Module {
-        let m = parse_module(tokens)?;
-        let loc = tokens.start_loc();
-        let ret_args = spanned(tokens.file_name(), loc, loc, Exp_::ExprList(vec![]));
-        let ret = spanned(
-            tokens.file_name(),
-            loc,
-            loc,
-            Cmd_::Return(Box::new(ret_args)),
-        );
-        let return_stmt = Statement::CommandStatement(ret);
-        let body = FunctionBody::Move {
-            locals: vec![],
-            code: Block_::new(vec![return_stmt]),
-        };
-        let main = Function_::new(
-            FunctionVisibility::Public,
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            vec![],
-            body,
-        );
-        Ok(Program::new(
-            vec![m],
-            Script::new(vec![], vec![], spanned(tokens.file_name(), loc, loc, main)),
-        ))
-    } else {
-        let modules = if tokens.peek() == Tok::Modules {
-            parse_modules(tokens)?
-        } else {
-            vec![]
-        };
-        let s = parse_script(tokens)?;
-        Ok(Program::new(modules, s))
-    }
-}
-
 // pub Script : Script = {
 //     <imports: (ImportDecl)*>
 //     "main" "(" <args: Comma<ArgDecl>> ")" <locals_body: FunctionBlock> => { ... }
@@ -2143,15 +2076,6 @@ pub fn parse_module_string(
     let mut tokens = Lexer::new(leak_str(file), input);
     tokens.advance()?;
     parse_module(&mut tokens)
-}
-
-pub fn parse_program_string(
-    file: &str,
-    input: &str,
-) -> Result<Program, ParseError<Loc, anyhow::Error>> {
-    let mut tokens = Lexer::new(leak_str(file), input);
-    tokens.advance()?;
-    parse_program(&mut tokens)
 }
 
 pub fn parse_script_string(

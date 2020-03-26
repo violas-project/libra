@@ -3,11 +3,14 @@
 
 use crate::{
     account_address::AccountAddress,
+    account_config::lbr_type_tag,
     account_state_blob::AccountStateBlob,
     block_metadata::BlockMetadata,
     contract_event::ContractEvent,
+    language_storage::TypeTag,
     ledger_info::LedgerInfo,
     proof::{accumulator::InMemoryAccumulator, TransactionListProof, TransactionProof},
+    transaction::authenticator::TransactionAuthenticator,
     vm_error::{StatusCode, StatusType, VMStatus},
     write_set::WriteSet,
 };
@@ -15,7 +18,8 @@ use anyhow::{ensure, format_err, Error, Result};
 use libra_crypto::{
     ed25519::*,
     hash::{CryptoHash, CryptoHasher, EventAccumulatorHasher},
-    traits::*,
+    multi_ed25519::{MultiEd25519PublicKey, MultiEd25519Signature},
+    traits::SigningKey,
     HashValue,
 };
 use libra_crypto_derive::CryptoHasher;
@@ -29,6 +33,7 @@ use std::{
     time::Duration,
 };
 
+pub mod authenticator;
 mod change_set;
 pub mod helpers;
 mod module;
@@ -60,6 +65,8 @@ pub struct RawTransaction {
     max_gas_amount: u64,
     // Maximal price can be paid per gas.
     gas_unit_price: u64,
+
+    gas_specifier: TypeTag,
     // Expiration time for this transaction.  If storage is queried and
     // the time returned is greater than or equal to this time and this
     // transaction has not been included, you can be certain that it will
@@ -113,6 +120,7 @@ impl RawTransaction {
         payload: TransactionPayload,
         max_gas_amount: u64,
         gas_unit_price: u64,
+        gas_specifier: TypeTag,
         expiration_time: Duration,
     ) -> Self {
         RawTransaction {
@@ -121,6 +129,7 @@ impl RawTransaction {
             payload,
             max_gas_amount,
             gas_unit_price,
+            gas_specifier,
             expiration_time,
         }
     }
@@ -134,6 +143,7 @@ impl RawTransaction {
         script: Script,
         max_gas_amount: u64,
         gas_unit_price: u64,
+        gas_specifier: TypeTag,
         expiration_time: Duration,
     ) -> Self {
         RawTransaction {
@@ -142,6 +152,7 @@ impl RawTransaction {
             payload: TransactionPayload::Script(script),
             max_gas_amount,
             gas_unit_price,
+            gas_specifier,
             expiration_time,
         }
     }
@@ -156,6 +167,7 @@ impl RawTransaction {
         module: Module,
         max_gas_amount: u64,
         gas_unit_price: u64,
+        gas_specifier: TypeTag,
         expiration_time: Duration,
     ) -> Self {
         RawTransaction {
@@ -164,6 +176,7 @@ impl RawTransaction {
             payload: TransactionPayload::Module(module),
             max_gas_amount,
             gas_unit_price,
+            gas_specifier,
             expiration_time,
         }
     }
@@ -180,6 +193,7 @@ impl RawTransaction {
             // Since write-set transactions bypass the VM, these fields aren't relevant.
             max_gas_amount: 0,
             gas_unit_price: 0,
+            gas_specifier: lbr_type_tag(),
             // Write-set transactions are special and important and shouldn't expire.
             expiration_time: Duration::new(u64::max_value(), 0),
         }
@@ -197,6 +211,7 @@ impl RawTransaction {
             // Since write-set transactions bypass the VM, these fields aren't relevant.
             max_gas_amount: 0,
             gas_unit_price: 0,
+            gas_specifier: lbr_type_tag(),
             // Write-set transactions are special and important and shouldn't expire.
             expiration_time: Duration::new(u64::max_value(), 0),
         }
@@ -304,12 +319,8 @@ pub struct SignedTransaction {
     /// The raw transaction
     raw_txn: RawTransaction,
 
-    /// Sender's public key. When checking the signature, we first need to check whether this key
-    /// is indeed the pre-image of the pubkey hash stored under sender's account.
-    public_key: Ed25519PublicKey,
-
-    /// Signature of the transaction that correspond to the public key
-    signature: Ed25519Signature,
+    /// Public key and signature to authenticate
+    authenticator: TransactionAuthenticator,
 }
 
 /// A transaction for which the signature has been verified. Created by
@@ -343,11 +354,10 @@ impl fmt::Debug for SignedTransaction {
             f,
             "SignedTransaction {{ \n \
              {{ raw_txn: {:#?}, \n \
-             public_key: {:#?}, \n \
-             signature: {:#?}, \n \
+             authenticator: {:#?}, \n \
              }} \n \
              }}",
-            self.raw_txn, self.public_key, self.signature,
+            self.raw_txn, self.authenticator
         )
     }
 }
@@ -358,19 +368,27 @@ impl SignedTransaction {
         public_key: Ed25519PublicKey,
         signature: Ed25519Signature,
     ) -> SignedTransaction {
+        let authenticator = TransactionAuthenticator::ed25519(public_key, signature);
         SignedTransaction {
             raw_txn,
-            public_key,
-            signature,
+            authenticator,
         }
     }
 
-    pub fn public_key(&self) -> Ed25519PublicKey {
-        self.public_key.clone()
+    pub fn new_multisig(
+        raw_txn: RawTransaction,
+        public_key: MultiEd25519PublicKey,
+        signature: MultiEd25519Signature,
+    ) -> SignedTransaction {
+        let authenticator = TransactionAuthenticator::multi_ed25519(public_key, signature);
+        SignedTransaction {
+            raw_txn,
+            authenticator,
+        }
     }
 
-    pub fn signature(&self) -> Ed25519Signature {
-        self.signature.clone()
+    pub fn authenticator(&self) -> TransactionAuthenticator {
+        self.authenticator.clone()
     }
 
     pub fn sender(&self) -> AccountAddress {
@@ -410,8 +428,7 @@ impl SignedTransaction {
     /// Checks that the signature of given transaction. Returns `Ok(SignatureCheckedTransaction)` if
     /// the signature is valid.
     pub fn check_signature(self) -> Result<SignatureCheckedTransaction> {
-        self.public_key
-            .verify_signature(&self.raw_txn.hash(), &self.signature)?;
+        self.authenticator.verify_signature(&self.raw_txn.hash())?;
         Ok(SignatureCheckedTransaction(self))
     }
 
@@ -419,12 +436,10 @@ impl SignedTransaction {
         format!(
             "SignedTransaction {{ \n \
              raw_txn: {}, \n \
-             public_key: {:#?}, \n \
-             signature: {:#?}, \n \
+             authenticator: {:#?}, \n \
              }}",
             self.raw_txn.format_for_client(get_transaction_name),
-            self.public_key,
-            self.signature,
+            self.authenticator
         )
     }
 }

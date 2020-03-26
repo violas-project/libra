@@ -17,7 +17,7 @@ use codespan_reporting::{
 use itertools::Itertools;
 use num::{BigUint, Num};
 
-use bytecode_source_map::source_map::ModuleSourceMap;
+use bytecode_source_map::source_map::SourceMap;
 use libra_types::language_storage;
 use vm::{
     access::ModuleAccess,
@@ -33,7 +33,7 @@ use vm::{
 };
 
 use crate::{
-    ast::{Condition, Invariant, InvariantKind, ModuleName, SpecFunDecl, SpecVarDecl},
+    ast::{Condition, FunSpec, Invariant, InvariantKind, ModuleName, SpecFunDecl, SpecVarDecl},
     symbol::{Symbol, SymbolPool},
     ty::{PrimitiveType, Type},
 };
@@ -380,11 +380,12 @@ impl GlobalEnv {
         &mut self,
         loc: Loc,
         module: CompiledModule,
-        source_map: ModuleSourceMap<MoveIrLoc>,
+        source_map: SourceMap<MoveIrLoc>,
         struct_data: BTreeMap<StructId, StructData>,
         function_data: BTreeMap<FunId, FunctionData>,
         spec_vars: Vec<SpecVarDecl>,
         spec_funs: Vec<SpecFunDecl>,
+        module_invariants: Vec<Invariant>,
         loc_map: BTreeMap<NodeId, Loc>,
         type_map: BTreeMap<NodeId, Type>,
         instantiation_map: BTreeMap<NodeId, Vec<Type>>,
@@ -423,6 +424,7 @@ impl GlobalEnv {
             function_idx_to_id,
             spec_vars,
             spec_funs,
+            module_invariants,
             source_map,
             loc,
             loc_map,
@@ -441,7 +443,7 @@ impl GlobalEnv {
         loc: Loc,
         arg_names: Vec<Symbol>,
         type_arg_names: Vec<Symbol>,
-        spec: Vec<Condition>,
+        spec: FunSpec,
     ) -> FunctionData {
         let handle_idx = module.function_def_at(def_idx).function;
         FunctionData {
@@ -499,6 +501,7 @@ impl GlobalEnv {
                 InvariantKind::Update => update_invariants.push(inv),
                 InvariantKind::Pack => pack_invariants.push(inv),
                 InvariantKind::Unpack => unpack_invariants.push(inv),
+                _ => panic!("unexpected invariant kind"),
             }
         }
         StructData {
@@ -677,8 +680,11 @@ pub struct ModuleData {
     /// Specification functions, in SpecFunId order.
     pub spec_funs: BTreeMap<SpecFunId, SpecFunDecl>,
 
+    /// Module level invariants.
+    pub module_invariants: Vec<Invariant>,
+
     /// Module source location information.
-    pub source_map: ModuleSourceMap<MoveIrLoc>,
+    pub source_map: SourceMap<MoveIrLoc>,
 
     /// The location of this module.
     pub loc: Loc,
@@ -870,7 +876,6 @@ impl<'env> ModuleEnv<'env> {
             SignatureToken::U8 => Type::Primitive(PrimitiveType::U8),
             SignatureToken::U64 => Type::Primitive(PrimitiveType::U64),
             SignatureToken::U128 => Type::Primitive(PrimitiveType::U128),
-            SignatureToken::ByteArray => Type::Primitive(PrimitiveType::ByteArray),
             SignatureToken::Address => Type::Primitive(PrimitiveType::Address),
             SignatureToken::Reference(t) => {
                 Type::Reference(false, Box::new(self.globalize_signature(&*t)))
@@ -938,6 +943,11 @@ impl<'env> ModuleEnv<'env> {
     /// Gets spec fun by id.
     pub fn get_spec_fun(&self, id: SpecFunId) -> &SpecFunDecl {
         self.data.spec_funs.get(&id).expect("spec fun id defined")
+    }
+
+    /// Gets module invariants.
+    pub fn get_module_invariants(&self) -> &[Invariant] {
+        &self.data.module_invariants
     }
 
     /// Get all spec fun overloads with the given name.
@@ -1231,7 +1241,7 @@ pub struct FunctionData {
     type_arg_names: Vec<Symbol>,
 
     /// List of specification conditions. Not in bytecode but obtained from AST.
-    spec: Vec<Condition>,
+    spec: FunSpec,
 }
 
 #[derive(Debug, Clone)]
@@ -1288,6 +1298,12 @@ impl<'env> FunctionEnv<'env> {
     pub fn is_native(&self) -> bool {
         let view = self.definition_view();
         view.is_native()
+    }
+
+    /// Returns true if this function is public.
+    pub fn is_public(&self) -> bool {
+        let view = self.definition_view();
+        view.is_public()
     }
 
     /// Returns true if this function mutates any references (i.e. has &mut parameters).
@@ -1393,7 +1409,7 @@ impl<'env> FunctionEnv<'env> {
 
     /// Returns specification conditions associated with this function.
     pub fn get_specification(&'env self) -> &'env [Condition] {
-        &self.data.spec
+        &self.data.spec.on_decl
     }
 
     fn definition_view(&'env self) -> FunctionDefinitionView<'env, CompiledModule> {

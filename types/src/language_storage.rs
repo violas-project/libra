@@ -15,7 +15,6 @@ pub enum TypeTag {
     U8,
     U64,
     U128,
-    ByteArray,
     Address,
     Vector(Box<TypeTag>),
     Struct(StructTag),
@@ -28,6 +27,7 @@ pub struct StructTag {
     pub address: AccountAddress,
     pub module: Identifier,
     pub name: Identifier,
+    // TODO: rename to "type_args"
     pub type_params: Vec<TypeTag>,
 }
 

@@ -196,7 +196,7 @@ fn stack_instructions(options: &Opt) {
     // load the entry point
     let entry_idx = FunctionDefinitionIndex::new(0);
     let entry_func = FunctionRef::new(&loaded_module, entry_idx);
-    vm.push_frame(entry_func, vec![], vec![]);
+    vm.push_frame(entry_func, vec![]);
 
     let costs: HashMap<String, Vec<u64>> = stack_opcodes
         .into_iter()
@@ -262,7 +262,7 @@ macro_rules! bench_native {
                 let time = (0..$iters).fold(0, |acc, _| {
                     let before = Instant::now();
                     let mut args = VecDeque::new();
-                    args.push_front(Value::byte_array(stack_access.next_bytearray()));
+                    args.push_front(Value::vector_u8(stack_access.next_bytearray()));
                     let _ = $function(vec![], args, &cost_table);
                     acc + before.elapsed().as_nanos()
                 });

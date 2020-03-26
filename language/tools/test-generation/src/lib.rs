@@ -21,14 +21,9 @@ use bytecode_verifier::VerifiedModule;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use getrandom::getrandom;
 use language_e2e_tests::executor::FakeExecutor;
-use libra_config::config::VMConfig;
 use libra_logger::{debug, error, info};
 use libra_state_view::StateView;
-use libra_types::{
-    account_address::{AccountAddress, ADDRESS_LENGTH},
-    byte_array::ByteArray,
-    vm_error::StatusCode,
-};
+use libra_types::{account_address::AccountAddress, vm_error::StatusCode};
 use libra_vm::LibraVM;
 use move_vm_types::values::Value;
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -64,10 +59,12 @@ fn run_vm(module: VerifiedModule) -> VMResult<()> {
         .arg_types
         .iter()
         .map(|sig_tok| match sig_tok {
-            SignatureToken::Address => Value::address(AccountAddress::new([0u8; ADDRESS_LENGTH])),
+            SignatureToken::Address => Value::address(AccountAddress::DEFAULT),
             SignatureToken::U64 => Value::u64(0),
             SignatureToken::Bool => Value::bool(true),
-            SignatureToken::ByteArray => Value::byte_array(ByteArray::new(vec![])),
+            SignatureToken::Vector(inner_tok) if **inner_tok == SignatureToken::U8 => {
+                Value::vector_u8(vec![])
+            }
             _ => unimplemented!("Unsupported argument type: {:#?}", sig_tok),
         })
         .collect();
@@ -90,7 +87,7 @@ fn execute_function_in_module(
         module.identifier_at(entry_name_idx)
     };
     {
-        let mut libra_vm = LibraVM::new(&VMConfig::default());
+        let mut libra_vm = LibraVM::new();
         libra_vm.load_configs(state_view);
 
         let internals = libra_vm.internals();

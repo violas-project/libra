@@ -11,7 +11,7 @@ use language_e2e_tests::{
 };
 use libra_config::generator;
 use libra_crypto::PrivateKey;
-use libra_types::crypto_proxies::ValidatorSet;
+use libra_types::validator_set::ValidatorSet;
 use std::{
     collections::{btree_map, BTreeMap},
     str::FromStr,
@@ -59,13 +59,13 @@ pub enum Entry {
 
 impl Entry {
     pub fn is_validator(&self) -> bool {
-        match self {
+        matches!(
+            self,
             Entry::AccountDefinition(AccountDefinition {
                 role: Some(Role::Validator),
                 ..
-            }) => true,
-            _ => false,
-        }
+            })
+        )
     }
 }
 

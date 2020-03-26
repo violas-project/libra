@@ -3,9 +3,10 @@
 
 #![forbid(unsafe_code)]
 
-use libra_config::config::{NodeConfig, RoleType, VMPublishingOption};
+use libra_config::config::{NodeConfig, RoleType, TestConfig};
 use libra_swarm::{client, swarm::LibraSwarm};
 use libra_temppath::TempPath;
+use libra_types::on_chain_config::VMPublishingOption;
 use std::path::Path;
 use structopt::StructOpt;
 
@@ -37,7 +38,11 @@ fn main() {
     let num_nodes = args.num_nodes;
     let num_full_nodes = args.num_full_nodes;
     let mut dev_config = NodeConfig::default();
-    dev_config.vm_config.publishing_options = VMPublishingOption::Open;
+    dev_config.test = Some({
+        let mut config = TestConfig::default();
+        config.publishing_option = Some(VMPublishingOption::Open);
+        config
+    });
 
     libra_logger::Logger::new().init();
 
@@ -84,8 +89,8 @@ fn main() {
     let validator_config = NodeConfig::load(&validator_swarm.config.config_files[0]).unwrap();
     println!("To run the Libra CLI client in a separate process and connect to the validator nodes you just spawned, use this command:");
     println!(
-        "\tcargo run --bin cli -- -a localhost -p {} -m {:?}",
-        validator_config.rpc.address.port(),
+        "\tcargo run --bin cli -- -u {} -m {:?}",
+        format!("http://localhost:{}", validator_config.rpc.address.port()),
         faucet_key_file_path,
     );
     let node_address_list = validator_swarm
@@ -107,8 +112,8 @@ fn main() {
         let full_node_config = NodeConfig::load(&swarm.config.config_files[0]).unwrap();
         println!("To connect to the full nodes you just spawned, use this command:");
         println!(
-            "\tcargo run --bin cli -- -a localhost -p {} -m {:?}",
-            full_node_config.rpc.address.port(),
+            "\tcargo run --bin cli -- -u {} -m {:?}",
+            format!("http://localhost:{}", full_node_config.rpc.address.port()),
             faucet_key_file_path,
         );
     }

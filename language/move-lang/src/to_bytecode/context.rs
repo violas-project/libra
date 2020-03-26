@@ -1,7 +1,10 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::parser::ast::{FunctionName, ModuleIdent, ModuleIdent_, ModuleName, StructName};
+use crate::{
+    expansion::ast::SpecId,
+    parser::ast::{FunctionName, ModuleIdent, ModuleIdent_, ModuleName, StructName},
+};
 use libra_types::account_address::AccountAddress as LibraAddress;
 use move_ir_types::ast as IR;
 use std::{
@@ -15,6 +18,7 @@ pub struct Context<'a> {
     current_module: Option<&'a ModuleIdent>,
     seen_structs: BTreeSet<(ModuleIdent, StructName)>,
     seen_functions: BTreeSet<(ModuleIdent, FunctionName)>,
+    nop_labels: BTreeMap<SpecId, IR::NopLabel>,
 }
 
 impl<'a> Context<'a> {
@@ -26,6 +30,7 @@ impl<'a> Context<'a> {
             current_module,
             seen_structs: BTreeSet::new(),
             seen_functions: BTreeSet::new(),
+            nop_labels: BTreeMap::new(),
         }
     }
 
@@ -35,6 +40,10 @@ impl<'a> Context<'a> {
 
     fn is_current_module(&self, m: &ModuleIdent) -> bool {
         self.current_module.map(|cur| cur == m).unwrap_or(false)
+    }
+
+    pub fn finish_function(&mut self) -> BTreeMap<SpecId, IR::NopLabel> {
+        std::mem::replace(&mut self.nop_labels, BTreeMap::new())
     }
 
     //**********************************************************************************************
@@ -48,30 +57,25 @@ impl<'a> Context<'a> {
             (ModuleIdent, StructName),
             (bool, Vec<(IR::TypeVar, IR::Kind)>),
         >,
-        function_declarations: &HashMap<(ModuleIdent, FunctionName), IR::FunctionSignature>,
+        function_declarations: &HashMap<
+            (ModuleIdent, FunctionName),
+            (BTreeSet<(ModuleIdent, StructName)>, IR::FunctionSignature),
+        >,
     ) -> (Vec<IR::ImportDefinition>, Vec<IR::ModuleDependency>) {
         let Context {
             current_module: _current_module,
             seen_structs,
             seen_functions,
+            ..
         } = self;
         let mut module_dependencies = BTreeMap::new();
-        for (module, sname) in seen_structs {
-            let struct_dep = Self::struct_dependency(struct_declarations, &module, sname);
-            module_dependencies
-                .entry(module)
-                .or_insert_with(|| (vec![], vec![]))
-                .0
-                .push(struct_dep);
-        }
-        for (module, fname) in seen_functions {
-            let function_dep = Self::function_dependency(function_declarations, &module, fname);
-            module_dependencies
-                .entry(module)
-                .or_insert_with(|| (vec![], vec![]))
-                .1
-                .push(function_dep);
-        }
+        Self::struct_dependencies(struct_declarations, &mut module_dependencies, seen_structs);
+        Self::function_dependencies(
+            struct_declarations,
+            function_declarations,
+            &mut module_dependencies,
+            seen_functions,
+        );
         let mut imports = vec![];
         let mut ordered_dependencies = vec![];
         for (module, (structs, functions)) in module_dependencies {
@@ -93,6 +97,53 @@ impl<'a> Context<'a> {
         (imports, dependencies)
     }
 
+    fn insert_struct_dependency(
+        module_dependencies: &mut BTreeMap<
+            ModuleIdent,
+            (Vec<IR::StructDependency>, Vec<IR::FunctionDependency>),
+        >,
+        module: ModuleIdent,
+        struct_dep: IR::StructDependency,
+    ) {
+        module_dependencies
+            .entry(module)
+            .or_insert_with(|| (vec![], vec![]))
+            .0
+            .push(struct_dep);
+    }
+
+    fn insert_function_dependency(
+        module_dependencies: &mut BTreeMap<
+            ModuleIdent,
+            (Vec<IR::StructDependency>, Vec<IR::FunctionDependency>),
+        >,
+        module: ModuleIdent,
+        function_dep: IR::FunctionDependency,
+    ) {
+        module_dependencies
+            .entry(module)
+            .or_insert_with(|| (vec![], vec![]))
+            .1
+            .push(function_dep);
+    }
+
+    fn struct_dependencies(
+        struct_declarations: &HashMap<
+            (ModuleIdent, StructName),
+            (bool, Vec<(IR::TypeVar, IR::Kind)>),
+        >,
+        module_dependencies: &mut BTreeMap<
+            ModuleIdent,
+            (Vec<IR::StructDependency>, Vec<IR::FunctionDependency>),
+        >,
+        seen_structs: BTreeSet<(ModuleIdent, StructName)>,
+    ) {
+        for (module, sname) in seen_structs {
+            let struct_dep = Self::struct_dependency(struct_declarations, &module, sname);
+            Self::insert_struct_dependency(module_dependencies, module, struct_dep);
+        }
+    }
+
     fn struct_dependency(
         struct_declarations: &HashMap<
             (ModuleIdent, StructName),
@@ -111,15 +162,41 @@ impl<'a> Context<'a> {
         }
     }
 
+    fn function_dependencies(
+        struct_declarations: &HashMap<
+            (ModuleIdent, StructName),
+            (bool, Vec<(IR::TypeVar, IR::Kind)>),
+        >,
+        function_declarations: &HashMap<
+            (ModuleIdent, FunctionName),
+            (BTreeSet<(ModuleIdent, StructName)>, IR::FunctionSignature),
+        >,
+        module_dependencies: &mut BTreeMap<
+            ModuleIdent,
+            (Vec<IR::StructDependency>, Vec<IR::FunctionDependency>),
+        >,
+        seen_functions: BTreeSet<(ModuleIdent, FunctionName)>,
+    ) {
+        for (module, fname) in seen_functions {
+            let (seen_structs, function_dep) =
+                Self::function_dependency(function_declarations, &module, fname);
+            Self::insert_function_dependency(module_dependencies, module, function_dep);
+            Self::struct_dependencies(struct_declarations, module_dependencies, seen_structs)
+        }
+    }
+
     fn function_dependency(
-        function_declarations: &HashMap<(ModuleIdent, FunctionName), IR::FunctionSignature>,
+        function_declarations: &HashMap<
+            (ModuleIdent, FunctionName),
+            (BTreeSet<(ModuleIdent, StructName)>, IR::FunctionSignature),
+        >,
         module: &ModuleIdent,
         fname: FunctionName,
-    ) -> IR::FunctionDependency {
+    ) -> (BTreeSet<(ModuleIdent, StructName)>, IR::FunctionDependency) {
         let key = (module.clone(), fname.clone());
-        let signature = function_declarations.get(&key).unwrap().clone();
+        let (seen_structs, signature) = function_declarations.get(&key).unwrap().clone();
         let name = Self::translate_function_name(fname);
-        IR::FunctionDependency { name, signature }
+        (seen_structs, IR::FunctionDependency { name, signature })
     }
 
     //**********************************************************************************************
@@ -204,5 +281,15 @@ impl<'a> Context<'a> {
         };
         let n = Self::translate_function_name(f);
         (mname, n)
+    }
+
+    //**********************************************************************************************
+    // Nops
+    //**********************************************************************************************
+
+    pub fn nop_label(&mut self, id: SpecId) -> IR::NopLabel {
+        let label = IR::NopLabel(format!("{}", id));
+        assert!(self.nop_labels.insert(id, label.clone()).is_none());
+        label
     }
 }

@@ -17,7 +17,12 @@
 #[macro_use]
 mod util;
 
+#[macro_use]
+extern crate prometheus;
+
 mod client;
+mod counters;
+pub mod errors;
 mod methods;
 mod runtime;
 pub mod views;
@@ -25,5 +30,8 @@ pub mod views;
 pub use client::{JsonRpcAsyncClient, JsonRpcBatch};
 pub use runtime::bootstrap_from_config;
 
+#[cfg(any(feature = "fuzzing", test))]
+/// Fuzzer for JSON RPC service
+pub mod fuzzing;
 #[cfg(test)]
 mod tests;

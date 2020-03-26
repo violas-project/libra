@@ -8,12 +8,10 @@ use libra_config::{
         ConsensusType, NodeConfig, RemoteService, SafetyRulesBackend, SafetyRulesService,
         SeedPeersConfig, VaultConfig,
     },
-    generator::{self, ValidatorSwarm},
+    generator,
 };
 use libra_crypto::{ed25519::Ed25519PrivateKey, PrivateKey, Uniform};
-use libra_types::{
-    crypto_proxies::ValidatorSet, discovery_set::DiscoverySet, transaction::Transaction,
-};
+use libra_types::{transaction::Transaction, validator_set::ValidatorSet};
 use parity_multiaddr::Multiaddr;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 use std::{collections::HashMap, net::SocketAddr};
@@ -32,6 +30,7 @@ pub struct ValidatorConfig {
     safety_rules_addr: Option<SocketAddr>,
     safety_rules_backend: Option<String>,
     safety_rules_host: Option<String>,
+    safety_rules_namespace: Option<String>,
     safety_rules_token: Option<String>,
     seed: [u8; 32],
     template: NodeConfig,
@@ -49,6 +48,7 @@ impl Default for ValidatorConfig {
             safety_rules_addr: None,
             safety_rules_backend: None,
             safety_rules_host: None,
+            safety_rules_namespace: None,
             safety_rules_token: None,
             seed: DEFAULT_SEED,
             template: NodeConfig::default(),
@@ -106,6 +106,11 @@ impl ValidatorConfig {
         self
     }
 
+    pub fn safety_rules_namespace(&mut self, safety_rules_namespace: Option<String>) -> &mut Self {
+        self.safety_rules_namespace = safety_rules_namespace;
+        self
+    }
+
     pub fn safety_rules_token(&mut self, safety_rules_token: Option<String>) -> &mut Self {
         self.safety_rules_token = safety_rules_token;
         self
@@ -148,7 +153,7 @@ impl ValidatorConfig {
     }
 
     pub fn build_set(&self) -> Result<Vec<NodeConfig>> {
-        let (configs, _) = self.build_common(false, false)?;
+        let (configs, _) = self.build_common(false)?;
         Ok(configs)
     }
 
@@ -157,11 +162,7 @@ impl ValidatorConfig {
         faucet_key
     }
 
-    pub fn build_common(
-        &self,
-        randomize_service_ports: bool,
-        randomize_libranet_ports: bool,
-    ) -> Result<(Vec<NodeConfig>, Ed25519PrivateKey)> {
+    fn build_common(&self, randomize_ports: bool) -> Result<(Vec<NodeConfig>, Ed25519PrivateKey)> {
         ensure!(self.nodes > 0, Error::NonZeroNetwork);
         ensure!(
             self.index < self.nodes,
@@ -172,47 +173,47 @@ impl ValidatorConfig {
         );
 
         let (faucet_key, config_seed) = self.build_faucet();
-        let ValidatorSwarm {
-            mut nodes,
-            validator_set,
-            discovery_set,
-        } = generator::validator_swarm(
-            &self.template,
-            self.nodes,
-            config_seed,
-            randomize_service_ports,
-            randomize_libranet_ports,
-        );
+        let mut validator_swarm =
+            generator::validator_swarm(&self.template, self.nodes, config_seed, randomize_ports);
 
         ensure!(
-            nodes.len() == self.nodes,
-            Error::MissingConfigs { found: nodes.len() }
+            validator_swarm.nodes.len() == self.nodes,
+            Error::MissingConfigs {
+                found: validator_swarm.nodes.len()
+            }
         );
-
-        // Optionally choose a limited subset of generated validators to be
-        // present at genesis time.
         let nodes_in_genesis = self.nodes_in_genesis.unwrap_or(self.nodes);
-        let validator_set =
-            ValidatorSet::new(validator_set.into_iter().take(nodes_in_genesis).collect());
-        let discovery_set =
-            DiscoverySet::new(discovery_set.into_iter().take(nodes_in_genesis).collect());
+
+        let validator_set = ValidatorSet::new(
+            validator_swarm
+                .validator_set
+                .clone()
+                .into_iter()
+                .take(nodes_in_genesis)
+                .collect(),
+        );
+        let discovery_set = vm_genesis::make_placeholder_discovery_set(&validator_set);
 
         let genesis = Some(Transaction::UserTransaction(
             vm_genesis::encode_genesis_transaction_with_validator(
                 &faucet_key,
                 faucet_key.public_key(),
-                &nodes,
+                &validator_swarm.nodes,
                 validator_set,
                 discovery_set,
+                self.template
+                    .test
+                    .as_ref()
+                    .and_then(|config| config.publishing_option.clone()),
             )
             .into_inner(),
         ));
 
-        for node in &mut nodes {
+        for node in &mut validator_swarm.nodes {
             node.execution.genesis = genesis.clone();
         }
 
-        Ok((nodes, faucet_key))
+        Ok((validator_swarm.nodes, faucet_key))
     }
 
     fn build_faucet(&self) -> (Ed25519PrivateKey, [u8; 32]) {
@@ -237,6 +238,7 @@ impl ValidatorConfig {
                 "on-disk" => safety_rules_config.backend.clone(),
                 "vault" => SafetyRulesBackend::Vault(VaultConfig {
                     default: true,
+                    namespace: self.safety_rules_namespace.clone(),
                     server: self
                         .safety_rules_host
                         .as_ref()
@@ -258,7 +260,7 @@ impl ValidatorConfig {
 
 impl BuildSwarm for ValidatorConfig {
     fn build_swarm(&self) -> Result<(Vec<NodeConfig>, Ed25519PrivateKey)> {
-        self.build_common(true, true)
+        self.build_common(true)
     }
 }
 

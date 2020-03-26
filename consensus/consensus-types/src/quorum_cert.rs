@@ -6,8 +6,8 @@ use anyhow::{ensure, Context};
 use libra_crypto::{hash::CryptoHash, HashValue};
 use libra_types::{
     block_info::BlockInfo,
-    crypto_proxies::{LedgerInfoWithSignatures, ValidatorVerifier},
-    ledger_info::LedgerInfo,
+    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
+    validator_verifier::ValidatorVerifier,
 };
 use serde::{Deserialize, Serialize};
 use std::{

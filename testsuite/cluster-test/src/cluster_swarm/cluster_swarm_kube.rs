@@ -9,7 +9,7 @@ use anyhow::{bail, format_err, Result};
 use async_trait::async_trait;
 
 use futures::{future::try_join_all, lock::Mutex};
-use k8s_openapi::api::core::v1::{ConfigMap, Pod};
+use k8s_openapi::api::core::v1::{ConfigMap, Node, Pod};
 use kube::{
     api::{Api, PostParams},
     client::APIClient,
@@ -19,7 +19,14 @@ use libra_logger::*;
 use util::retry;
 
 use crate::{cluster_swarm::ClusterSwarm, instance::Instance};
+use rand::{distributions::Alphanumeric, thread_rng, Rng};
 
+use crate::instance::{
+    InstanceConfig,
+    InstanceConfig::{Fullnode, Validator},
+};
+use itertools::Itertools;
+use k8s_openapi::api::batch::v1::Job;
 use kube::api::ListParams;
 use libra_config::config::DEFAULT_JSON_RPC_PORT;
 
@@ -32,8 +39,7 @@ const ERROR_NOT_FOUND: u16 = 404;
 
 pub struct ClusterSwarmKube {
     client: APIClient,
-    validator_to_node: Arc<Mutex<HashMap<u32, Instance>>>,
-    fullnode_to_node: Arc<Mutex<HashMap<(u32, u32), Instance>>>,
+    node_map: Arc<Mutex<HashMap<InstanceConfig, Instance>>>,
 }
 
 impl ClusterSwarmKube {
@@ -44,13 +50,8 @@ impl ClusterSwarmKube {
         }
         let config = config.map_err(|e| format_err!("Failed to load config: {:?}", e))?;
         let client = APIClient::new(config);
-        let validator_to_node = Arc::new(Mutex::new(HashMap::new()));
-        let fullnode_to_node = Arc::new(Mutex::new(HashMap::new()));
-        Ok(Self {
-            client,
-            validator_to_node,
-            fullnode_to_node,
-        })
+        let node_map = Arc::new(Mutex::new(HashMap::new()));
+        Ok(Self { client, node_map })
     }
 
     fn validator_spec(
@@ -60,6 +61,7 @@ impl ClusterSwarmKube {
         num_fullnodes: u32,
         node_name: &str,
         image_tag: &str,
+        cfg_overrides: &str,
         delete_data: bool,
     ) -> Result<Pod> {
         let cfg_fullnode_seed = if num_fullnodes > 0 {
@@ -67,7 +69,7 @@ impl ClusterSwarmKube {
         } else {
             ""
         };
-        let fluentbit_enabled = if index % 10 == 0 { "true" } else { "false" };
+        let fluentbit_enabled = "true";
         let pod_yaml = format!(
             include_str!("validator_spec_template.yaml"),
             index = index,
@@ -75,7 +77,7 @@ impl ClusterSwarmKube {
             num_fullnodes = num_fullnodes,
             image_tag = image_tag,
             node_name = node_name,
-            cfg_overrides = "",
+            cfg_overrides = cfg_overrides,
             delete_data = delete_data,
             cfg_seed = CFG_SEED,
             cfg_fullnode_seed = cfg_fullnode_seed,
@@ -95,13 +97,10 @@ impl ClusterSwarmKube {
         num_validators: u32,
         node_name: &str,
         image_tag: &str,
+        cfg_overrides: &str,
         delete_data: bool,
     ) -> Result<Pod> {
-        let fluentbit_enabled = if validator_index % 10 == 0 {
-            "true"
-        } else {
-            "false"
-        };
+        let fluentbit_enabled = "true";
         let pod_yaml = format!(
             include_str!("fullnode_spec_template.yaml"),
             fullnode_index = fullnode_index,
@@ -110,7 +109,7 @@ impl ClusterSwarmKube {
             num_validators = num_validators,
             node_name = node_name,
             image_tag = image_tag,
-            cfg_overrides = "",
+            cfg_overrides = cfg_overrides,
             delete_data = delete_data,
             cfg_seed = CFG_SEED,
             cfg_fullnode_seed = CFG_FULLNODE_SEED,
@@ -120,6 +119,61 @@ impl ClusterSwarmKube {
         let pod_spec = serde_json::value::to_value(pod_spec)?;
         serde_json::from_value(pod_spec)
             .map_err(|e| format_err!("serde_json::from_value failed: {}", e))
+    }
+
+    async fn wait_job_completion(&self, job_name: &str, back_off_limit: u32) -> Result<bool> {
+        retry::retry_async(retry::fixed_retry_strategy(5000, 60), || {
+            let job_api: Api<Job> = Api::namespaced(self.client.clone(), DEFAULT_NAMESPACE);
+            let job_name = job_name.to_string();
+            Box::pin(async move {
+                match job_api.get(&job_name).await {
+                    Ok(job) => {
+                        let job_status = job
+                            .status
+                            .ok_or_else(|| format_err!("status not found for job {}", job_name))?;
+                        if let Some(succeeded) = job_status.succeeded {
+                            if succeeded == 1 {
+                                return Ok(true);
+                            }
+                        }
+                        if let Some(failed) = job_status.succeeded {
+                            if failed as u32 == back_off_limit + 1 {
+                                error!("job {} failed to complete", job_name);
+                                return Ok(false);
+                            }
+                        }
+                        bail!("job in still in progress {}", job_name)
+                    }
+                    Err(e) => bail!("job_api.get failed for job {} : {:?}", job_name, e),
+                }
+            })
+        })
+        .await
+    }
+
+    async fn run_jobs(&self, jobs: Vec<Job>, back_off_limit: u32) -> Result<()> {
+        let pp = PostParams::default();
+        let job_api: Api<Job> = Api::namespaced(self.client.clone(), DEFAULT_NAMESPACE);
+        let create_jobs_futures = jobs.iter().map(|job| job_api.create(&pp, job));
+        let job_names: Vec<String> = try_join_all(create_jobs_futures)
+            .await?
+            .into_iter()
+            .map(|job| -> Result<String, anyhow::Error> {
+                Ok(job
+                    .metadata
+                    .ok_or_else(|| format_err!("metadata not found for job"))?
+                    .name
+                    .ok_or_else(|| format_err!("name not found for job"))?)
+            })
+            .collect::<Result<_, _>>()?;
+        let wait_jobs_futures = job_names
+            .iter()
+            .map(|job_name| self.wait_job_completion(job_name, back_off_limit));
+        let wait_jobs_results = try_join_all(wait_jobs_futures).await?;
+        if wait_jobs_results.into_iter().any(|r| !r) {
+            bail!("one of the jobs failed")
+        }
+        Ok(())
     }
 
     async fn get_pod_node_and_ip(&self, pod_name: &str) -> Result<(String, String)> {
@@ -188,38 +242,128 @@ impl ClusterSwarmKube {
 
 #[async_trait]
 impl ClusterSwarm for ClusterSwarmKube {
+    async fn remove_all_network_effects(&self) -> Result<()> {
+        debug!("Trying to remove_all_network_effects");
+        let back_off_limit = 2;
+
+        let node_api: Api<Node> = Api::all(self.client.clone());
+        let lp = ListParams::default().labels("nodeType=validators");
+        let jobs: Vec<Job> = node_api
+            .list(&lp)
+            .await?
+            .iter()
+            .map(|node| -> Result<Job, anyhow::Error> {
+                let node_name = node
+                    .metadata
+                    .as_ref()
+                    .ok_or_else(|| format_err!("metadata not found for node"))?
+                    .name
+                    .as_ref()
+                    .ok_or_else(|| format_err!("name not found for node"))?
+                    .clone();
+                let suffix = thread_rng()
+                    .sample_iter(&Alphanumeric)
+                    .take(10)
+                    .collect::<String>()
+                    .to_ascii_lowercase();
+                let job_name = format!("remove-network-effects-{}", suffix);
+                let job_yaml = format!(
+                    include_str!("job_template.yaml"),
+                    name = &job_name,
+                    label = "remove-network-effects",
+                    image = "853397791086.dkr.ecr.us-west-2.amazonaws.com/cluster-test-util:latest",
+                    node_name = node_name,
+                    command = "tc qdisc delete dev eth0 root || true",
+                    back_off_limit = back_off_limit,
+                );
+                debug!("Removing network effects from node {}", node_name);
+                let job_spec: serde_yaml::Value = serde_yaml::from_str(&job_yaml)?;
+                let job_spec = serde_json::value::to_value(job_spec)?;
+                serde_json::from_value(job_spec)
+                    .map_err(|e| format_err!("serde_json::from_value failed: {}", e))
+            })
+            .collect::<Result<_, _>>()?;
+        self.run_jobs(jobs, back_off_limit).await
+    }
+
+    async fn run(
+        &self,
+        instance: &Instance,
+        docker_image: &str,
+        command: String,
+        job_name: &str,
+    ) -> Result<()> {
+        let back_off_limit = 0;
+        let suffix = thread_rng()
+            .sample_iter(&Alphanumeric)
+            .take(10)
+            .collect::<String>()
+            .to_ascii_lowercase();
+        let job_full_name = format!("{}-{}", job_name, suffix);
+        let job_yaml = format!(
+            include_str!("job_template.yaml"),
+            name = &job_full_name,
+            label = job_name,
+            image = docker_image,
+            node_name = instance
+                .k8s_node()
+                .ok_or_else(|| { format_err!("k8s_node not found for Instance") })?,
+            command = &command,
+            back_off_limit = back_off_limit,
+        );
+        let job_spec: serde_yaml::Value = serde_yaml::from_str(&job_yaml)?;
+        let job_spec = serde_json::value::to_value(job_spec)?;
+        let job_spec = serde_json::from_value(job_spec)
+            .map_err(|e| format_err!("serde_json::from_value failed: {}", e))?;
+        debug!("Running job {} for instance {}", job_name, instance);
+        self.run_jobs(vec![job_spec], back_off_limit).await
+    }
+
     async fn validator_instances(&self) -> Vec<Instance> {
-        self.validator_to_node
+        self.node_map
             .lock()
             .await
             .values()
+            .filter(|instance| {
+                if let Some(Validator(_)) = instance.instance_config() {
+                    true
+                } else {
+                    false
+                }
+            })
             .cloned()
             .collect()
     }
 
     async fn fullnode_instances(&self) -> Vec<Instance> {
-        self.fullnode_to_node
+        self.node_map
             .lock()
             .await
             .values()
+            .filter(|instance| {
+                if let Some(Fullnode(_)) = instance.instance_config() {
+                    true
+                } else {
+                    false
+                }
+            })
             .cloned()
             .collect()
     }
 
-    async fn upsert_validator(
-        &self,
-        index: u32,
-        num_validators: u32,
-        num_fullnodes: u32,
-        image_tag: &str,
-        delete_data: bool,
-    ) -> Result<()> {
-        let pod_name = format!("val-{}", index);
+    async fn upsert_node(&self, instance_config: InstanceConfig, delete_data: bool) -> Result<()> {
+        let pod_name = match &instance_config {
+            Validator(validator_config) => format!("val-{}", validator_config.index),
+            Fullnode(fullnode_config) => format!(
+                "fn-{}-{}",
+                fullnode_config.validator_index, fullnode_config.fullnode_index
+            ),
+        };
         let pod_api: Api<Pod> = Api::namespaced(self.client.clone(), DEFAULT_NAMESPACE);
         if pod_api.get(&pod_name).await.is_ok() {
             self.delete_pod(&pod_name).await?;
         }
-        let node_name = if let Some(instance) = self.validator_to_node.lock().await.get(&index) {
+        let node_name = if let Some(instance) = self.node_map.lock().await.get(&instance_config) {
             if let Some(k8s_node) = instance.k8s_node() {
                 k8s_node.to_string()
             } else {
@@ -229,85 +373,36 @@ impl ClusterSwarm for ClusterSwarmKube {
             "".to_string()
         };
         debug!("Creating pod {} on node {:?}", pod_name, node_name);
-        let p: Pod = self.validator_spec(
-            index,
-            num_validators,
-            num_fullnodes,
-            &node_name,
-            image_tag,
-            delete_data,
-        )?;
-        match pod_api.create(&PostParams::default(), &p).await {
-            Ok(o) => {
-                debug!(
-                    "Created {}",
-                    o.metadata
-                        .ok_or_else(|| { format_err!("metadata not found for pod {}", pod_name) })?
-                        .name
-                        .ok_or_else(|| { format_err!("name not found for pod {}", pod_name) })?
-                );
-            }
-            Err(e) => bail!("Failed to create pod {} : {}", pod_name, e),
-        }
-        if node_name.is_empty() {
-            let (node_name, pod_ip) = self.get_pod_node_and_ip(&pod_name).await?;
-            let ac_port = DEFAULT_JSON_RPC_PORT as u32;
-            let instance = Instance::new_k8s(pod_name, pod_ip, ac_port, Some(node_name));
-            self.validator_to_node.lock().await.insert(index, instance);
-        }
-        Ok(())
-    }
-
-    async fn delete_validator(&self, index: u32) -> Result<()> {
-        let pod_name = format!("val-{}", index);
-        self.delete_pod(&pod_name).await
-    }
-
-    async fn upsert_fullnode(
-        &self,
-        fullnode_index: u32,
-        num_fullnodes_per_validator: u32,
-        validator_index: u32,
-        num_validators: u32,
-        image_tag: &str,
-        delete_data: bool,
-    ) -> Result<()> {
-        let pod_name = format!("fn-{}-{}", validator_index, fullnode_index);
-        let pod_api: Api<Pod> = Api::namespaced(self.client.clone(), DEFAULT_NAMESPACE);
-        if pod_api.get(&pod_name).await.is_ok() {
-            self.delete_pod(&pod_name).await?;
-        }
-        let node_name = if let Some(instance) = self
-            .fullnode_to_node
-            .lock()
-            .await
-            .get(&(validator_index, fullnode_index))
-        {
-            if let Some(k8s_node) = instance.k8s_node() {
-                k8s_node.to_string()
-            } else {
-                "".to_string()
-            }
-        } else {
-            "".to_string()
+        let p: Pod = match &instance_config {
+            Validator(validator_config) => self.validator_spec(
+                validator_config.index,
+                validator_config.num_validators,
+                validator_config.num_fullnodes,
+                &node_name,
+                &validator_config.image_tag,
+                &validator_config.config_overrides.iter().join(","),
+                delete_data,
+            )?,
+            Fullnode(fullnode_config) => self.fullnode_spec(
+                fullnode_config.fullnode_index,
+                fullnode_config.num_fullnodes_per_validator,
+                fullnode_config.validator_index,
+                fullnode_config.num_validators,
+                &node_name,
+                &fullnode_config.image_tag,
+                &fullnode_config.config_overrides.iter().join(","),
+                delete_data,
+            )?,
         };
-        debug!("Creating pod {} on node {:?}", pod_name, node_name);
-        let p: Pod = self.fullnode_spec(
-            fullnode_index,
-            num_fullnodes_per_validator,
-            validator_index,
-            num_validators,
-            &node_name,
-            image_tag,
-            delete_data,
-        )?;
         match pod_api.create(&PostParams::default(), &p).await {
             Ok(o) => {
                 debug!(
                     "Created {}",
                     o.metadata
+                        .as_ref()
                         .ok_or_else(|| { format_err!("metadata not found for pod {}", pod_name) })?
                         .name
+                        .as_ref()
                         .ok_or_else(|| { format_err!("name not found for pod {}", pod_name) })?
                 );
             }
@@ -316,17 +411,26 @@ impl ClusterSwarm for ClusterSwarmKube {
         if node_name.is_empty() {
             let (node_name, pod_ip) = self.get_pod_node_and_ip(&pod_name).await?;
             let ac_port = DEFAULT_JSON_RPC_PORT as u32;
-            let instance = Instance::new_k8s(pod_name, pod_ip, ac_port, Some(node_name));
-            self.fullnode_to_node
-                .lock()
-                .await
-                .insert((validator_index, fullnode_index), instance);
+            let instance = Instance::new_k8s(
+                pod_name,
+                pod_ip,
+                ac_port,
+                Some(node_name),
+                instance_config.clone(),
+            );
+            self.node_map.lock().await.insert(instance_config, instance);
         }
         Ok(())
     }
 
-    async fn delete_fullnode(&self, fullnode_index: u32, validator_index: u32) -> Result<()> {
-        let pod_name = format!("fn-{}-{}", validator_index, fullnode_index);
+    async fn delete_node(&self, instance_config: InstanceConfig) -> Result<()> {
+        let pod_name = match instance_config {
+            Validator(validator_config) => format!("val-{}", validator_config.index),
+            Fullnode(fullnode_config) => format!(
+                "fn-{}-{}",
+                fullnode_config.validator_index, fullnode_config.fullnode_index
+            ),
+        };
         self.delete_pod(&pod_name).await
     }
 

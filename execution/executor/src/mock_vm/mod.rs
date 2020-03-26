@@ -4,20 +4,20 @@
 #[cfg(test)]
 mod mock_vm_test;
 
-use libra_config::config::VMConfig;
 use libra_crypto::ed25519::compat;
 use libra_state_view::StateView;
 use libra_types::{
     access_path::AccessPath,
-    account_address::{AccountAddress, ADDRESS_LENGTH},
+    account_address::AccountAddress,
+    account_config::lbr_type_tag,
     contract_event::ContractEvent,
-    crypto_proxies::ValidatorSet,
     event::EventKey,
     language_storage::TypeTag,
     transaction::{
         RawTransaction, Script, SignedTransaction, Transaction, TransactionArgument,
         TransactionOutput, TransactionPayload, TransactionStatus,
     },
+    validator_set::ValidatorSet,
     vm_error::{StatusCode, VMStatus},
     write_set::{WriteOp, WriteSet, WriteSetMut},
 };
@@ -52,7 +52,6 @@ pub struct MockVM;
 impl VMExecutor for MockVM {
     fn execute_block(
         transactions: Vec<Transaction>,
-        _config: &VMConfig,
         state_view: &dyn StateView,
     ) -> Result<Vec<TransactionOutput>, VMStatus> {
         if state_view.is_genesis() {
@@ -143,7 +142,7 @@ impl VMExecutor for MockVM {
                     ));
                 }
                 MockVMTransaction::Reconfiguration => {
-                    let account = AccountAddress::new([0xff; ADDRESS_LENGTH]);
+                    let account = AccountAddress::new([0xff; AccountAddress::LENGTH]);
                     let balance_access_path = balance_ap(account);
                     read_balance_from_storage(state_view, &balance_access_path);
                     outputs.push(TransactionOutput::new(
@@ -221,7 +220,7 @@ fn seqnum_ap(account: AccountAddress) -> AccessPath {
 }
 
 fn gen_genesis_writeset() -> WriteSet {
-    let address = AccountAddress::new([0xff; ADDRESS_LENGTH]);
+    let address = AccountAddress::new([0xff; AccountAddress::LENGTH]);
     let path = b"hello".to_vec();
     let mut write_set = WriteSetMut::default();
     write_set.push((
@@ -275,7 +274,7 @@ fn gen_events(sender: AccountAddress) -> Vec<ContractEvent> {
     vec![ContractEvent::new(
         EventKey::new_from_address(&sender, 0),
         0,
-        TypeTag::ByteArray,
+        TypeTag::Vector(Box::new(TypeTag::U8)),
         b"event_data".to_vec(),
     )]
 }
@@ -304,8 +303,15 @@ pub fn encode_transfer_transaction(
 }
 
 fn encode_transaction(sender: AccountAddress, program: Script) -> Transaction {
-    let raw_transaction =
-        RawTransaction::new_script(sender, 0, program, 0, 0, std::time::Duration::from_secs(0));
+    let raw_transaction = RawTransaction::new_script(
+        sender,
+        0,
+        program,
+        0,
+        0,
+        lbr_type_tag(),
+        std::time::Duration::from_secs(0),
+    );
 
     let (privkey, pubkey) = compat::generate_keypair(None);
     Transaction::UserTransaction(

@@ -11,11 +11,13 @@ use libra_crypto::{
 };
 use libra_logger::prelude::*;
 use libra_types::{
-    account_address::{AccountAddress, AuthenticationKey},
-    account_config::{association_address, AccountResource},
+    account_address::AccountAddress,
+    account_config::{association_address, lbr_type_tag, AccountResource},
     block_info::BlockInfo,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
-    transaction::{RawTransaction, Script, SignedTransaction, Transaction},
+    transaction::{
+        authenticator::AuthenticationKey, RawTransaction, Script, SignedTransaction, Transaction,
+    },
 };
 use libra_vm::LibraVM;
 use rand::{rngs::StdRng, SeedableRng};
@@ -37,7 +39,7 @@ struct AccountData {
 
 impl AccountData {
     pub fn auth_key_prefix(&self) -> Vec<u8> {
-        AuthenticationKey::from_public_key(&self.public_key)
+        AuthenticationKey::ed25519(&self.public_key)
             .prefix()
             .to_vec()
     }
@@ -334,6 +336,7 @@ fn create_transaction(
         program,
         400_000, /* max_gas_amount */
         1,       /* gas_unit_price */
+        lbr_type_tag(),
         expiration_time,
     );
 

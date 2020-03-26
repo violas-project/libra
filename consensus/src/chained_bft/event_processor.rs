@@ -43,10 +43,8 @@ use libra_crypto::hash::TransactionAccumulatorHasher;
 use libra_logger::prelude::*;
 use libra_security_logger::{security_log, SecurityEvent};
 use libra_types::{
-    crypto_proxies::{
-        EpochInfo, LedgerInfoWithSignatures, ValidatorChangeProof, ValidatorVerifier,
-    },
-    transaction::TransactionStatus,
+    epoch_info::EpochInfo, ledger_info::LedgerInfoWithSignatures, transaction::TransactionStatus,
+    validator_change::ValidatorChangeProof, validator_verifier::ValidatorVerifier,
 };
 #[cfg(test)]
 use safety_rules::ConsensusState;
@@ -111,7 +109,7 @@ pub enum VerifiedEvent<T> {
 #[path = "event_processor_test.rs"]
 mod event_processor_test;
 
-#[cfg(any(feature = "fuzzing", test))]
+#[cfg(any(test, feature = "fuzzing"))]
 #[path = "event_processor_fuzzing.rs"]
 pub mod event_processor_fuzzing;
 
@@ -766,7 +764,7 @@ impl<T: Payload> EventProcessor<T> {
                 executed_block.transaction_info_hashes(),
             ),
             block.clone(),
-            executed_block.compute_result().executed_state.validators,
+            executed_block.compute_result().validators().clone(),
         );
 
         let vote = self
@@ -957,7 +955,7 @@ impl<T: Payload> EventProcessor<T> {
                     }
                 }
             }
-            for status in block.compute_result().compute_status.iter() {
+            for status in block.compute_result().compute_status().iter() {
                 match status {
                     TransactionStatus::Keep(_) => {
                         counters::COMMITTED_TXNS_COUNT

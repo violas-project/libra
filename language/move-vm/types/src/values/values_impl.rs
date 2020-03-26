@@ -2,13 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    loaded_data::{struct_def::StructDef, types::Type},
+    loaded_data::types::{StructType, Type},
     native_functions::dispatch::{native_gas, NativeResult},
 };
 use libra_types::{
-    account_address::{AccountAddress, ADDRESS_LENGTH},
-    byte_array::ByteArray,
-    language_storage::TypeTag,
+    account_address::AccountAddress,
     vm_error::{sub_status::NFE_VECTOR_ERROR_BASE, StatusCode, VMStatus},
 };
 use std::{
@@ -49,7 +47,6 @@ enum ValueImpl {
     U128(u128),
     Bool(bool),
     Address(AccountAddress),
-    ByteArray(ByteArray),
 
     Container(Rc<RefCell<Container>>),
 
@@ -210,7 +207,6 @@ impl Value {
             (SignatureToken::U128, ValueImpl::U128(_)) => true,
             (SignatureToken::Bool, ValueImpl::Bool(_)) => true,
             (SignatureToken::Address, ValueImpl::Address(_)) => true,
-            (SignatureToken::ByteArray, ValueImpl::ByteArray(_)) => true,
             (SignatureToken::Vector(ty), ValueImpl::Container(r)) => match (&**ty, &*r.borrow()) {
                 (SignatureToken::U8, Container::U8(_)) => true,
                 _ => false,
@@ -291,7 +287,6 @@ impl_vm_value_ref!(u64, U64);
 impl_vm_value_ref!(u128, U128);
 impl_vm_value_ref!(bool, Bool);
 impl_vm_value_ref!(AccountAddress, Address);
-impl_vm_value_ref!(ByteArray, ByteArray);
 
 impl ValueImpl {
     fn as_value_ref<T>(&self) -> VMResult<&T>
@@ -323,7 +318,6 @@ impl ValueImpl {
             U128(x) => U128(*x),
             Bool(x) => Bool(*x),
             Address(x) => Address(*x),
-            ByteArray(x) => ByteArray(x.clone()),
 
             ContainerRef(r) => ContainerRef(r.copy_value()),
             IndexedRef(r) => IndexedRef(r.copy_value()),
@@ -402,7 +396,6 @@ impl ValueImpl {
             (U64(l), U64(r)) => l == r,
             (U128(l), U128(r)) => l == r,
             (Bool(l), Bool(r)) => l == r,
-            (ByteArray(l), ByteArray(r)) => l == r,
             (Address(l), Address(r)) => l == r,
 
             (Container(l), Container(r)) => l.borrow().equals(&*r.borrow())?,
@@ -717,8 +710,7 @@ impl Locals {
                 | ValueImpl::U64(_)
                 | ValueImpl::U128(_)
                 | ValueImpl::Bool(_)
-                | ValueImpl::Address(_)
-                | ValueImpl::ByteArray(_) => Ok(Value(ValueImpl::IndexedRef(IndexedRef {
+                | ValueImpl::Address(_) => Ok(Value(ValueImpl::IndexedRef(IndexedRef {
                     container_ref: ContainerRef::Local(Rc::clone(&self.0)),
                     idx,
                 }))),
@@ -840,10 +832,6 @@ impl Value {
         Self(ValueImpl::Bool(x))
     }
 
-    pub fn byte_array(x: ByteArray) -> Self {
-        Self(ValueImpl::ByteArray(x))
-    }
-
     pub fn address(x: AccountAddress) -> Self {
         Self(ValueImpl::Address(x))
     }
@@ -852,9 +840,35 @@ impl Value {
         Self(ValueImpl::new_container(s.0))
     }
 
-    // TODO: consider whether we want to replace this with fn vector(v: Vec<Value>).
-    pub fn vector_u8(v: Vec<u8>) -> Self {
-        Self(ValueImpl::new_container(Container::U8(v)))
+    // TODO: consider whether we want to replace these with fn vector(v: Vec<Value>).
+    pub fn vector_u8(it: impl IntoIterator<Item = u8>) -> Self {
+        Self(ValueImpl::new_container(Container::U8(
+            it.into_iter().collect(),
+        )))
+    }
+
+    pub fn vector_u64(it: impl IntoIterator<Item = u64>) -> Self {
+        Self(ValueImpl::new_container(Container::U64(
+            it.into_iter().collect(),
+        )))
+    }
+
+    pub fn vector_u128(it: impl IntoIterator<Item = u128>) -> Self {
+        Self(ValueImpl::new_container(Container::U128(
+            it.into_iter().collect(),
+        )))
+    }
+
+    pub fn vector_bool(it: impl IntoIterator<Item = bool>) -> Self {
+        Self(ValueImpl::new_container(Container::Bool(
+            it.into_iter().collect(),
+        )))
+    }
+
+    pub fn vector_address(it: impl IntoIterator<Item = AccountAddress>) -> Self {
+        Self(ValueImpl::new_container(Container::General(
+            it.into_iter().map(ValueImpl::Address).collect(),
+        )))
     }
 }
 
@@ -899,7 +913,6 @@ impl_vm_value_cast!(u64, U64);
 impl_vm_value_cast!(u128, U128);
 impl_vm_value_cast!(bool, Bool);
 impl_vm_value_cast!(AccountAddress, Address);
-impl_vm_value_cast!(ByteArray, ByteArray);
 impl_vm_value_cast!(ContainerRef, ContainerRef);
 impl_vm_value_cast!(IndexedRef, IndexedRef);
 
@@ -1369,7 +1382,7 @@ pub mod vector {
     }
 
     pub fn native_empty(
-        ty_args: Vec<TypeTag>,
+        ty_args: Vec<Type>,
         args: VecDeque<Value>,
         cost_table: &CostTable,
     ) -> VMResult<NativeResult> {
@@ -1378,10 +1391,10 @@ pub mod vector {
 
         let cost = native_gas(cost_table, NativeCostIndex::EMPTY, 1);
         let container = match &ty_args[0] {
-            TypeTag::U8 => Container::U8(vec![]),
-            TypeTag::U64 => Container::U64(vec![]),
-            TypeTag::U128 => Container::U128(vec![]),
-            TypeTag::Bool => Container::Bool(vec![]),
+            Type::U8 => Container::U8(vec![]),
+            Type::U64 => Container::U64(vec![]),
+            Type::U128 => Container::U128(vec![]),
+            Type::Bool => Container::Bool(vec![]),
 
             _ => Container::General(vec![]),
         };
@@ -1393,7 +1406,7 @@ pub mod vector {
     }
 
     pub fn native_length(
-        ty_args: Vec<TypeTag>,
+        ty_args: Vec<Type>,
         mut args: VecDeque<Value>,
         cost_table: &CostTable,
     ) -> VMResult<NativeResult> {
@@ -1405,14 +1418,14 @@ pub mod vector {
         let v = r.borrow();
 
         let len = match (&ty_args[0], &*v) {
-            (TypeTag::U8, Container::U8(v)) => v.len(),
-            (TypeTag::U64, Container::U64(v)) => v.len(),
-            (TypeTag::U128, Container::U128(v)) => v.len(),
-            (TypeTag::Bool, Container::Bool(v)) => v.len(),
+            (Type::U8, Container::U8(v)) => v.len(),
+            (Type::U64, Container::U64(v)) => v.len(),
+            (Type::U128, Container::U128(v)) => v.len(),
+            (Type::Bool, Container::Bool(v)) => v.len(),
 
-            (TypeTag::Struct(_), Container::General(v))
-            | (TypeTag::ByteArray, Container::General(v))
-            | (TypeTag::Address, Container::General(v)) => v.len(),
+            (Type::Struct(_), Container::General(v)) | (Type::Address, Container::General(v)) => {
+                v.len()
+            }
 
             (tag, v) => err_vector_elem_ty_mismatch!(tag, v),
         };
@@ -1421,7 +1434,7 @@ pub mod vector {
     }
 
     pub fn native_push_back(
-        ty_args: Vec<TypeTag>,
+        ty_args: Vec<Type>,
         mut args: VecDeque<Value>,
         cost_table: &CostTable,
     ) -> VMResult<NativeResult> {
@@ -1438,14 +1451,14 @@ pub mod vector {
             .mul(e.size());
 
         match (&ty_args[0], &mut *v) {
-            (TypeTag::U8, Container::U8(v)) => v.push(e.value_as()?),
-            (TypeTag::U64, Container::U64(v)) => v.push(e.value_as()?),
-            (TypeTag::U128, Container::U128(v)) => v.push(e.value_as()?),
-            (TypeTag::Bool, Container::Bool(v)) => v.push(e.value_as()?),
+            (Type::U8, Container::U8(v)) => v.push(e.value_as()?),
+            (Type::U64, Container::U64(v)) => v.push(e.value_as()?),
+            (Type::U128, Container::U128(v)) => v.push(e.value_as()?),
+            (Type::Bool, Container::Bool(v)) => v.push(e.value_as()?),
 
-            (TypeTag::Struct(_), Container::General(v))
-            | (TypeTag::ByteArray, Container::General(v))
-            | (TypeTag::Address, Container::General(v)) => v.push(e.0),
+            (Type::Struct(_), Container::General(v)) | (Type::Address, Container::General(v)) => {
+                v.push(e.0)
+            }
 
             (tag, v) => err_vector_elem_ty_mismatch!(tag, v),
         }
@@ -1454,7 +1467,7 @@ pub mod vector {
     }
 
     pub fn native_borrow(
-        ty_args: Vec<TypeTag>,
+        ty_args: Vec<Type>,
         mut args: VecDeque<Value>,
         cost_table: &CostTable,
     ) -> VMResult<NativeResult> {
@@ -1480,7 +1493,7 @@ pub mod vector {
     }
 
     pub fn native_pop(
-        ty_args: Vec<TypeTag>,
+        ty_args: Vec<Type>,
         mut args: VecDeque<Value>,
         cost_table: &CostTable,
     ) -> VMResult<NativeResult> {
@@ -1501,29 +1514,29 @@ pub mod vector {
         }
 
         let res = match (&ty_args[0], &mut *v) {
-            (TypeTag::U8, Container::U8(v)) => match v.pop() {
+            (Type::U8, Container::U8(v)) => match v.pop() {
                 Some(x) => Value::u8(x),
                 None => err_pop_empty_vec!(),
             },
-            (TypeTag::U64, Container::U64(v)) => match v.pop() {
+            (Type::U64, Container::U64(v)) => match v.pop() {
                 Some(x) => Value::u64(x),
                 None => err_pop_empty_vec!(),
             },
-            (TypeTag::U128, Container::U128(v)) => match v.pop() {
+            (Type::U128, Container::U128(v)) => match v.pop() {
                 Some(x) => Value::u128(x),
                 None => err_pop_empty_vec!(),
             },
-            (TypeTag::Bool, Container::Bool(v)) => match v.pop() {
+            (Type::Bool, Container::Bool(v)) => match v.pop() {
                 Some(x) => Value::bool(x),
                 None => err_pop_empty_vec!(),
             },
 
-            (TypeTag::Struct(_), Container::General(v))
-            | (TypeTag::ByteArray, Container::General(v))
-            | (TypeTag::Address, Container::General(v)) => match v.pop() {
-                Some(x) => Value(x),
-                None => err_pop_empty_vec!(),
-            },
+            (Type::Struct(_), Container::General(v)) | (Type::Address, Container::General(v)) => {
+                match v.pop() {
+                    Some(x) => Value(x),
+                    None => err_pop_empty_vec!(),
+                }
+            }
 
             (tag, v) => err_vector_elem_ty_mismatch!(tag, v),
         };
@@ -1532,7 +1545,7 @@ pub mod vector {
     }
 
     pub fn native_destroy_empty(
-        ty_args: Vec<TypeTag>,
+        ty_args: Vec<Type>,
         mut args: VecDeque<Value>,
         cost_table: &CostTable,
     ) -> VMResult<NativeResult> {
@@ -1543,14 +1556,14 @@ pub mod vector {
         let v = args.pop_front().unwrap().value_as::<Container>()?;
 
         let is_empty = match (&ty_args[0], &v) {
-            (TypeTag::U8, Container::U8(v)) => v.is_empty(),
-            (TypeTag::U64, Container::U64(v)) => v.is_empty(),
-            (TypeTag::U128, Container::U128(v)) => v.is_empty(),
-            (TypeTag::Bool, Container::Bool(v)) => v.is_empty(),
+            (Type::U8, Container::U8(v)) => v.is_empty(),
+            (Type::U64, Container::U64(v)) => v.is_empty(),
+            (Type::U128, Container::U128(v)) => v.is_empty(),
+            (Type::Bool, Container::Bool(v)) => v.is_empty(),
 
-            (TypeTag::Struct(_), Container::General(v))
-            | (TypeTag::ByteArray, Container::General(v))
-            | (TypeTag::Address, Container::General(v)) => v.is_empty(),
+            (Type::Struct(_), Container::General(v)) | (Type::Address, Container::General(v)) => {
+                v.is_empty()
+            }
 
             (tag, v) => err_vector_elem_ty_mismatch!(tag, v),
         };
@@ -1567,7 +1580,7 @@ pub mod vector {
     }
 
     pub fn native_swap(
-        ty_args: Vec<TypeTag>,
+        ty_args: Vec<Type>,
         mut args: VecDeque<Value>,
         cost_table: &CostTable,
     ) -> VMResult<NativeResult> {
@@ -1594,13 +1607,13 @@ pub mod vector {
         }
 
         match (&ty_args[0], &mut *v) {
-            (TypeTag::U8, Container::U8(v)) => swap!(v),
-            (TypeTag::U64, Container::U64(v)) => swap!(v),
-            (TypeTag::U128, Container::U128(v)) => swap!(v),
-            (TypeTag::Bool, Container::Bool(v)) => swap!(v),
-            (TypeTag::Struct(_), Container::General(v))
-            | (TypeTag::Address, Container::General(v))
-            | (TypeTag::ByteArray, Container::General(v)) => swap!(v),
+            (Type::U8, Container::U8(v)) => swap!(v),
+            (Type::U64, Container::U64(v)) => swap!(v),
+            (Type::U128, Container::U128(v)) => swap!(v),
+            (Type::Bool, Container::Bool(v)) => swap!(v),
+            (Type::Struct(_), Container::General(v)) | (Type::Address, Container::General(v)) => {
+                swap!(v)
+            }
             (tag, v) => err_vector_elem_ty_mismatch!(tag, v),
         }
 
@@ -1648,8 +1661,7 @@ impl ValueImpl {
 
         match self {
             Invalid | U8(_) | U64(_) | U128(_) | Bool(_) => CONST_SIZE,
-            Address(_) => AbstractMemorySize::new(ADDRESS_LENGTH as u64),
-            ByteArray(key) => AbstractMemorySize::new(key.len() as u64),
+            Address(_) => AbstractMemorySize::new(AccountAddress::LENGTH as u64),
             ContainerRef(r) => r.size(),
             IndexedRef(r) => r.size(),
             // TODO: in case the borrow fails the VM will panic.
@@ -1789,7 +1801,6 @@ impl Display for ValueImpl {
             Self::U128(x) => write!(f, "U128({})", x),
             Self::Bool(x) => write!(f, "{}", x),
             Self::Address(addr) => write!(f, "Address({})", addr.short_str()),
-            Self::ByteArray(x) => write!(f, "ByteArray({})", x),
 
             Self::Container(r) => write!(f, "Container({})", &*r.borrow()),
 
@@ -1899,40 +1910,32 @@ use serde::{
 };
 
 impl Value {
-    pub fn simple_deserialize(blob: &[u8], layout: Type) -> VMResult<Value> {
-        lcs::from_bytes_seed(&layout, blob)
+    pub fn simple_deserialize(blob: &[u8], ty: Type) -> VMResult<Value> {
+        lcs::from_bytes_seed(&ty, blob)
             .map_err(|e| VMStatus::new(StatusCode::INVALID_DATA).with_message(e.to_string()))
     }
 
-    pub fn simple_serialize(&self, layout: &Type) -> Option<Vec<u8>> {
-        lcs::to_bytes(&AnnotatedValue {
-            layout,
-            val: &self.0,
-        })
-        .ok()
+    pub fn simple_serialize(&self, ty: &Type) -> Option<Vec<u8>> {
+        lcs::to_bytes(&AnnotatedValue { ty, val: &self.0 }).ok()
     }
 }
 
 impl Struct {
-    pub fn simple_serialize(&self, layout: &StructDef) -> Option<Vec<u8>> {
-        lcs::to_bytes(&AnnotatedValue {
-            layout,
-            val: &self.0,
-        })
-        .ok()
+    pub fn simple_serialize(&self, ty: &StructType) -> Option<Vec<u8>> {
+        lcs::to_bytes(&AnnotatedValue { ty, val: &self.0 }).ok()
     }
 }
 
 struct AnnotatedValue<'a, 'b, T1, T2> {
-    layout: &'a T1,
+    ty: &'a T1,
     val: &'b T2,
 }
 
 impl<'a, 'b> serde::Serialize for AnnotatedValue<'a, 'b, Type, ValueImpl> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         macro_rules! serialize_vec {
-            ($tc: ident, $layout: expr, $v: expr) => {{
-                match $layout {
+            ($tc: ident, $ty: expr, $v: expr) => {{
+                match $ty {
                     Type::$tc => (),
                     _ => {
                         return Err(S::Error::custom(
@@ -1951,79 +1954,82 @@ impl<'a, 'b> serde::Serialize for AnnotatedValue<'a, 'b, Type, ValueImpl> {
             }};
         }
 
-        match (self.layout, self.val) {
+        match (self.ty, self.val) {
             (Type::U8, ValueImpl::U8(x)) => serializer.serialize_u8(*x),
             (Type::U64, ValueImpl::U64(x)) => serializer.serialize_u64(*x),
             (Type::U128, ValueImpl::U128(x)) => serializer.serialize_u128(*x),
             (Type::Bool, ValueImpl::Bool(x)) => serializer.serialize_bool(*x),
             (Type::Address, ValueImpl::Address(x)) => x.serialize(serializer),
-            (Type::ByteArray, ValueImpl::ByteArray(x)) => x.serialize(serializer),
 
-            (Type::Struct(layout), ValueImpl::Container(r)) => {
+            (Type::Struct(ty), ValueImpl::Container(r)) => {
                 let r = r.borrow();
-                (AnnotatedValue { layout, val: &*r }).serialize(serializer)
+                (AnnotatedValue {
+                    ty: &**ty,
+                    val: &*r,
+                })
+                .serialize(serializer)
             }
 
-            (Type::Vector(layout), ValueImpl::Container(r)) => {
-                let layout = &**layout;
-                match (layout, &*r.borrow()) {
+            (Type::Vector(ty), ValueImpl::Container(r)) => {
+                let ty = &**ty;
+                match (ty, &*r.borrow()) {
                     (Type::Vector(_), Container::General(v))
                     | (Type::Struct(_), Container::General(v))
-                    | (Type::Address, Container::General(v))
-                    | (Type::ByteArray, Container::General(v)) => {
+                    | (Type::Address, Container::General(v)) => {
                         let mut t = serializer.serialize_seq(Some(v.len()))?;
                         for val in v {
-                            t.serialize_element(&AnnotatedValue { layout, val })?;
+                            t.serialize_element(&AnnotatedValue { ty, val })?;
                         }
                         t.end()
                     }
 
-                    (Type::U8, Container::U8(v)) => serialize_vec!(U8, layout, v),
-                    (Type::U64, Container::U64(v)) => serialize_vec!(U64, layout, v),
-                    (Type::U128, Container::U128(v)) => serialize_vec!(U128, layout, v),
-                    (Type::Bool, Container::Bool(v)) => serialize_vec!(Bool, layout, v),
+                    (Type::U8, Container::U8(v)) => serialize_vec!(U8, ty, v),
+                    (Type::U64, Container::U64(v)) => serialize_vec!(U64, ty, v),
+                    (Type::U128, Container::U128(v)) => serialize_vec!(U128, ty, v),
+                    (Type::Bool, Container::Bool(v)) => serialize_vec!(Bool, ty, v),
 
-                    (layout, container) => Err(S::Error::custom(
+                    (ty, container) => Err(S::Error::custom(
                         VMStatus::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR).with_message(
-                            format!("cannot serialize container {:?} as {:?}", container, layout),
+                            format!("cannot serialize container {:?} as {:?}", container, ty),
                         ),
                     )),
                 }
             }
 
-            (layout, val) => Err(S::Error::custom(
+            (ty, val) => Err(S::Error::custom(
                 VMStatus::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR)
-                    .with_message(format!("cannot serialize value {:?} as {:?}", val, layout)),
+                    .with_message(format!("cannot serialize value {:?} as {:?}", val, ty)),
             )),
         }
     }
 }
 
-impl<'a, 'b> serde::Serialize for AnnotatedValue<'a, 'b, StructDef, Container> {
+impl<'a, 'b> serde::Serialize for AnnotatedValue<'a, 'b, StructType, Container> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        match (self.layout, self.val) {
-            (StructDef::Struct(inner), Container::General(v)) => {
-                if inner.field_definitions().len() != v.len() {
+        match self.val {
+            Container::General(v) => {
+                let fields = &self.ty.layout;
+                if fields.len() != v.len() {
                     return Err(S::Error::custom(
                         VMStatus::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR).with_message(
                             format!(
                                 "cannot serialize struct value {:?} as {:?} -- number of fields mismatch",
-                                self.val, self.layout
+                                self.val, self.ty
                             ),
                         ),
                     ));
                 }
                 let mut t = serializer.serialize_tuple(v.len())?;
-                for (layout, val) in inner.field_definitions().iter().zip(v.iter()) {
-                    t.serialize_element(&AnnotatedValue { layout, val })?;
+                for (ty, val) in fields.iter().zip(v.iter()) {
+                    t.serialize_element(&AnnotatedValue { ty, val })?;
                 }
                 t.end()
             }
 
-            (val, layout) => Err(S::Error::custom(
+            _ => Err(S::Error::custom(
                 VMStatus::new(StatusCode::UNKNOWN_INVARIANT_VIOLATION_ERROR).with_message(format!(
                     "cannot serialize container value {:?} as {:?}",
-                    val, layout
+                    self.val, self.ty
                 )),
             )),
         }
@@ -2042,7 +2048,6 @@ impl<'d> serde::de::DeserializeSeed<'d> for &Type {
             Type::U8 => u8::deserialize(deserializer).map(Value::u8),
             Type::U64 => u64::deserialize(deserializer).map(Value::u64),
             Type::U128 => u128::deserialize(deserializer).map(Value::u128),
-            Type::ByteArray => ByteArray::deserialize(deserializer).map(Value::byte_array),
             Type::Address => AccountAddress::deserialize(deserializer).map(Value::address),
 
             Type::Vector(layout) => {
@@ -2106,7 +2111,7 @@ impl<'d> serde::de::DeserializeSeed<'d> for &Type {
 
             Type::Struct(layout) => layout.deserialize(deserializer),
 
-            Type::Reference(_) | Type::MutableReference(_) | Type::TypeVariable(_) => {
+            Type::Reference(_) | Type::MutableReference(_) | Type::TyParam(_) => {
                 Err(D::Error::custom(
                     VMStatus::new(StatusCode::INVALID_DATA)
                         .with_message(format!("Value type {:?} not possible", self)),
@@ -2116,49 +2121,43 @@ impl<'d> serde::de::DeserializeSeed<'d> for &Type {
     }
 }
 
-impl<'d> serde::de::DeserializeSeed<'d> for &StructDef {
+impl<'d> serde::de::DeserializeSeed<'d> for &StructType {
     type Value = Value;
 
     fn deserialize<D: serde::de::Deserializer<'d>>(
         self,
         deserializer: D,
     ) -> Result<Self::Value, D::Error> {
-        match self {
-            StructDef::Struct(inner) => {
-                struct StructVisitor<'a>(&'a [Type]);
-                impl<'d, 'a> serde::de::Visitor<'d> for StructVisitor<'a> {
-                    type Value = Struct;
+        struct StructVisitor<'a>(&'a [Type]);
+        impl<'d, 'a> serde::de::Visitor<'d> for StructVisitor<'a> {
+            type Value = Struct;
 
-                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                        formatter.write_str("Struct")
-                    }
-
-                    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
-                    where
-                        A: serde::de::SeqAccess<'d>,
-                    {
-                        let mut val = Vec::new();
-
-                        for (i, field_type) in self.0.iter().enumerate() {
-                            if let Some(elem) = seq.next_element_seed(field_type)? {
-                                val.push(elem)
-                            } else {
-                                return Err(A::Error::invalid_length(i, &self));
-                            }
-                        }
-                        Ok(Struct::pack(val))
-                    }
-                }
-
-                let field_layouts = inner.field_definitions();
-                Ok(Value::struct_(deserializer.deserialize_tuple(
-                    field_layouts.len(),
-                    StructVisitor(field_layouts),
-                )?))
+            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str("Struct")
             }
 
-            StructDef::Native(_) => unreachable!("we do not have any native structs right now"),
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: serde::de::SeqAccess<'d>,
+            {
+                let mut val = Vec::new();
+
+                for (i, field_type) in self.0.iter().enumerate() {
+                    if let Some(elem) = seq.next_element_seed(field_type)? {
+                        val.push(elem)
+                    } else {
+                        return Err(A::Error::invalid_length(i, &self));
+                    }
+                }
+                Ok(Struct::pack(val))
+            }
         }
+
+        let field_layouts = &self.layout;
+        Ok(Value::struct_(deserializer.deserialize_tuple(
+            field_layouts.len(),
+            StructVisitor(field_layouts),
+        )?))
     }
 }
 
@@ -2181,7 +2180,6 @@ pub mod prop {
             Type::U128 => any::<u128>().prop_map(Value::u128).boxed(),
             Type::Bool => any::<bool>().prop_map(Value::bool).boxed(),
             Type::Address => any::<AccountAddress>().prop_map(Value::address).boxed(),
-            Type::ByteArray => any::<ByteArray>().prop_map(Value::byte_array).boxed(),
 
             Type::Vector(layout) => match &**layout {
                 Type::U8 => vec(any::<u8>(), 0..10)
@@ -2205,8 +2203,8 @@ pub mod prop {
                     .boxed(),
             },
 
-            Type::Struct(StructDef::Struct(inner)) => inner
-                .field_definitions()
+            Type::Struct(struct_ty) => struct_ty
+                .layout
                 .iter()
                 .map(|layout| value_strategy_with_layout(layout))
                 .collect::<Vec<_>>()
@@ -2217,15 +2215,11 @@ pub mod prop {
                 })
                 .boxed(),
 
-            Type::Struct(StructDef::Native(_)) => {
-                unreachable!("we do not have any native structs now")
-            }
-
             Type::Reference(..) | Type::MutableReference(..) => {
                 panic!("cannot generate references for prop tests")
             }
 
-            Type::TypeVariable(..) => panic!("cannot generate type variables for prop tests"),
+            Type::TyParam(..) => panic!("cannot generate type params for prop tests"),
         }
     }
 

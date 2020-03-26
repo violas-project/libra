@@ -10,7 +10,10 @@ use consensus_types::{block::Block, executed_block::ExecutedBlock};
 use executor_types::{ExecutedTrees, ProcessedVMOutput};
 use futures::channel::mpsc;
 use libra_logger::prelude::*;
-use libra_types::crypto_proxies::{LedgerInfoWithSignatures, ValidatorChangeProof, ValidatorSet};
+use libra_types::{
+    ledger_info::LedgerInfoWithSignatures, validator_change::ValidatorChangeProof,
+    validator_set::ValidatorSet,
+};
 use std::sync::Arc;
 use termion::color::*;
 

@@ -10,12 +10,11 @@ use crate::{
     Executor, OP_COUNTERS,
 };
 use libra_config::config::NodeConfig;
-use libra_crypto::{ed25519::Ed25519PrivateKey, hash::PRE_GENESIS_BLOCK_ID, HashValue};
+use libra_crypto::{hash::PRE_GENESIS_BLOCK_ID, HashValue};
 use libra_types::{
-    account_address::{AccountAddress, ADDRESS_LENGTH},
+    account_address::AccountAddress,
     block_info::BlockInfo,
-    crypto_proxies::LedgerInfoWithSignatures,
-    ledger_info::LedgerInfo,
+    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     transaction::{Transaction, TransactionListWithProof, Version},
 };
 use proptest::prelude::*;
@@ -24,16 +23,6 @@ use std::{collections::BTreeMap, sync::Arc};
 use storage_client::{StorageRead, StorageReadServiceClient, StorageWriteServiceClient};
 use storage_service::start_storage_service;
 use tokio::runtime::Runtime;
-
-fn build_test_config() -> (NodeConfig, Ed25519PrivateKey) {
-    let validator_config = config_builder::ValidatorConfig::new();
-    let randomize_service_ports = true;
-    let randomize_libranet_ports = false;
-    let (mut configs, key) = validator_config
-        .build_common(randomize_service_ports, randomize_libranet_ports)
-        .unwrap();
-    (configs.swap_remove(0), key)
-}
 
 fn create_executor(config: &NodeConfig) -> (Executor<MockVM>, ExecutedTrees) {
     let mut rt = Runtime::new().unwrap();
@@ -88,7 +77,7 @@ struct TestExecutor {
 
 impl TestExecutor {
     fn new() -> (TestExecutor, ExecutedTrees) {
-        let (config, _) = build_test_config();
+        let (config, _) = config_builder::test_config();
         let storage_server = start_storage_service(&config);
         let (executor, committed_trees) = create_executor(&config);
 
@@ -121,8 +110,8 @@ impl Drop for TestExecutor {
 
 fn gen_address(index: u64) -> AccountAddress {
     let bytes = index.to_be_bytes();
-    let mut buf = [0; ADDRESS_LENGTH];
-    buf[ADDRESS_LENGTH - 8..].copy_from_slice(&bytes);
+    let mut buf = [0; AccountAddress::LENGTH];
+    buf[AccountAddress::LENGTH - 8..].copy_from_slice(&bytes);
     AccountAddress::new(buf)
 }
 
@@ -177,7 +166,7 @@ fn test_executor_status() {
             KEEP_STATUS.clone(),
             DISCARD_STATUS.clone()
         ],
-        *output.state_compute_result().status()
+        *output.state_compute_result().compute_status()
     );
 }
 
@@ -319,7 +308,7 @@ fn create_transaction_chunks(
 
     // To obtain the batches of transactions, we first execute and save all these transactions in a
     // separate DB. Then we call get_transactions to retrieve them.
-    let (config, _) = build_test_config();
+    let (config, _) = config_builder::test_config();
     let storage_server = start_storage_service(&config);
     let (executor, root_trees) = create_executor(&config);
 
@@ -383,7 +372,7 @@ fn test_executor_execute_and_commit_chunk() {
     };
 
     // Now we execute these two chunks of transactions.
-    let (config, _) = build_test_config();
+    let (config, _) = config_builder::test_config();
     let storage_server = start_storage_service(&config);
     let (executor, mut committed_trees) = create_executor(&config);
     let storage_client = StorageReadServiceClient::new(&config.storage.address);
@@ -480,7 +469,7 @@ fn test_executor_execute_and_commit_chunk_restart() {
         ])
     };
 
-    let (config, _) = build_test_config();
+    let (config, _) = config_builder::test_config();
     let storage_server = start_storage_service(&config);
     let mut synced_trees;
 
@@ -669,14 +658,8 @@ proptest! {
                 HashValue::zero(), block.txns, &committed_trees, &committed_trees,
             ).unwrap();
         let retry_iter = output.transaction_data().iter().map(TransactionData::status)
-            .skip_while(|status| match *status {
-                TransactionStatus::Keep(_) => true,
-                _ => false
-            });
-            prop_assert_eq!(retry_iter.take_while(|status| match *status {
-                TransactionStatus::Retry => true,
-                _ => false
-            }).count() as u64, num_txns - reconfig_txn_index - 1);
+            .skip_while(|status| matches!(*status, TransactionStatus::Keep(_)));
+            prop_assert_eq!(retry_iter.take_while(|status| matches!(*status,TransactionStatus::Retry)).count() as u64, num_txns - reconfig_txn_index - 1);
         }
 
     #[test]
@@ -684,7 +667,7 @@ proptest! {
         let block_a = TestBlock::new(0..a_size, amount, gen_block_id(1));
         let block_b = TestBlock::new(0..b_size, amount, gen_block_id(2));
 
-        let (config, _) = build_test_config();
+        let (config, _) = config_builder::test_config();
         let storage_server = start_storage_service(&config);
 
         // First execute and commit one block, then destroy executor.
@@ -742,7 +725,7 @@ proptest! {
                 overlap_start..overlap_end
             ]);
 
-        let (config, _) = build_test_config();
+        let (config, _) = config_builder::test_config();
         let storage_server = start_storage_service(&config);
         let (executor, committed_trees) = create_executor(&config);
 

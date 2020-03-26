@@ -5,9 +5,7 @@ use crate::{
     error::*,
 };
 use libra_crypto::ed25519::ED25519_PUBLIC_KEY_LENGTH;
-use libra_types::{
-    account_state::AccountState, account_state_blob::AccountStateBlob, event::EVENT_KEY_LENGTH,
-};
+use libra_types::{account_state::AccountState, account_state_blob::AccountStateBlob};
 use std::{convert::TryFrom, slice};
 
 pub fn libra_LibraAccountResource_from_safe(
@@ -20,21 +18,13 @@ pub fn libra_LibraAccountResource_from_safe(
                 let mut authentication_key = [0u8; ED25519_PUBLIC_KEY_LENGTH];
                 authentication_key.copy_from_slice(account_resource.authentication_key());
 
-                let mut sent_key_copy = [0u8; EVENT_KEY_LENGTH];
-                sent_key_copy.copy_from_slice(account_resource.sent_events().key().as_bytes());
-
                 let sent_events = LibraEventHandle {
                     count: account_resource.sent_events().count(),
-                    key: sent_key_copy,
+                    key: account_resource.sent_events().key().into(),
                 };
-
-                let mut received_key_copy = [0u8; EVENT_KEY_LENGTH];
-                received_key_copy
-                    .copy_from_slice(account_resource.received_events().key().as_bytes());
-
                 let received_events = LibraEventHandle {
                     count: account_resource.received_events().count(),
-                    key: received_key_copy,
+                    key: account_resource.received_events().key().into(),
                 };
 
                 return Ok(LibraAccountResource {
@@ -88,11 +78,11 @@ mod tests {
     fn test_get_accountresource() {
         use libra_crypto::ed25519::compat;
         use libra_types::{
-            account_address::AuthenticationKey,
             account_config::{
                 AccountResource, BalanceResource, ACCOUNT_RESOURCE_PATH, BALANCE_RESOURCE_PATH,
             },
             event::{EventHandle, EventKey},
+            transaction::authenticator::AuthenticationKey,
         };
         use std::collections::BTreeMap;
 
@@ -100,7 +90,7 @@ mod tests {
 
         // Figure out how to use Libra code to generate AccountStateBlob directly, not involving btreemap directly
         let mut map: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
-        let auth_key = AuthenticationKey::from_public_key(&keypair.1);
+        let auth_key = AuthenticationKey::ed25519(&keypair.1);
         let addr = auth_key.derived_address();
         let ar = AccountResource::new(
             123_456_789,

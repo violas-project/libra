@@ -160,6 +160,12 @@ variable "log_path" {
   default = "/opt/libra/data/libra.log"
 }
 
+variable "structlog_path" {
+  description = "Structured log path"
+  type    = string
+  default = "/opt/libra/data/libra_structlog.log"
+}
+
 variable "enable_logstash" {
   type        = bool
   description = "Enable logstash instance on validator to send logs to elasticservice, this will enable log_to_file"
@@ -201,4 +207,10 @@ variable "restore_vol_id" {
 variable "permissions_boundary_policy" {
   default     = ""
   description = "ARN of IAM policy to set as permissions boundary on created roles"
+}
+
+variable "override_image_tags" {
+  type        = list(string)
+  default     = []
+  description = "List of Docker image tags to be used in record and replay test, overrides image_tag"
 }

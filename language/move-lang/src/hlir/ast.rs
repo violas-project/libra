@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    naming::ast::{BuiltinTypeName, BuiltinTypeName_, TParam, TypeName, TypeName_},
+    expansion::ast::SpecId,
+    naming::ast::{BuiltinTypeName, BuiltinTypeName_, TParam},
     parser::ast::{
         BinOp, Field, FunctionName, FunctionVisibility, Kind, Kind_, ModuleIdent, ResourceLoc,
         StructName, UnaryOp, Value, Var,
@@ -10,7 +11,7 @@ use crate::{
     shared::{ast_debug::*, unique_map::UniqueMap, *},
 };
 use move_ir_types::location::*;
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 // High Level IR
 
@@ -88,10 +89,18 @@ pub struct Function {
 //**************************************************************************************************
 
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
+pub enum TypeName_ {
+    Builtin(BuiltinTypeName),
+    ModuleType(ModuleIdent, StructName),
+}
+pub type TypeName = Spanned<TypeName_>;
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone)]
 #[allow(clippy::large_enum_variant)]
 pub enum BaseType_ {
     Param(TParam),
     Apply(Kind, TypeName, Vec<BaseType>),
+    Unreachable,
     UnresolvedError,
 }
 pub type BaseType = Spanned<BaseType_>;
@@ -139,6 +148,13 @@ pub type Statement = Spanned<Statement_>;
 
 pub type Block = VecDeque<Statement>;
 
+pub type BasicBlocks = BTreeMap<Label, BasicBlock>;
+
+pub type BasicBlock = VecDeque<Command>;
+
+#[derive(Debug, PartialEq, Eq, Hash, Copy, Clone, PartialOrd, Ord)]
+pub struct Label(pub usize);
+
 //**************************************************************************************************
 // Commands
 //**************************************************************************************************
@@ -152,7 +168,16 @@ pub enum Command_ {
     Return(Exp),
     Break,
     Continue,
-    IgnoreAndPop { pop_num: usize, exp: Exp },
+    IgnoreAndPop {
+        pop_num: usize,
+        exp: Exp,
+    },
+    Jump(Label),
+    JumpIf {
+        cond: Exp,
+        if_true: Label,
+        if_false: Label,
+    },
 }
 pub type Command = Spanned<Command_>;
 
@@ -211,6 +236,8 @@ pub enum UnannotatedExp_ {
 
     Unreachable,
 
+    Spec(SpecId),
+
     UnresolvedError,
 }
 pub type UnannotatedExp = Spanned<UnannotatedExp_>;
@@ -233,12 +260,89 @@ pub enum ExpListItem {
 // impls
 //**************************************************************************************************
 
+impl FunctionSignature {
+    pub fn is_parameter(&self, v: &Var) -> bool {
+        self.parameters
+            .iter()
+            .any(|(parameter_name, _)| parameter_name == v)
+    }
+}
+
+impl Command_ {
+    pub fn is_terminal(&self) -> bool {
+        use Command_::*;
+        match self {
+            Break | Continue => panic!("ICE break/continue not translated to jumps"),
+            Assign(_, _) | Mutate(_, _) | IgnoreAndPop { .. } => false,
+            Abort(_) | Return(_) | Jump(_) | JumpIf { .. } => true,
+        }
+    }
+
+    pub fn is_exit(&self) -> bool {
+        use Command_::*;
+        match self {
+            Break | Continue => panic!("ICE break/continue not translated to jumps"),
+            Assign(_, _) | Mutate(_, _) | IgnoreAndPop { .. } | Jump(_) | JumpIf { .. } => false,
+            Abort(_) | Return(_) => true,
+        }
+    }
+
+    pub fn is_unit(&self) -> bool {
+        use Command_::*;
+        match self {
+            Break | Continue => panic!("ICE break/continue not translated to jumps"),
+            Assign(ls, e) => ls.is_empty() && e.is_unit(),
+            IgnoreAndPop { exp: e, .. } => e.is_unit(),
+
+            Mutate(_, _) | Return(_) | Abort(_) | JumpIf { .. } | Jump(_) => false,
+        }
+    }
+
+    pub fn successors(&self) -> BTreeSet<Label> {
+        use Command_::*;
+
+        let mut successors = BTreeSet::new();
+        match self {
+            Break | Continue => panic!("ICE break/continue not translated to jumps"),
+            Mutate(_, _) | Assign(_, _) | IgnoreAndPop { .. } => {
+                panic!("ICE Should not be last command in block")
+            }
+            Abort(_) | Return(_) => (),
+            Jump(lbl) => {
+                successors.insert(lbl.clone());
+            }
+            JumpIf {
+                if_true, if_false, ..
+            } => {
+                successors.insert(if_true.clone());
+                successors.insert(if_false.clone());
+            }
+        }
+        successors
+    }
+}
+
+impl Exp {
+    pub fn is_unit(&self) -> bool {
+        self.exp.value.is_unit()
+    }
+}
+
+impl UnannotatedExp_ {
+    pub fn is_unit(&self) -> bool {
+        match self {
+            UnannotatedExp_::Unit => true,
+            _ => false,
+        }
+    }
+}
+
 impl BaseType_ {
     pub fn builtin(loc: Loc, b_: BuiltinTypeName_, ty_args: Vec<BaseType>) -> BaseType {
         use BuiltinTypeName_::*;
 
         let kind = match b_ {
-            U8 | U64 | U128 | Bool | Address | Bytearray => sp(loc, Kind_::Unrestricted),
+            U8 | U64 | U128 | Bool | Address => sp(loc, Kind_::Unrestricted),
             Vector => {
                 assert!(
                     ty_args.len() == 1,
@@ -255,8 +359,8 @@ impl BaseType_ {
         match self {
             BaseType_::Apply(k, _, _) => k.clone(),
             BaseType_::Param(TParam { kind, .. }) => kind.clone(),
-            BaseType_::UnresolvedError => panic!(
-                "ICE unresolved error has no kind. \
+            BaseType_::Unreachable | BaseType_::UnresolvedError => panic!(
+                "ICE unreachable/unresolved error has no kind. \
                  Should only exist in dead code that should not be analyzed"
             ),
         }
@@ -290,6 +394,13 @@ impl SingleType_ {
 
     pub fn u64(loc: Loc) -> SingleType {
         Self::base(BaseType_::u64(loc))
+    }
+
+    pub fn kind(&self, loc: Loc) -> Kind {
+        match self {
+            SingleType_::Ref(_, _) => sp(loc, Kind_::Unrestricted),
+            SingleType_::Base(b) => b.value.kind(),
+        }
     }
 }
 
@@ -335,6 +446,26 @@ impl Type_ {
             _ => Type_::Multiple(ss),
         };
         sp(loc, t_)
+    }
+}
+
+//**************************************************************************************************
+// Display
+//**************************************************************************************************
+
+impl std::fmt::Display for TypeName_ {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        use TypeName_::*;
+        match self {
+            Builtin(b) => write!(f, "{}", b),
+            ModuleType(m, n) => write!(f, "{}::{}", m, n),
+        }
+    }
+}
+
+impl std::fmt::Display for Label {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -471,6 +602,15 @@ impl AstDebug for FunctionSignature {
     }
 }
 
+impl AstDebug for TypeName_ {
+    fn ast_debug(&self, w: &mut AstWriter) {
+        match self {
+            TypeName_::Builtin(bt) => bt.ast_debug(w),
+            TypeName_::ModuleType(m, s) => w.write(&format!("{}::{}", m, s)),
+        }
+    }
+}
+
 impl AstDebug for BaseType_ {
     fn ast_debug(&self, w: &mut AstWriter) {
         match self {
@@ -488,7 +628,8 @@ impl AstDebug for BaseType_ {
                     k,
                 );
             }
-            BaseType_::UnresolvedError => w.write("_|_"),
+            BaseType_::Unreachable => w.write("_|_"),
+            BaseType_::UnresolvedError => w.write("_"),
         }
     }
 }
@@ -624,6 +765,16 @@ impl AstDebug for Command_ {
                 w.write(" = ");
                 exp.ast_debug(w);
             }
+            C::Jump(lbl) => w.write(&format!("jump {}", lbl.0)),
+            C::JumpIf {
+                cond,
+                if_true,
+                if_false,
+            } => {
+                w.write("jump_if(");
+                cond.ast_debug(w);
+                w.write(&format!(") {} else {}", if_true.0, if_false.0));
+            }
         }
     }
 }
@@ -729,6 +880,7 @@ impl AstDebug for UnannotatedExp_ {
                 bt.ast_debug(w);
                 w.write(")");
             }
+            E::Spec(u) => w.write(&format!("spec({})", u)),
             E::UnresolvedError => w.write("_|_"),
             E::Unreachable => w.write("unreachable"),
         }

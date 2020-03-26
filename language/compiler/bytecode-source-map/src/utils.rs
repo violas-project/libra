@@ -1,10 +1,7 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{
-    mapping::SourceMapping,
-    source_map::{ModuleSourceMap, SourceMap},
-};
+use crate::{mapping::SourceMapping, source_map::SourceMap};
 use anyhow::{format_err, Result};
 use codespan::{FileId, Files, Span};
 use codespan_reporting::{
@@ -21,16 +18,6 @@ use std::{collections::HashMap, fs::File, path::Path};
 
 pub type Error = (Loc, String);
 pub type Errors = Vec<Error>;
-
-pub fn module_source_map_from_file<Location>(file_path: &Path) -> Result<ModuleSourceMap<Location>>
-where
-    Location: Clone + Eq + Default + DeserializeOwned,
-{
-    File::open(file_path)
-        .ok()
-        .and_then(|file| serde_json::from_reader(file).ok())
-        .ok_or_else(|| format_err!("Error while reading in source map information"))
-}
 
 pub fn source_map_from_file<Location>(file_path: &Path) -> Result<SourceMap<Location>>
 where
@@ -73,7 +60,7 @@ pub struct OwnedLoc {
     span: Span,
 }
 
-pub fn remap_owned_loc_to_loc(m: ModuleSourceMap<OwnedLoc>) -> ModuleSourceMap<Loc> {
+pub fn remap_owned_loc_to_loc(m: SourceMap<OwnedLoc>) -> SourceMap<Loc> {
     let mut table: HashMap<String, &'static str> = HashMap::new();
     let mut f = |owned| {
         let OwnedLoc { file, span } = owned;

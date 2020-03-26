@@ -4,19 +4,19 @@
 use crate::{
     data::{
         LibraP2PTransferTransactionArgument, LibraRawTransaction, LibraSignedTransaction,
-        LibraStatus, LibraTransactionPayload, TransactionType,
+        LibraStatus, LibraTransactionPayload, TransactionType, LIBRA_PUBKEY_SIZE,
+        LIBRA_SIGNATURE_SIZE,
     },
     error::*,
 };
 use lcs::to_bytes;
 use libra_crypto::{ed25519::*, test_utils::KeyPair};
 use libra_types::{
-    account_address::{
-        AccountAddress, AuthenticationKey, ADDRESS_LENGTH, AUTHENTICATION_KEY_LENGTH,
-    },
+    account_address::AccountAddress,
+    account_config::lbr_type_tag,
     transaction::{
-        helpers::TransactionSigner, RawTransaction, SignedTransaction, TransactionArgument,
-        TransactionPayload,
+        authenticator::AuthenticationKey, helpers::TransactionSigner, RawTransaction,
+        SignedTransaction, TransactionArgument, TransactionPayload,
     },
 };
 use std::{convert::TryFrom, slice, time::Duration};
@@ -57,7 +57,7 @@ pub unsafe extern "C" fn libra_SignedTransactionBytes_from(
         update_last_error("receiver parameter must not be null.".to_string());
         return LibraStatus::InvalidArgument;
     }
-    let receiver_buf = slice::from_raw_parts(receiver, AUTHENTICATION_KEY_LENGTH);
+    let receiver_buf = slice::from_raw_parts(receiver, AuthenticationKey::LENGTH);
     let receiver_auth_key = match AuthenticationKey::try_from(receiver_buf) {
         Ok(result) => result,
         Err(e) => {
@@ -83,6 +83,7 @@ pub unsafe extern "C" fn libra_SignedTransactionBytes_from(
         payload,
         max_gas_amount,
         gas_unit_price,
+        lbr_type_tag(),
         expiration_time,
     );
 
@@ -139,7 +140,7 @@ pub unsafe extern "C" fn libra_RawTransactionBytes_from(
         update_last_error("sender parameter must not be null.".to_string());
         return LibraStatus::InvalidArgument;
     }
-    let sender_buf = slice::from_raw_parts(sender, ADDRESS_LENGTH);
+    let sender_buf = slice::from_raw_parts(sender, AccountAddress::LENGTH);
     let sender_address = match AccountAddress::try_from(sender_buf) {
         Ok(result) => result,
         Err(e) => {
@@ -152,7 +153,7 @@ pub unsafe extern "C" fn libra_RawTransactionBytes_from(
         update_last_error("receiver parameter must not be null.".to_string());
         return LibraStatus::InvalidArgument;
     }
-    let receiver_buf = slice::from_raw_parts(receiver, AUTHENTICATION_KEY_LENGTH);
+    let receiver_buf = slice::from_raw_parts(receiver, AuthenticationKey::LENGTH);
     let receiver_auth_key = match AuthenticationKey::try_from(receiver_buf) {
         Ok(result) => result,
         Err(e) => {
@@ -178,6 +179,7 @@ pub unsafe extern "C" fn libra_RawTransactionBytes_from(
         payload,
         max_gas_amount,
         gas_unit_price,
+        lbr_type_tag(),
         expiration_time,
     );
 
@@ -296,75 +298,53 @@ pub unsafe extern "C" fn libra_LibraSignedTransaction_from(
         }
     };
 
-    let mut sender = [0u8; ADDRESS_LENGTH];
-    sender.copy_from_slice(signed_txn.sender().as_ref());
+    let sender = signed_txn.sender().into();
     let sequence_number = signed_txn.sequence_number();
     let payload = signed_txn.payload();
     let max_gas_amount = signed_txn.max_gas_amount();
     let gas_unit_price = signed_txn.gas_unit_price();
     let expiration_time_secs = signed_txn.expiration_time().as_secs();
-    let public_key = signed_txn.public_key();
-    let signature = signed_txn.signature();
+    // TODO: this will not work with multisig transactions, where both the pubkey and signature
+    // have different sizes than the ones expected here. We will either need LibraSignedTransaction
+    // types for single and multisig authenticators or adapt the type to work  with both
+    // authenticators
+    let public_key_bytes = signed_txn.authenticator().public_key_bytes();
+    let signature_bytes = signed_txn.authenticator().signature_bytes();
+    let mut public_key = [0; LIBRA_PUBKEY_SIZE as usize];
+    let mut signature = [0; LIBRA_SIGNATURE_SIZE as usize];
+
+    let public_key_bytes = &public_key_bytes[..public_key.len()];
+    public_key.copy_from_slice(public_key_bytes);
+    let signature_bytes = &signature_bytes[..signature.len()];
+    signature.copy_from_slice(signature_bytes);
 
     let mut txn_payload = None;
 
     if let TransactionPayload::Script(script) = payload {
         match get_transaction_name(script.code()).as_str() {
-            "peer_to_peer_transaction" => {
+            "peer_to_peer_transaction" | "mint_transaction" => {
                 let args = script.args();
-                let mut value = None;
-                let mut address = None;
-                args.iter().for_each(|txn_arg| match txn_arg {
-                    TransactionArgument::U64(val) => {
-                        value = Some(*val);
-                    }
-                    TransactionArgument::Address(addr) => {
-                        let mut addr_buffer = [0u8; ADDRESS_LENGTH];
-                        addr_buffer.copy_from_slice(addr.as_ref());
-                        address = Some(addr_buffer);
-                    }
-                    _ => {}
-                });
-                if let (Some(val), Some(add)) = (value, address) {
+                if let [TransactionArgument::Address(addr), TransactionArgument::U8Vector(auth_key_prefix), TransactionArgument::U64(amount)] =
+                    &args[..]
+                {
+                    let mut auth_key_prefix_buffer =
+                        [0u8; AuthenticationKey::LENGTH - AccountAddress::LENGTH];
+                    auth_key_prefix_buffer.copy_from_slice(auth_key_prefix.as_slice());
+
                     txn_payload = Some(LibraTransactionPayload {
                         txn_type: TransactionType::PeerToPeer,
                         args: LibraP2PTransferTransactionArgument {
-                            value: val,
-                            address: add,
+                            value: *amount,
+                            address: addr.into(),
+                            auth_key_prefix: auth_key_prefix_buffer,
                         },
                     });
                 } else {
+                    update_last_error("Fail to decode transaction payload".to_string());
                     return LibraStatus::InternalError;
                 }
             }
-            "mint_transaction" => {
-                let args = script.args();
-                let mut value = None;
-                let mut address = None;
-                args.iter().for_each(|txn_arg| match txn_arg {
-                    TransactionArgument::U64(val) => {
-                        value = Some(*val);
-                    }
-                    TransactionArgument::Address(addr) => {
-                        let mut addr_buffer = [0u8; ADDRESS_LENGTH];
-                        addr_buffer.copy_from_slice(addr.as_ref());
-                        address = Some(addr_buffer);
-                    }
-                    _ => {}
-                });
-                if let (Some(val), Some(add)) = (value, address) {
-                    txn_payload = Some(LibraTransactionPayload {
-                        txn_type: TransactionType::Mint,
-                        args: LibraP2PTransferTransactionArgument {
-                            value: val,
-                            address: add,
-                        },
-                    });
-                } else {
-                    return LibraStatus::InternalError;
-                }
-            }
-            &_ => {
+            _ => {
                 update_last_error("Transaction type not supported".to_string());
                 return LibraStatus::InternalError;
             }
@@ -394,8 +374,8 @@ pub unsafe extern "C" fn libra_LibraSignedTransaction_from(
             };
             *out = LibraSignedTransaction {
                 raw_txn: raw_txn_other,
-                public_key: public_key.to_bytes(),
-                signature: signature.to_bytes(),
+                public_key,
+                signature,
             };
             return LibraStatus::Ok;
         }
@@ -403,8 +383,8 @@ pub unsafe extern "C" fn libra_LibraSignedTransaction_from(
 
     *out = LibraSignedTransaction {
         raw_txn,
-        public_key: public_key.to_bytes(),
-        signature: signature.to_bytes(),
+        public_key,
+        signature,
     };
 
     LibraStatus::Ok
@@ -466,7 +446,10 @@ fn test_lcs_signed_transaction() {
     assert_eq!(deserialized_signed_txn.sender(), sender_address);
     assert_eq!(deserialized_signed_txn.sequence_number(), 0);
     assert_eq!(deserialized_signed_txn.gas_unit_price(), gas_unit_price);
-    assert_eq!(deserialized_signed_txn.public_key(), public_key);
+    assert_eq!(
+        deserialized_signed_txn.authenticator().public_key_bytes(),
+        public_key.to_bytes()
+    );
     assert!(deserialized_signed_txn.check_signature().is_ok());
 
     // Test signature is stable
@@ -580,7 +563,10 @@ fn test_libra_raw_transaction_bytes_from() {
     assert_eq!(deserialized_signed_txn.sender(), sender_address);
     assert_eq!(deserialized_signed_txn.sequence_number(), 0);
     assert_eq!(deserialized_signed_txn.gas_unit_price(), gas_unit_price);
-    assert_eq!(deserialized_signed_txn.public_key(), public_key);
+    assert_eq!(
+        deserialized_signed_txn.authenticator().public_key_bytes(),
+        public_key.to_bytes()
+    );
     assert!(deserialized_signed_txn.check_signature().is_ok());
 
     // free memory
@@ -618,6 +604,7 @@ fn test_libra_signed_transaction_deserialize() {
             program,
             max_gas_amount,
             gas_unit_price,
+            lbr_type_tag(),
             Duration::from_secs(expiration_time_secs),
         ),
         public_key.clone(),

@@ -1,9 +1,11 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{counters::*, system_module_names::*, VMExecutor, VMVerifier};
+use crate::{
+    counters::*, on_chain_configs::VMConfig as OnlineConfig, system_module_names::*, VMExecutor,
+    VMVerifier,
+};
 use debug_interface::prelude::*;
-use libra_config::config::{VMConfig, VMPublishingOption};
 use libra_crypto::HashValue;
 use libra_logger::prelude::*;
 use libra_state_view::StateView;
@@ -39,16 +41,17 @@ use vm::{
 pub struct LibraVM {
     move_vm: Arc<MoveVM>,
     gas_schedule: Option<CostTable>,
-    config: VMConfig,
+    on_chain_config: Option<OnlineConfig>,
 }
 
 impl LibraVM {
-    pub fn new(config: &VMConfig) -> Self {
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
         let inner = MoveVM::new();
         Self {
             move_vm: Arc::new(inner),
             gas_schedule: None,
-            config: config.clone(),
+            on_chain_config: None,
         }
     }
 
@@ -61,22 +64,29 @@ impl LibraVM {
         self.load_configs_impl(&RemoteStorage::new(state))
     }
 
+    fn on_chain_config(&self) -> VMResult<&OnlineConfig> {
+        self.on_chain_config
+            .as_ref()
+            .ok_or_else(|| VMStatus::new(StatusCode::VM_STARTUP_FAILURE))
+    }
+
     fn load_configs_impl(&mut self, data_cache: &dyn RemoteCache) {
         self.gas_schedule = self.fetch_gas_schedule(data_cache).ok();
+        self.on_chain_config = OnlineConfig::load_on_chain_config(data_cache);
     }
 
     fn fetch_gas_schedule(&mut self, data_cache: &dyn RemoteCache) -> VMResult<CostTable> {
         let address = account_config::association_address();
         let mut ctx = SystemExecutionContext::new(data_cache, GasUnits::new(0));
-        let gas_struct_tag = self
+        let gas_struct_ty = self
             .move_vm
-            .resolve_struct_tag_by_name(&GAS_SCHEDULE_MODULE, &GAS_SCHEDULE_NAME, &mut ctx)
+            .resolve_struct_def_by_name(&GAS_SCHEDULE_MODULE, &GAS_SCHEDULE_NAME, &mut ctx, &[])
             .map_err(|_| {
                 VMStatus::new(StatusCode::GAS_SCHEDULE_ERROR)
                     .with_sub_status(sub_status::GSE_UNABLE_TO_LOAD_MODULE)
             })?;
 
-        let access_path = create_access_path(&address, gas_struct_tag);
+        let access_path = create_access_path(address, gas_struct_ty.into_struct_tag()?);
 
         let data_blob = data_cache
             .get(&access_path)
@@ -114,7 +124,11 @@ impl LibraVM {
                 self.check_change_set(change_set, state_view)
             }
             TransactionPayload::Script(script) => {
-                if !is_allowed_script(&self.config.publishing_options, &script.code()) {
+                if !self
+                    .on_chain_config()?
+                    .publishing_options
+                    .is_allowed_script(&script.code())
+                {
                     warn!("[VM] Custom scripts not allowed: {:?}", &script.code());
                     Err(VMStatus::new(StatusCode::UNKNOWN_SCRIPT))
                 } else {
@@ -122,7 +136,7 @@ impl LibraVM {
                 }
             }
             TransactionPayload::Module(_module) => {
-                if !&self.config.publishing_options.is_open() {
+                if !&self.on_chain_config()?.publishing_options.is_open() {
                     warn!("[VM] Custom modules not allowed");
                     Err(VMStatus::new(StatusCode::UNKNOWN_MODULE))
                 } else {
@@ -421,11 +435,11 @@ impl LibraVM {
         //       time by a reasonable amount.
         let gas_schedule = CostTable::zero();
 
-        if let Ok((id, timestamp, previous_vote, proposer)) = block_metadata.into_inner() {
+        if let Ok((round, timestamp, previous_vote, proposer)) = block_metadata.into_inner() {
             let args = vec![
+                Value::u64(round),
                 Value::u64(timestamp),
-                Value::vector_u8(id),
-                Value::vector_u8(previous_vote),
+                Value::vector_address(previous_vote),
                 Value::address(proposer),
             ];
             self.move_vm.execute_function(
@@ -458,7 +472,7 @@ impl LibraVM {
         txn_data: &TransactionMetadata,
     ) -> VMResult<()> {
         let txn_sequence_number = txn_data.sequence_number();
-        let txn_public_key = txn_data.public_key().to_bytes().to_vec();
+        let txn_public_key = txn_data.authentication_key_preimage().to_vec();
         let txn_gas_price = txn_data.gas_unit_price().get();
         let txn_max_gas_units = txn_data.max_gas_amount().get();
         let txn_expiration_time = txn_data.expiration_time();
@@ -521,7 +535,6 @@ impl LibraVM {
         let mut result = vec![];
         let blocks = chunk_block_transactions(transactions);
         let mut data_cache = BlockDataCache::new(state_view);
-        self.load_configs_impl(&data_cache);
         let mut execute_block_trace_guard = vec![];
         let mut current_block_id = HashValue::zero();
         for block in blocks {
@@ -559,6 +572,7 @@ impl LibraVM {
         data_cache: &mut BlockDataCache<'_>,
         state_view: &dyn StateView,
     ) -> VMResult<Vec<TransactionOutput>> {
+        self.load_configs_impl(data_cache);
         let signature_verified_block: Vec<Result<SignatureCheckedTransaction, VMStatus>>;
         {
             trace_code_block!("libra_vm::verify_signatures", {"block", block_id});
@@ -651,10 +665,9 @@ impl VMExecutor for LibraVM {
     /// transaction output.
     fn execute_block(
         transactions: Vec<Transaction>,
-        config: &VMConfig,
         state_view: &dyn StateView,
     ) -> VMResult<Vec<TransactionOutput>> {
-        let mut vm = LibraVM::new(config);
+        let mut vm = LibraVM::new();
         vm.execute_block_impl(transactions, state_view)
     }
 }
@@ -672,11 +685,6 @@ impl<'a> LibraVMInternals<'a> {
     /// Returns the internal gas schedule if it has been loaded, or an error if it hasn't.
     pub fn gas_schedule(self) -> VMResult<&'a CostTable> {
         self.0.get_gas_schedule()
-    }
-
-    /// Returns the configuration.
-    pub fn config(self) -> &'a VMConfig {
-        &self.0.config
     }
 
     /// Executes the given code within the context of a transaction.
@@ -746,16 +754,6 @@ pub fn chunk_block_transactions(txns: Vec<Transaction>) -> Vec<TransactionBlock>
 enum VerifiedTranscationPayload {
     Script(Vec<u8>, Vec<TransactionArgument>),
     Module(Vec<u8>),
-}
-
-pub fn is_allowed_script(publishing_option: &VMPublishingOption, program: &[u8]) -> bool {
-    match publishing_option {
-        VMPublishingOption::Open | VMPublishingOption::CustomScripts => true,
-        VMPublishingOption::Locked(whitelist) => {
-            let hash_value = HashValue::from_sha3_256(program);
-            whitelist.contains(hash_value.as_ref())
-        }
-    }
 }
 
 /// Convert the transaction arguments into move values.

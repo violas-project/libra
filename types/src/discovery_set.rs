@@ -30,8 +30,8 @@ pub fn discovery_set_struct_name() -> &'static IdentStr {
 
 pub fn discovery_set_tag() -> StructTag {
     StructTag {
-        name: discovery_set_struct_name().to_owned(),
         address: account_config::CORE_CODE_ADDRESS,
+        name: discovery_set_struct_name().to_owned(),
         module: discovery_set_module_name().to_owned(),
         type_params: vec![],
     }
@@ -56,10 +56,10 @@ pub static GLOBAL_DISCOVERY_SET_CHANGE_EVENT_PATH: Lazy<AccessPath> = Lazy::new(
     )
 });
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 pub struct DiscoverySetResource {
     /// The current discovery set. Updated only at epoch boundaries via reconfiguration.
-    discovery_set: Vec<DiscoveryInfo>,
+    discovery_set: DiscoverySet,
     /// Handle where discovery set change events are emitted
     change_events: EventHandle,
 }
@@ -67,6 +67,10 @@ pub struct DiscoverySetResource {
 impl DiscoverySetResource {
     pub fn change_events(&self) -> &EventHandle {
         &self.change_events
+    }
+
+    pub fn discovery_set(&self) -> &DiscoverySet {
+        &self.discovery_set
     }
 }
 
@@ -102,38 +106,5 @@ impl IntoIterator for DiscoverySet {
 
     fn into_iter(self) -> Self::IntoIter {
         self.0.into_iter()
-    }
-}
-
-#[cfg(any(test, feature = "fuzzing"))]
-pub mod mock {
-    use super::*;
-
-    use crate::crypto_proxies::ValidatorSet;
-    use libra_crypto::x25519::X25519StaticPrivateKey;
-    use parity_multiaddr::Multiaddr;
-    use std::str::FromStr;
-
-    pub fn mock_discovery_set(validator_set: &ValidatorSet) -> DiscoverySet {
-        let salt = None;
-        let seed = [69u8; 32];
-        let app_info = None;
-        let (_, mock_pubkey) =
-            X25519StaticPrivateKey::derive_keypair_from_seed(salt, &seed, app_info);
-        let mock_addr = Multiaddr::from_str("/ip4/127.0.0.1/tcp/1234").unwrap();
-
-        let discovery_set = validator_set
-            .iter()
-            .map(|validator_pubkeys| DiscoveryInfo {
-                account_address: *validator_pubkeys.account_address(),
-                validator_network_identity_pubkey: validator_pubkeys
-                    .network_identity_public_key()
-                    .clone(),
-                validator_network_address: mock_addr.clone(),
-                fullnodes_network_identity_pubkey: mock_pubkey.clone(),
-                fullnodes_network_address: mock_addr.clone(),
-            })
-            .collect::<Vec<_>>();
-        DiscoverySet::new(discovery_set)
     }
 }

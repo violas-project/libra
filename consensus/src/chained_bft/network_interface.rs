@@ -14,10 +14,7 @@ use consensus_types::{
     vote_msg::VoteMsg,
 };
 use futures::sink::SinkExt;
-use libra_types::{
-    crypto_proxies::{ValidatorChangeProof, ValidatorPublicKeys},
-    PeerId,
-};
+use libra_types::{validator_change::ValidatorChangeProof, validator_info::ValidatorInfo, PeerId};
 use network::{
     common::NetworkPublicKeys,
     connectivity_manager::ConnectivityRequest,
@@ -158,7 +155,7 @@ impl<T: Payload> ConsensusNetworkSender<T> {
     /// the unified reconfiguration event.
     pub async fn update_eligible_nodes(
         &mut self,
-        validators: Vec<ValidatorPublicKeys>,
+        validators: Vec<ValidatorInfo>,
     ) -> Result<(), NetworkError> {
         self.conn_mgr_reqs_tx
             .send(ConnectivityRequest::UpdateEligibleNodes(

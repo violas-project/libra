@@ -4,7 +4,7 @@
 use anyhow::{format_err, Result};
 use libra_types::account_address::AccountAddress;
 use move_core_types::identifier::Identifier;
-use move_ir_types::ast::{ModuleName, QualifiedModuleIdent};
+use move_ir_types::ast::{ModuleName, NopLabel, QualifiedModuleIdent};
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, ops::Bound};
 use vm::{
@@ -21,7 +21,6 @@ use vm::{
 // Source location mapping
 //***************************************************************************
 
-pub type SourceMap<Location> = Vec<ModuleSourceMap<Location>>;
 pub type SourceName<Location> = (String, Location);
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -51,13 +50,17 @@ pub struct FunctionSourceMap<Location: Clone + Eq> {
     /// is the name and location of the local.
     pub locals: Vec<SourceName<Location>>,
 
+    /// A map to the code offset for a corresponding nop. Nop's are used as markers for some
+    /// high level language information
+    pub nops: BTreeMap<NopLabel, CodeOffset>,
+
     /// The source location map for the function body.
     pub code_map: BTreeMap<CodeOffset, Location>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
-pub struct ModuleSourceMap<Location: Clone + Eq> {
-    /// The name <address.module_name> for module that this source map is for
+pub struct SourceMap<Location: Clone + Eq> {
+    /// The name <address.module_name> for module/script that this source map is for
     pub module_name: (AccountAddress, Identifier),
 
     // A mapping of StructDefinitionIndex to source map for each struct/resource
@@ -75,9 +78,9 @@ pub fn remap_locations_source_name<Location: Clone + Eq, Other: Clone + Eq>(
 }
 
 pub fn remap_locations_source_map<Location: Clone + Eq, Other: Clone + Eq>(
-    map: SourceMap<Location>,
+    map: Vec<SourceMap<Location>>,
     f: &mut impl FnMut(Location) -> Other,
-) -> SourceMap<Other> {
+) -> Vec<SourceMap<Other>> {
     map.into_iter().map(|m| m.remap_locations(f)).collect()
 }
 
@@ -160,6 +163,7 @@ impl<Location: Clone + Eq> FunctionSourceMap<Location> {
             type_parameters: Vec::new(),
             locals: Vec::new(),
             code_map: BTreeMap::new(),
+            nops: BTreeMap::new(),
         }
     }
 
@@ -191,7 +195,12 @@ impl<Location: Clone + Eq> FunctionSourceMap<Location> {
         };
     }
 
-    // Not that it is important that locations be added in order.
+    /// Record the code offset for an Nop label
+    pub fn add_nop_mapping(&mut self, label: NopLabel, offset: CodeOffset) {
+        assert!(self.nops.insert(label, offset).is_none())
+    }
+
+    // Note that it is important that locations be added in order.
     pub fn add_local_mapping(&mut self, name: SourceName<Location>) {
         self.locals.push(name);
     }
@@ -250,6 +259,7 @@ impl<Location: Clone + Eq> FunctionSourceMap<Location> {
             type_parameters,
             locals,
             code_map,
+            nops,
         } = self;
         let decl_location = f(decl_location);
         let type_parameters = type_parameters
@@ -266,11 +276,12 @@ impl<Location: Clone + Eq> FunctionSourceMap<Location> {
             type_parameters,
             locals,
             code_map,
+            nops,
         }
     }
 }
 
-impl<Location: Clone + Eq> ModuleSourceMap<Location> {
+impl<Location: Clone + Eq> SourceMap<Location> {
     pub fn new(module_name: QualifiedModuleIdent) -> Self {
         let ident = Identifier::new(module_name.name.into_inner()).unwrap();
         Self {
@@ -326,6 +337,20 @@ impl<Location: Clone + Eq> ModuleSourceMap<Location> {
             .get_mut(&fdef_idx.0)
             .ok_or_else(|| format_err!("Tried to add code mapping to undefined function index"))?;
         func_entry.add_code_mapping(start_offset, location);
+        Ok(())
+    }
+
+    pub fn add_nop_mapping(
+        &mut self,
+        fdef_idx: FunctionDefinitionIndex,
+        label: NopLabel,
+        start_offset: CodeOffset,
+    ) -> Result<()> {
+        let func_entry = self
+            .function_map
+            .get_mut(&fdef_idx.0)
+            .ok_or_else(|| format_err!("Tried to add nop mapping to undefined function index"))?;
+        func_entry.add_nop_mapping(label, start_offset);
         Ok(())
     }
 
@@ -486,8 +511,8 @@ impl<Location: Clone + Eq> ModuleSourceMap<Location> {
     pub fn remap_locations<Other: Clone + Eq>(
         self,
         f: &mut impl FnMut(Location) -> Other,
-    ) -> ModuleSourceMap<Other> {
-        let ModuleSourceMap {
+    ) -> SourceMap<Other> {
+        let SourceMap {
             module_name,
             struct_map,
             function_map,
@@ -500,7 +525,7 @@ impl<Location: Clone + Eq> ModuleSourceMap<Location> {
             .into_iter()
             .map(|(n, m)| (n, m.remap_locations(f)))
             .collect();
-        ModuleSourceMap {
+        SourceMap {
             module_name,
             struct_map,
             function_map,

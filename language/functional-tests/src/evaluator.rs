@@ -10,14 +10,15 @@ use bytecode_verifier::verifier::{
     verify_module_dependencies, verify_script_dependencies, VerifiedModule, VerifiedScript,
 };
 use language_e2e_tests::executor::FakeExecutor;
-use libra_config::config::VMPublishingOption;
 use libra_crypto::ed25519::{Ed25519PrivateKey, Ed25519PublicKey};
 use libra_state_view::StateView;
 use libra_types::{
     access_path::AccessPath,
     account_address::AccountAddress,
+    account_config::lbr_type_tag,
     block_metadata::BlockMetadata,
     language_storage::ModuleId,
+    on_chain_config::VMPublishingOption,
     transaction::{
         Module as TransactionModule, RawTransaction, Script as TransactionScript,
         SignedTransaction, Transaction as LibraTransaction, TransactionOutput, TransactionStatus,
@@ -116,10 +117,7 @@ pub enum EvaluationOutput {
 
 impl EvaluationOutput {
     pub fn is_error(&self) -> bool {
-        match self {
-            Self::Error(_) => true,
-            _ => false,
-        }
+        matches!(self, Self::Error(_))
     }
 }
 
@@ -312,6 +310,7 @@ fn make_script_transaction(
         script,
         params.max_gas_amount,
         params.gas_unit_price,
+        lbr_type_tag(),
         params.expiration_time,
     )
     .sign(params.privkey, params.pubkey.clone())?
@@ -335,6 +334,7 @@ fn make_module_transaction(
         module,
         params.max_gas_amount,
         params.gas_unit_price,
+        lbr_type_tag(),
         params.expiration_time,
     )
     .sign(params.privkey, params.pubkey.clone())?

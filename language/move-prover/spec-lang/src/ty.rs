@@ -31,6 +31,7 @@ pub enum Type {
 }
 
 pub const BOOL_TYPE: Type = Type::Primitive(PrimitiveType::Bool);
+pub const NUM_TYPE: Type = Type::Primitive(PrimitiveType::Num);
 
 /// Represents a primitive (builtin) type.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
@@ -39,7 +40,6 @@ pub enum PrimitiveType {
     U8,
     U64,
     U128,
-    ByteArray,
     Address,
 
     // Types only appearing in specifications
@@ -73,10 +73,7 @@ impl Type {
 
     /// Determines whether this is a reference.
     pub fn is_reference(&self) -> bool {
-        match self {
-            Type::Reference(_, _) => true,
-            _ => false,
-        }
+        matches!(self, Type::Reference(_, _))
     }
 
     /// Determines whether this is a mutual reference.
@@ -457,7 +454,6 @@ impl fmt::Display for PrimitiveType {
             U8 => f.write_str("u8"),
             U64 => f.write_str("u64"),
             U128 => f.write_str("u128"),
-            ByteArray => f.write_str("bytearray"),
             Address => f.write_str("address"),
             Range => f.write_str("range"),
             Num => f.write_str("num"),

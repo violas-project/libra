@@ -6,28 +6,47 @@ use crate::{
     Value,
 };
 
+const VAULT_HOST: &str = "http://localhost:8200";
+const VAULT_ROOT_TOKEN: &str = "root_token";
+
 /// A test for verifying VaultStorage properly implements the LibraSecureStorage API. This test
 /// depends on running Vault, which can be done by using the provided docker run script in
 /// `docker/vault/run.sh`
+// There can only be one vault test as reset called on one instance can break another test
 #[test]
 #[ignore]
 fn execute_storage_tests_vault() {
-    let mut storage = Box::new(setup_vault());
-    suite::execute_all_storage_tests(storage.as_mut());
+    let mut storage = VaultStorage::new(VAULT_HOST.into(), VAULT_ROOT_TOKEN.into(), None);
+    storage.reset_and_clear().unwrap();
+
+    test_vault(&mut storage);
+    suite::execute_all_storage_tests(&mut storage);
+
+    let mut storage0 = VaultStorage::new(
+        VAULT_HOST.into(),
+        VAULT_ROOT_TOKEN.into(),
+        Some("test0".into()),
+    );
+    let mut storage1 = VaultStorage::new(
+        VAULT_HOST.into(),
+        VAULT_ROOT_TOKEN.into(),
+        Some("test1".into()),
+    );
+
+    test_vault(&mut storage0);
+    test_vault(&mut storage1);
+    suite::execute_all_storage_tests(&mut storage0);
+    suite::execute_all_storage_tests(&mut storage1);
+    storage.reset_and_clear().unwrap();
 }
 
 /// Creates and returns a new VaultStorage instance for testing purposes.
-// TODO(joshlind): refactor this method to make it cleaner and easier to reason about.
-pub fn setup_vault() -> VaultStorage {
-    let host = "http://localhost:8200".to_string();
-    let token = "root_token".to_string();
-    let mut storage = VaultStorage::new(host.clone(), token);
-    storage.reset_and_clear().unwrap();
-
-    // @TODO davidiw, the following needs to be made generic but right now the creation of a token
-    // / service is very backend specific.
-    let reader: String = "reader".to_string();
-    let writer: String = "writer".to_string();
+pub fn test_vault(storage: &mut VaultStorage) {
+    // TODO(davidiw,joshlind): evaluate other systems and determine if create_token can be on the
+    // Storage / KV interface. And then refactor this method to make it cleaner and easier to reason
+    // about.
+    let reader: String = "reader".into();
+    let writer: String = "writer".into();
 
     let anyone = Policy::public();
     let root = Policy::new(vec![]);
@@ -58,24 +77,24 @@ pub fn setup_vault() -> VaultStorage {
 
     // Verify initial reading works correctly
 
-    assert_eq!(storage.get("anyone"), Ok(Value::U64(1)));
-    assert_eq!(storage.get("root"), Ok(Value::U64(2)));
-    assert_eq!(storage.get("partial"), Ok(Value::U64(3)));
-    assert_eq!(storage.get("full"), Ok(Value::U64(4)));
+    assert_eq!(storage.get("anyone").unwrap().value, Value::U64(1));
+    assert_eq!(storage.get("root").unwrap().value, Value::U64(2));
+    assert_eq!(storage.get("partial").unwrap().value, Value::U64(3));
+    assert_eq!(storage.get("full").unwrap().value, Value::U64(4));
 
-    let writer_token = storage.client.create_token(vec![&writer]).unwrap();
-    let mut writer = VaultStorage::new(host.clone(), writer_token);
-    assert_eq!(writer.get("anyone"), Ok(Value::U64(1)));
+    let writer_token = storage.create_token(vec![&writer]).unwrap();
+    let mut writer = VaultStorage::new(VAULT_HOST.into(), writer_token, storage.namespace());
+    assert_eq!(writer.get("anyone").unwrap().value, Value::U64(1));
     assert_eq!(writer.get("root"), Err(Error::PermissionDenied));
-    assert_eq!(writer.get("partial"), Ok(Value::U64(3)));
-    assert_eq!(writer.get("full"), Ok(Value::U64(4)));
+    assert_eq!(writer.get("partial").unwrap().value, Value::U64(3));
+    assert_eq!(writer.get("full").unwrap().value, Value::U64(4));
 
-    let reader_token = storage.client.create_token(vec![&reader]).unwrap();
-    let mut reader = VaultStorage::new(host, reader_token);
-    assert_eq!(reader.get("anyone"), Ok(Value::U64(1)));
+    let reader_token = storage.create_token(vec![&reader]).unwrap();
+    let mut reader = VaultStorage::new(VAULT_HOST.into(), reader_token, storage.namespace());
+    assert_eq!(reader.get("anyone").unwrap().value, Value::U64(1));
     assert_eq!(reader.get("root"), Err(Error::PermissionDenied));
-    assert_eq!(reader.get("partial"), Ok(Value::U64(3)));
-    assert_eq!(reader.get("full"), Ok(Value::U64(4)));
+    assert_eq!(reader.get("partial").unwrap().value, Value::U64(3));
+    assert_eq!(reader.get("full").unwrap().value, Value::U64(4));
 
     // Attempt writes followed by reads for correctness
 
@@ -87,10 +106,10 @@ pub fn setup_vault() -> VaultStorage {
     writer.set("partial", Value::U64(7)).unwrap();
     writer.set("full", Value::U64(8)).unwrap();
 
-    assert_eq!(storage.get("anyone"), Ok(Value::U64(5)));
-    assert_eq!(storage.get("root"), Ok(Value::U64(2)));
-    assert_eq!(storage.get("partial"), Ok(Value::U64(7)));
-    assert_eq!(storage.get("full"), Ok(Value::U64(8)));
+    assert_eq!(storage.get("anyone").unwrap().value, Value::U64(5));
+    assert_eq!(storage.get("root").unwrap().value, Value::U64(2));
+    assert_eq!(storage.get("partial").unwrap().value, Value::U64(7));
+    assert_eq!(storage.get("full").unwrap().value, Value::U64(8));
 
     reader.set("anyone", Value::U64(9)).unwrap();
     assert_eq!(
@@ -103,11 +122,8 @@ pub fn setup_vault() -> VaultStorage {
     );
     reader.set("full", Value::U64(12)).unwrap();
 
-    assert_eq!(storage.get("anyone"), Ok(Value::U64(9)));
-    assert_eq!(storage.get("root"), Ok(Value::U64(2)));
-    assert_eq!(storage.get("partial"), Ok(Value::U64(7)));
-    assert_eq!(storage.get("full"), Ok(Value::U64(12)));
-
-    storage.reset_and_clear().unwrap();
-    storage
+    assert_eq!(storage.get("anyone").unwrap().value, Value::U64(9));
+    assert_eq!(storage.get("root").unwrap().value, Value::U64(2));
+    assert_eq!(storage.get("partial").unwrap().value, Value::U64(7));
+    assert_eq!(storage.get("full").unwrap().value, Value::U64(12));
 }

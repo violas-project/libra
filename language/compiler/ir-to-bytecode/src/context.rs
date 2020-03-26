@@ -2,8 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use anyhow::{bail, format_err, Result};
-use bytecode_source_map::source_map::ModuleSourceMap;
-use libra_types::{account_address::AccountAddress, byte_array::ByteArray};
+use bytecode_source_map::source_map::SourceMap;
+use libra_types::account_address::AccountAddress;
 use move_core_types::identifier::{IdentStr, Identifier};
 use move_ir_types::{ast::*, location::*};
 use std::{clone::Clone, collections::HashMap, hash::Hash};
@@ -17,8 +17,6 @@ use vm::{
         StructHandleIndex, TableIndex, TypeSignature, TypeSignatureIndex,
     },
 };
-
-type TypeFormalMap = HashMap<TypeVar_, TableIndex>;
 
 macro_rules! get_or_add_item_macro {
     ($m:ident, $k_get:expr, $k_insert:expr) => {{
@@ -37,7 +35,7 @@ macro_rules! get_or_add_item_macro {
     }};
 }
 
-const TABLE_MAX_SIZE: usize = u16::max_value() as usize;
+pub const TABLE_MAX_SIZE: usize = u16::max_value() as usize;
 fn get_or_add_item_ref<K: Clone + Eq + Hash>(
     m: &mut HashMap<K, TableIndex>,
     k: &K,
@@ -155,7 +153,7 @@ pub struct MaterializedPools {
     /// Identifier pool
     pub identifiers: Vec<Identifier>,
     /// Byte array pool
-    pub byte_array_pool: Vec<ByteArray>,
+    pub byte_array_pool: Vec<Vec<u8>>,
     /// Address pool
     pub address_pool: Vec<AccountAddress>,
 }
@@ -172,7 +170,7 @@ pub struct Context<'a> {
     modules: HashMap<ModuleName, (QualifiedModuleIdent, ModuleHandle)>,
     structs: HashMap<QualifiedStructIdent, StructHandle>,
     struct_defs: HashMap<StructName, TableIndex>,
-    labels: HashMap<Label, u16>,
+    labels: HashMap<BlockLabel, u16>,
 
     // queryable pools
     fields: HashMap<(StructHandleIndex, Field_), (TableIndex, SignatureToken, usize)>,
@@ -187,17 +185,14 @@ pub struct Context<'a> {
     type_signatures: HashMap<TypeSignature, TableIndex>,
     locals_signatures: HashMap<LocalsSignature, TableIndex>,
     identifiers: HashMap<Identifier, TableIndex>,
-    byte_array_pool: HashMap<ByteArray, TableIndex>,
+    byte_array_pool: HashMap<Vec<u8>, TableIndex>,
     address_pool: HashMap<AccountAddress, TableIndex>,
-
-    // Current generic/type formal context
-    type_formals: TypeFormalMap,
 
     // The current function index that we are on
     current_function_index: FunctionDefinitionIndex,
 
     // Source location mapping for this module
-    pub source_map: ModuleSourceMap<Loc>,
+    pub source_map: SourceMap<Loc>,
 }
 
 impl<'a> Context<'a> {
@@ -236,9 +231,8 @@ impl<'a> Context<'a> {
             identifiers: HashMap::new(),
             byte_array_pool: HashMap::new(),
             address_pool: HashMap::new(),
-            type_formals: HashMap::new(),
             current_function_index: FunctionDefinitionIndex(0),
-            source_map: ModuleSourceMap::new(current_module.clone()),
+            source_map: SourceMap::new(current_module.clone()),
         };
         let self_name = ModuleName::new(ModuleName::self_name().into());
         context.declare_import(current_module, self_name)?;
@@ -263,7 +257,7 @@ impl<'a> Context<'a> {
     }
 
     /// Finish compilation, and materialize the pools for file format.
-    pub fn materialize_pools(self) -> (MaterializedPools, ModuleSourceMap<Loc>) {
+    pub fn materialize_pools(self) -> (MaterializedPools, SourceMap<Loc>) {
         let num_functions = self.function_handles.len();
         assert!(num_functions == self.function_signatures.len());
         let function_handles = Self::materialize_pool(
@@ -286,23 +280,9 @@ impl<'a> Context<'a> {
         (materialized_pools, self.source_map)
     }
 
-    /// Bind the type formals into a "pool" for the current context.
-    pub fn bind_type_formals(&mut self, m: HashMap<TypeVar_, usize>) -> Result<()> {
-        self.type_formals = m
-            .into_iter()
-            .map(|(k, idx)| {
-                if idx > TABLE_MAX_SIZE {
-                    bail!("Too many type parameters")
-                }
-                Ok((k, idx as TableIndex))
-            })
-            .collect::<Result<_>>()?;
-        Ok(())
-    }
-
     pub fn build_index_remapping(
         &mut self,
-        label_to_index: HashMap<Label, u16>,
+        label_to_index: HashMap<BlockLabel, u16>,
     ) -> HashMap<u16, u16> {
         let labels = std::mem::replace(&mut self.labels, HashMap::new());
         label_to_index
@@ -348,16 +328,8 @@ impl<'a> Context<'a> {
         ))
     }
 
-    /// Get the type formal index, fails if it is not bound.
-    pub fn type_formal_index(&mut self, t: &TypeVar_) -> Result<TableIndex> {
-        match self.type_formals.get(&t) {
-            None => bail!("Unbound type parameter {}", t),
-            Some(idx) => Ok(*idx),
-        }
-    }
-
     /// Get the fake offset for the label. Labels will be fixed to real offsets after compilation
-    pub fn label_index(&mut self, label: Label) -> Result<CodeOffset> {
+    pub fn label_index(&mut self, label: BlockLabel) -> Result<CodeOffset> {
         Ok(get_or_add_item(&mut self.labels, label)?)
     }
 
@@ -378,7 +350,8 @@ impl<'a> Context<'a> {
     }
 
     /// Get the byte array pool index, adds it if missing.
-    pub fn byte_array_index(&mut self, byte_array: &ByteArray) -> Result<ByteArrayPoolIndex> {
+    #[allow(clippy::ptr_arg)]
+    pub fn byte_array_index(&mut self, byte_array: &Vec<u8>) -> Result<ByteArrayPoolIndex> {
         Ok(ByteArrayPoolIndex(get_or_add_item_ref(
             &mut self.byte_array_pool,
             byte_array,
@@ -606,7 +579,6 @@ impl<'a> Context<'a> {
             | x @ SignatureToken::U8
             | x @ SignatureToken::U64
             | x @ SignatureToken::U128
-            | x @ SignatureToken::ByteArray
             | x @ SignatureToken::Address
             | x @ SignatureToken::TypeParameter(_) => x,
             SignatureToken::Vector(inner) => {
@@ -657,7 +629,7 @@ impl<'a> Context<'a> {
             .map(|t| self.reindex_signature_token(dep, t))
             .collect::<Result<_>>()?;
         let type_formals = orig.type_formals;
-        Ok(FunctionSignature {
+        Ok(vm::file_format::FunctionSignature {
             return_types,
             arg_types,
             type_formals,

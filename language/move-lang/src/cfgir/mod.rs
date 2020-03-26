@@ -4,19 +4,19 @@
 mod absint;
 pub mod ast;
 mod borrows;
-pub mod cfg;
+pub(crate) mod cfg;
 mod eliminate_locals;
 mod liveness;
 mod locals;
 mod remove_no_ops;
-pub mod translate;
+pub(crate) mod translate;
 
 use crate::{
     errors::Errors,
+    hlir::ast::*,
     parser::ast::{StructName, Var},
     shared::unique_map::UniqueMap,
 };
-use ast::*;
 use cfg::*;
 use std::collections::BTreeSet;
 

@@ -20,7 +20,10 @@ use crate::{
 use channel::{self, libra_channel, message_queues::QueueStyle};
 use consensus_types::proposal_msg::ProposalMsg;
 use futures::{channel::mpsc, executor::block_on};
-use libra_types::crypto_proxies::{LedgerInfoWithSignatures, ValidatorSigner, ValidatorVerifier};
+use libra_types::{
+    ledger_info::LedgerInfoWithSignatures, validator_signer::ValidatorSigner,
+    validator_verifier::ValidatorVerifier,
+};
 use network::peer_manager::{ConnectionRequestSender, PeerManagerRequestSender};
 use once_cell::sync::Lazy;
 use safety_rules::{PersistentSafetyStorage, SafetyRules};

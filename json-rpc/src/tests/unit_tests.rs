@@ -3,6 +3,7 @@
 
 use crate::{
     client::{JsonRpcAsyncClient, JsonRpcBatch, JsonRpcResponse},
+    errors::{JsonRpcError, ServerCode},
     runtime::bootstrap,
     tests::mock_db::MockLibraDB,
     views::{
@@ -14,19 +15,22 @@ use anyhow::format_err;
 use futures::{channel::mpsc::channel, StreamExt};
 use hex;
 use libra_config::utils;
-use libra_crypto::ed25519::*;
+use libra_crypto::{ed25519::*, HashValue};
 use libra_temppath::TempPath;
 use libra_types::{
-    account_address::{AccountAddress, ADDRESS_LENGTH},
+    account_address::AccountAddress,
     account_config::AccountResource,
     account_state::AccountState,
     account_state_blob::{AccountStateBlob, AccountStateWithProof},
     contract_event::ContractEvent,
-    crypto_proxies::LedgerInfoWithSignatures,
+    event::EventKey,
+    language_storage::TypeTag,
+    ledger_info::LedgerInfoWithSignatures,
     mempool_status::{MempoolStatus, MempoolStatusCode},
     proof::{SparseMerkleProof, TransactionAccumulatorProof},
     test_helpers::transaction_test_helpers::get_test_signed_txn,
-    transaction::{Transaction, TransactionInfo, TransactionToCommit},
+    transaction::{Transaction, TransactionInfo, TransactionPayload, TransactionToCommit},
+    vm_error::{StatusCode, VMStatus},
 };
 use libradb::{test_helper::arb_blocks_to_commit, LibraDB, LibraDBTrait};
 use proptest::prelude::*;
@@ -137,11 +141,12 @@ fn mock_db(
         }
 
         // Record all transactions.
-        all_txns.extend(
-            txns_to_commit
-                .iter()
-                .map(|txn_to_commit| txn_to_commit.transaction().clone()),
-        );
+        all_txns.extend(txns_to_commit.iter().map(|txn_to_commit| {
+            (
+                txn_to_commit.transaction().clone(),
+                txn_to_commit.major_status(),
+            )
+        }));
     }
 
     let account_state_with_proof = if let Some(mut proof) = account_state_with_proof {
@@ -153,6 +158,16 @@ fn mock_db(
     } else {
         vec![]
     };
+    if events.is_empty() {
+        // mock the first event
+        let mock_event = ContractEvent::new(
+            EventKey::new_from_address(&AccountAddress::random(), 0),
+            0,
+            TypeTag::Bool,
+            b"event_data".to_vec(),
+        );
+        events.push((version as u64, mock_event));
+    }
 
     MockLibraDB {
         timestamp,
@@ -198,12 +213,28 @@ fn test_transaction_submission() {
     };
 
     // check successful submission
-    let sender = AccountAddress::new([9; ADDRESS_LENGTH]);
+    let sender = AccountAddress::new([9; AccountAddress::LENGTH]);
     assert!(txn_submission(sender)[0].as_ref().unwrap() == &JsonRpcResponse::SubmissionResponse);
 
     // check vm error submission
-    let sender = AccountAddress::new([0; ADDRESS_LENGTH]);
-    assert!(txn_submission(sender)[0].is_err());
+    let sender = AccountAddress::new([0; AccountAddress::LENGTH]);
+    let response = &txn_submission(sender)[0];
+
+    if let Err(e) = response {
+        if let Some(error) = e.downcast_ref::<JsonRpcError>() {
+            assert_eq!(error.code, ServerCode::VmValidationError as i16);
+            let vm_error: VMStatus =
+                serde_json::from_value(error.data.as_ref().unwrap().clone()).unwrap();
+            assert_eq!(
+                vm_error.major_status,
+                StatusCode::SENDING_ACCOUNT_DOES_NOT_EXIST
+            );
+        } else {
+            panic!("unexpected error format");
+        }
+    } else {
+        panic!("expected error");
+    }
 }
 
 proptest! {
@@ -292,10 +323,9 @@ proptest! {
 
 
     #[test]
-    fn test_get_events(blocks in arb_blocks_to_commit(), event in any::<ContractEvent>(),) {
+    fn test_get_events(blocks in arb_blocks_to_commit()) {
         // set up MockLibraDB
-        let mut mock_db = mock_db(blocks, None);
-        mock_db.add_event(event);
+        let mock_db = mock_db(blocks, None);
 
         // set up JSON RPC
         let address = format!("0.0.0.0:{}", utils::get_available_port());
@@ -303,12 +333,11 @@ proptest! {
         let client = reqwest::blocking::Client::new();
         let url = format!("http://{}", address);
 
-
         let event_index = 0;
         let mock_db_events = mock_db.events;
         let (first_event_version, first_event) = mock_db_events[event_index].clone();
         let event_key = hex::encode(first_event.key().as_bytes());
-        let request = serde_json::json!({"jsonrpc": "2.0", "method": "get_events", "params": [event_key, 0, 10], "id": 1});
+        let request = serde_json::json!({"jsonrpc": "2.0", "method": "get_events", "params": [event_key, first_event.sequence_number(), first_event.sequence_number() + 10], "id": 1});
         let resp = client.post(&url).json(&request).send().unwrap();
         let events: Vec<EventView> = fetch_data(resp);
 
@@ -371,7 +400,7 @@ fn test_get_transactions_impl(blocks: Vec<(Vec<TransactionToCommit>, LedgerInfoW
                             .as_u64(),
                         Some(version)
                     );
-                    let tx = &mock_db.all_txns[version as usize];
+                    let (tx, status) = &mock_db.all_txns[version as usize];
 
                     let view: TransactionView =
                         serde_json::from_value(response.clone()).expect("Invalid result");
@@ -385,6 +414,7 @@ fn test_get_transactions_impl(blocks: Vec<(Vec<TransactionToCommit>, LedgerInfoW
                         .collect::<Vec<_>>();
 
                     assert_eq!(expected_events.len(), view.events.len());
+                    assert_eq!(status, &view.vm_status);
 
                     for (i, event_view) in view.events.iter().enumerate() {
                         let expected_event =
@@ -410,9 +440,19 @@ fn test_get_transactions_impl(blocks: Vec<(Vec<TransactionToCommit>, LedgerInfoW
                             _ => panic!("Returned value doesn't match!"),
                         },
                         Transaction::UserTransaction(t) => match view.transaction {
-                            TransactionDataView::UserTransaction { sender, .. } => {
+                            TransactionDataView::UserTransaction {
+                                sender,
+                                script_hash,
+                                ..
+                            } => {
                                 assert_eq!(t.sender().to_string(), sender);
                                 // TODO: verify every field
+                                if let TransactionPayload::Script(s) = t.payload() {
+                                    assert_eq!(
+                                        script_hash,
+                                        HashValue::from_sha3_256(s.code()).to_hex()
+                                    );
+                                }
                             }
                             _ => panic!("Returned value doesn't match!"),
                         },
@@ -471,6 +511,19 @@ fn test_get_account_transaction_impl(
             let data: Option<TransactionView> = fetch_data(resp);
             let tx_view = data.expect("Transaction didn't exists!");
 
+            let (expected_tx, expected_status) = mock_db
+                .all_txns
+                .iter()
+                .find_map(|(t, status)| {
+                    if let Ok(x) = t.as_signed_user_txn() {
+                        if x.sender() == *acc && x.sequence_number() == seq {
+                            return Some((x, status));
+                        }
+                    }
+                    None
+                })
+                .expect("Couldn't find tx");
+
             // Check we returned correct events
             let expected_events = mock_db
                 .events
@@ -480,6 +533,9 @@ fn test_get_account_transaction_impl(
                 .collect::<Vec<_>>();
 
             assert_eq!(tx_view.events.len(), expected_events.len());
+
+            // check VM major status
+            assert_eq!(&tx_view.vm_status, expected_status);
 
             for (i, event_view) in tx_view.events.iter().enumerate() {
                 let expected_event = expected_events.get(i).expect("Expected event didn't find");
@@ -499,10 +555,15 @@ fn test_get_account_transaction_impl(
                 TransactionDataView::UserTransaction {
                     sender,
                     sequence_number,
+                    script_hash,
                     ..
                 } => {
                     assert_eq!(acc.to_string(), sender);
                     assert_eq!(seq, sequence_number);
+
+                    if let TransactionPayload::Script(s) = expected_tx.payload() {
+                        assert_eq!(script_hash, HashValue::from_sha3_256(s.code()).to_hex());
+                    }
                 }
                 _ => panic!("wrong type"),
             }

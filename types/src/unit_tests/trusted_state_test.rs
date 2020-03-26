@@ -4,14 +4,14 @@
 use crate::{
     account_address::AccountAddress,
     block_info::BlockInfo,
-    crypto_proxies::{
-        random_validator_verifier, LedgerInfoWithSignatures, ValidatorPublicKeys, ValidatorSet,
-        ValidatorSigner,
-    },
-    ledger_info::LedgerInfo,
+    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     transaction::Version,
     trusted_state::{TrustedState, TrustedStateChange},
     validator_change::ValidatorChangeProof,
+    validator_info::ValidatorInfo,
+    validator_set::ValidatorSet,
+    validator_signer::ValidatorSigner,
+    validator_verifier::random_validator_verifier,
     waypoint::Waypoint,
 };
 use libra_crypto::{
@@ -62,7 +62,7 @@ fn into_validator_set(signers: &[ValidatorSigner]) -> ValidatorSet {
         signers
             .iter()
             .map(|signer| {
-                ValidatorPublicKeys::new_with_random_network_keys(
+                ValidatorInfo::new_with_random_network_keys(
                     signer.author(),
                     signer.public_key(),
                     1, /* voting power */
@@ -80,7 +80,7 @@ fn sign_ledger_info(
 ) -> BTreeMap<AccountAddress, Ed25519Signature> {
     signers
         .iter()
-        .map(|s| (s.author(), s.sign_message(ledger_info.hash()).unwrap()))
+        .map(|s| (s.author(), s.sign_message(ledger_info.hash())))
         .collect()
 }
 

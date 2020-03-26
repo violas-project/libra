@@ -1,5 +1,5 @@
-// dep: ../stdlib/modules/vector.move
-module References {
+// dep: tests/sources/modules/vector.move
+module TestReferences {
     use 0x0::Vector;
 
     struct T {

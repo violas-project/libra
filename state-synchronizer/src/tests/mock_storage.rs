@@ -6,15 +6,15 @@ use anyhow::{bail, Result};
 use executor_types::ExecutedTrees;
 use libra_crypto::{hash::CryptoHash, HashValue};
 use libra_types::{
-    account_address::{AccountAddress, AuthenticationKey},
+    account_address::AccountAddress,
     block_info::BlockInfo,
-    crypto_proxies::{
-        LedgerInfoWithSignatures, ValidatorChangeProof, ValidatorSet, ValidatorSigner,
-        ValidatorVerifier,
-    },
-    ledger_info::LedgerInfo,
+    ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
     test_helpers::transaction_test_helpers::get_test_signed_txn,
-    transaction::{SignedTransaction, Transaction},
+    transaction::{authenticator::AuthenticationKey, SignedTransaction, Transaction},
+    validator_change::ValidatorChangeProof,
+    validator_set::ValidatorSet,
+    validator_signer::ValidatorSigner,
+    validator_verifier::ValidatorVerifier,
 };
 use std::collections::{BTreeMap, HashMap};
 use transaction_builder::encode_transfer_script;
@@ -191,7 +191,7 @@ impl MockStorage {
             ),
             HashValue::zero(),
         );
-        let signature = self.signer.sign_message(ledger_info.hash()).unwrap();
+        let signature = self.signer.sign_message(ledger_info.hash());
         let mut signatures = BTreeMap::new();
         signatures.insert(self.signer.author(), signature);
         self.ledger_infos.insert(

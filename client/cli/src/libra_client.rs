@@ -2,9 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::AccountData;
-use anyhow::{bail, ensure, format_err, Result};
-use libra_json_rpc::views::{
-    AccountStateWithProofView, AccountView, BytesView, EventView, StateProofView, TransactionView,
+use anyhow::{bail, ensure, format_err, Error, Result};
+use libra_json_rpc::{
+    errors::JsonRpcError,
+    views::{
+        AccountStateWithProofView, AccountView, BytesView, EventView, StateProofView,
+        TransactionView,
+    },
 };
 use libra_logger::prelude::*;
 use libra_types::{
@@ -12,14 +16,18 @@ use libra_types::{
     account_address::AccountAddress,
     account_config::{ACCOUNT_RECEIVED_EVENT_PATH, ACCOUNT_SENT_EVENT_PATH},
     account_state_blob::AccountStateBlob,
-    crypto_proxies::LedgerInfoWithSignatures,
+    ledger_info::LedgerInfoWithSignatures,
     transaction::{SignedTransaction, Version},
     trusted_state::{TrustedState, TrustedStateChange},
     validator_change::ValidatorChangeProof,
+    vm_error::StatusCode,
     waypoint::Waypoint,
 };
 use rand::Rng;
-use reqwest::blocking::Client;
+use reqwest::{
+    blocking::{Client, ClientBuilder},
+    Url,
+};
 use std::time::Duration;
 
 const JSON_RPC_TIMEOUT_MS: u64 = 5_000;
@@ -50,16 +58,16 @@ pub struct LibraClient {
 }
 
 pub struct JsonRpcClient {
-    addr: String,
+    url: Url,
     client: Client,
 }
 
 impl JsonRpcClient {
-    pub fn new(host: &str, port: u16) -> Self {
-        let addr = format!("http://{}:{}", host, port);
-        let client = Client::new();
-
-        Self { client, addr }
+    pub fn new(url: Url) -> Result<Self> {
+        Ok(Self {
+            client: ClientBuilder::new().use_rustls_tls().build()?,
+            url,
+        })
     }
 
     /// Sends JSON request `request`, performs basic checks on the payload, and returns Ok(`result`),
@@ -110,7 +118,8 @@ impl JsonRpcClient {
         );
 
         if let Some(error) = response.get("error") {
-            bail!("Error in JSON RPC response: {:?}", error);
+            let json_error: JsonRpcError = serde_json::from_value(error.clone())?;
+            return Err(Error::new(json_error));
         }
 
         if let Some(result) = response.get("result") {
@@ -200,7 +209,7 @@ impl JsonRpcClient {
 
     fn send(&mut self, request: &serde_json::Value) -> Result<reqwest::blocking::Response> {
         self.client
-            .post(&self.addr)
+            .post(self.url.clone())
             .json(request)
             .timeout(Duration::from_millis(JSON_RPC_TIMEOUT_MS))
             .send()
@@ -211,14 +220,14 @@ impl JsonRpcClient {
 impl LibraClient {
     /// Construct a new Client instance.
     // TODO(philiphayes/dmitrip): Waypoint should not be optional
-    pub fn new(host: &str, port: u16, waypoint: Option<Waypoint>) -> Result<Self> {
+    pub fn new(url: Url, waypoint: Option<Waypoint>) -> Result<Self> {
         // If waypoint is present, use it for initial verification, otherwise the initial
         // verification is essentially empty.
         let initial_trusted_state = match waypoint {
             Some(waypoint) => TrustedState::from_waypoint(waypoint),
             None => TrustedState::new_trust_any_genesis_WARNING_UNSAFE(),
         };
-        let client = JsonRpcClient::new(host, port);
+        let client = JsonRpcClient::new(url)?;
         Ok(LibraClient {
             client,
             trusted_state: initial_trusted_state,
@@ -250,7 +259,20 @@ impl LibraClient {
                 }
                 Ok(())
             }
-            Err(e) => bail!("Transaction submission failed with error: {:?}", e),
+            Err(e) => {
+                if let Some(error) = e.downcast_ref::<JsonRpcError>() {
+                    // check VM status
+                    if let Some(vm_error) = error.get_vm_error() {
+                        if vm_error.major_status == StatusCode::SEQUENCE_NUMBER_TOO_OLD {
+                            if let Some(sender_account) = sender_account_opt {
+                                sender_account.sequence_number =
+                                    self.get_sequence_number(sender_account.address)?;
+                            }
+                        }
+                    }
+                }
+                bail!("Transaction submission failed with error: {:?}", e)
+            }
         }
     }
 
@@ -480,6 +502,13 @@ impl LibraClient {
                 Ok(txns)
             }
             Err(e) => bail!("Failed to get transactions with error: {:?}", e),
+        }
+    }
+
+    fn get_sequence_number(&mut self, account: AccountAddress) -> Result<u64> {
+        match self.get_account_state(account, true)?.0 {
+            None => bail!("No account found for address {:?}", account),
+            Some(account_view) => Ok(account_view.sequence_number),
         }
     }
 

@@ -22,7 +22,7 @@ num-traits = { version = "0.2.8", default-features = false }
 parity-multiaddr = { version = "0.7.2", default-features = false }
 rand = { version = "0.6.5", default-features = false }
 rusty-fork = { version = "0.2.2", default-features = false }
-serde = { version = "1.0.99", default-features = false }
+serde = { version = "1.0.105", default-features = false }
 serde_json = "1.0"
 thiserror = "1.0"
 termion = { version = "1.5.3", default-features = false }
@@ -49,11 +49,11 @@ network = { path = "../network", version = "0.1.0" }
 safety-rules = { path = "safety-rules", version = "0.1.0" }
 state-synchronizer = { path = "../state-synchronizer", version = "0.1.0" }
 schemadb = { path = "../storage/schemadb", version = "0.1.0" }
-storage-client = { path = "../storage/storage-client", version = "0.1.0" }
+libradb = { path = "../storage/libradb", version = "0.1.0" }
 libra-vm = { path = "../language/libra-vm", version = "0.1.0" }
 
 [dev-dependencies]
-cached = "0.11.0"
+cached = "0.12.0"
 proptest = "0.9.4"
 tempfile = "3.1.0"
 

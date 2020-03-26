@@ -3,17 +3,12 @@
 
 use super::{balance_ap, encode_mint_transaction, encode_transfer_transaction, seqnum_ap, MockVM};
 use anyhow::Result;
-use libra_config::config::VMConfig;
 use libra_state_view::StateView;
-use libra_types::{
-    access_path::AccessPath,
-    account_address::{AccountAddress, ADDRESS_LENGTH},
-    write_set::WriteOp,
-};
+use libra_types::{access_path::AccessPath, account_address::AccountAddress, write_set::WriteOp};
 use libra_vm::VMExecutor;
 
 fn gen_address(index: u8) -> AccountAddress {
-    AccountAddress::new([index; ADDRESS_LENGTH])
+    AccountAddress::new([index; AccountAddress::LENGTH])
 }
 
 struct MockStateView;
@@ -40,12 +35,8 @@ fn test_mock_vm_different_senders() {
         txns.push(encode_mint_transaction(gen_address(i), amount));
     }
 
-    let outputs = MockVM::execute_block(
-        txns.clone(),
-        &VMConfig::empty_whitelist_FOR_TESTING(),
-        &MockStateView,
-    )
-    .expect("MockVM should not fail to start");
+    let outputs = MockVM::execute_block(txns.clone(), &MockStateView)
+        .expect("MockVM should not fail to start");
 
     for (output, txn) in itertools::zip_eq(outputs.iter(), txns.iter()) {
         let sender = txn.as_signed_user_txn().unwrap().sender();
@@ -74,12 +65,8 @@ fn test_mock_vm_same_sender() {
         txns.push(encode_mint_transaction(sender, amount));
     }
 
-    let outputs = MockVM::execute_block(
-        txns,
-        &VMConfig::empty_whitelist_FOR_TESTING(),
-        &MockStateView,
-    )
-    .expect("MockVM should not fail to start");
+    let outputs =
+        MockVM::execute_block(txns, &MockStateView).expect("MockVM should not fail to start");
 
     for (i, output) in outputs.iter().enumerate() {
         assert_eq!(
@@ -109,12 +96,8 @@ fn test_mock_vm_payment() {
         50,
     ));
 
-    let output = MockVM::execute_block(
-        txns,
-        &VMConfig::empty_whitelist_FOR_TESTING(),
-        &MockStateView,
-    )
-    .expect("MockVM should not fail to start");
+    let output =
+        MockVM::execute_block(txns, &MockStateView).expect("MockVM should not fail to start");
 
     let mut output_iter = output.iter();
     output_iter.next();

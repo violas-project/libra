@@ -2,15 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Random valid type inhabitant generation.
-use crate::common::*;
-use libra_types::{
-    account_address::AccountAddress, byte_array::ByteArray, language_storage::ModuleId,
-};
+use libra_types::{account_address::AccountAddress, language_storage::ModuleId};
 use move_core_types::identifier::Identifier;
 use move_vm_runtime::{loaded_data::loaded_module::LoadedModule, MoveVM};
 use move_vm_state::execution_context::SystemExecutionContext;
 use move_vm_types::{
-    loaded_data::{struct_def::StructDef, types::Type},
+    loaded_data::types::{StructType, Type},
     values::*,
 };
 use rand::{rngs::StdRng, Rng, SeedableRng};
@@ -89,12 +86,6 @@ impl<'txn> RandomInhabitor<'txn> {
         self.gen.gen_bool(0.5)
     }
 
-    fn next_bytearray(&mut self) -> ByteArray {
-        let len: usize = self.gen.gen_range(1, BYTE_ARRAY_MAX_SIZE);
-        let bytes: Vec<u8> = (0..len).map(|_| self.gen.gen::<u8>()).collect();
-        ByteArray::new(bytes)
-    }
-
     fn next_addr(&mut self) -> AccountAddress {
         AccountAddress::new(self.gen.gen())
     }
@@ -152,9 +143,6 @@ impl<'txn> RandomInhabitor<'txn> {
             SignatureToken::Reference(_sig) | SignatureToken::MutableReference(_sig) => {
                 panic!("cannot inhabit references");
             }
-            SignatureToken::ByteArray => {
-                (Type::ByteArray, Value::byte_array(self.next_bytearray()))
-            }
             SignatureToken::Struct(struct_handle_idx, _) => {
                 assert!(self.root_module.struct_defs().len() > 1);
                 let struct_definition = self
@@ -179,7 +167,13 @@ impl<'txn> RandomInhabitor<'txn> {
                     })
                     .unzip();
                 (
-                    Type::Struct(StructDef::new(layouts)),
+                    Type::Struct(Box::new(StructType {
+                        address: AccountAddress::from_hex_literal("0x0").unwrap(),
+                        module: Identifier::new("unimplemented").unwrap(),
+                        name: Identifier::new("unimplemented").unwrap(),
+                        ty_args: vec![],
+                        layout: layouts,
+                    })),
                     Value::struct_(Struct::pack(values)),
                 )
             }

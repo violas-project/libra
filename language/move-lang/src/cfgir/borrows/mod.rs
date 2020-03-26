@@ -3,9 +3,10 @@
 
 mod state;
 
-use super::{absint::*, ast::*};
+use super::absint::*;
 use crate::{
     errors::*,
+    hlir::ast::*,
     parser::ast::{BinOp_, StructName, Var},
     shared::unique_map::UniqueMap,
 };
@@ -130,6 +131,7 @@ fn command(context: &mut Context, sp!(loc, cmd_): &Command) {
             context.borrow_state.abort()
         }
         C::Jump(_) => (),
+        C::Break | C::Continue => panic!("ICE break/continue not translated to jumps"),
     }
 }
 
@@ -239,7 +241,7 @@ fn exp(context: &mut Context, parent_e: &Exp) -> Values {
             values
         }
 
-        E::Unit | E::Value(_) | E::UnresolvedError => svalue(),
+        E::Unit | E::Value(_) | E::Spec(_) | E::UnresolvedError => svalue(),
         E::Cast(e, _) | E::UnaryExp(_, e) => {
             let v = exp(context, e);
             assert!(!assert_single_value(v).is_ref());

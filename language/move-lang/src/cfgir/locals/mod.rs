@@ -3,10 +3,13 @@
 
 pub mod state;
 
-use super::{absint::*, ast::*};
+use super::absint::*;
 use crate::{
     errors::*,
-    hlir::translate::{display_var, DisplayVar},
+    hlir::{
+        ast::*,
+        translate::{display_var, DisplayVar},
+    },
     parser::ast::{Kind_, StructName, Var},
     shared::{unique_map::UniqueMap, *},
 };
@@ -166,6 +169,7 @@ fn command(context: &mut Context, sp!(loc, cmd_): &Command) {
             errors.into_iter().for_each(|error| context.error(error))
         }
         C::Jump(_) => (),
+        C::Break | C::Continue => panic!("ICE break/continue not translated to jumps"),
     }
 }
 
@@ -218,7 +222,7 @@ fn exp(context: &mut Context, parent_e: &Exp) {
     use UnannotatedExp_ as E;
     let eloc = &parent_e.exp.loc;
     match &parent_e.exp.value {
-        E::Unit | E::Value(_) | E::UnresolvedError => (),
+        E::Unit | E::Value(_) | E::Spec(_) | E::UnresolvedError => (),
 
         E::BorrowLocal(_, var) | E::Copy { var, .. } => use_local(context, eloc, var),
 

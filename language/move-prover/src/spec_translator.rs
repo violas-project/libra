@@ -203,6 +203,21 @@ impl<'env> SpecTranslator<'env> {
         let conds = func_env.get_specification();
         emitln!(self.writer, "requires $ExistsTxnSenderAccount($m, $txn);");
 
+        // Generate requires.
+        let requires = conds
+            .iter()
+            .filter(|c| c.kind == ConditionKind::Requires)
+            .collect_vec();
+        if !requires.is_empty() {
+            self.translate_seq(requires.iter(), "\n", |cond| {
+                self.writer.set_location(&cond.loc);
+                emit!(self.writer, "requires b#Boolean(");
+                self.translate_exp(&cond.exp);
+                emit!(self.writer, ");")
+            });
+            emitln!(self.writer);
+        }
+
         // Generate aborts_if
         // abort_if P means function abort if P holds.
         // multiple abort_if conditions are "or"ed. If no condition holds, function does not abort.
@@ -227,12 +242,74 @@ impl<'env> SpecTranslator<'env> {
             .filter(|c| c.kind == ConditionKind::Ensures)
             .collect_vec();
         if !ensures.is_empty() {
-            self.writer.set_location(&ensures[0].loc);
             self.translate_seq(ensures.iter(), "\n", |cond| {
-                emit!(self.writer, "ensures !$abort_flag ==> b#Boolean(");
+                self.writer.set_location(&cond.loc);
+                emit!(self.writer, "ensures !$abort_flag ==> (b#Boolean(");
+                self.translate_exp(&cond.exp);
+                emit!(self.writer, "));")
+            });
+            emitln!(self.writer);
+        }
+
+        // Generate implicit requires/ensures from module invariants if this is a public function.
+        if func_env.is_public() {
+            let invariants = func_env.module_env.get_module_invariants();
+            if !invariants.is_empty() {
+                self.translate_seq(invariants.iter(), "\n", |inv| {
+                    self.writer.set_location(&inv.loc);
+                    emit!(self.writer, "requires b#Boolean(");
+                    self.translate_exp(&inv.exp);
+                    emit!(self.writer, ");")
+                });
+                emitln!(self.writer);
+                self.translate_seq(invariants.iter(), "\n", |inv| {
+                    self.writer.set_location(&inv.loc);
+                    emit!(self.writer, "ensures !$abort_flag ==> (b#Boolean(");
+                    self.translate_exp(&inv.exp);
+                    emit!(self.writer, "));")
+                });
+                emitln!(self.writer);
+            }
+        }
+    }
+
+    /// Assumes preconditions for function.
+    pub fn assume_preconditions(&self, func_env: &FunctionEnv<'_>) {
+        emitln!(self.writer, "assume $ExistsTxnSenderAccount($m, $txn);");
+
+        // Explicit pre-conditions.
+        let requires = func_env
+            .get_specification()
+            .iter()
+            .filter(|cond| cond.kind == ConditionKind::Requires)
+            .collect_vec();
+        if !requires.is_empty() {
+            self.translate_seq(requires.iter(), "\n", |cond| {
+                self.writer.set_location(&cond.loc);
+                emit!(self.writer, "assume b#Boolean(");
                 self.translate_exp(&cond.exp);
                 emit!(self.writer, ");")
             });
+            emitln!(self.writer);
+        }
+
+        // Implict module invariants.
+        self.assume_module_invariants(func_env);
+    }
+
+    /// Assume module invariants of function.
+    pub fn assume_module_invariants(&self, func_env: &FunctionEnv<'_>) {
+        if func_env.is_public() {
+            let invariants = func_env.module_env.get_module_invariants();
+            if !invariants.is_empty() {
+                self.translate_seq(invariants.iter(), "\n", |inv| {
+                    self.writer.set_location(&inv.loc);
+                    emit!(self.writer, "assume b#Boolean(");
+                    self.translate_exp(&inv.exp);
+                    emit!(self.writer, ");")
+                });
+                emitln!(self.writer);
+            }
         }
     }
 }
@@ -256,7 +333,7 @@ impl<'env> SpecTranslator<'env> {
     fn translate_assume_well_formed(&self, struct_env: &StructEnv<'env>) {
         emitln!(
             self.writer,
-            "function {{:inline 1}} ${}_is_well_formed($this: Value): bool {{",
+            "function {{:inline}} ${}_is_well_formed($this: Value): bool {{",
             boogie_struct_name(struct_env),
         );
         self.writer.indent();
@@ -283,7 +360,7 @@ impl<'env> SpecTranslator<'env> {
         emitln!(self.writer);
     }
 
-    /// Determines whether a before-update invariant is trivial, and can therefore be omitted.
+    /// Determines whether a before-update invariant is generated.
     ///
     /// We currently support two models for dealing with global spec var updates.
     /// If the specification has explicitly provided update invariants for spec vars, we use those.
@@ -319,7 +396,7 @@ impl<'env> SpecTranslator<'env> {
         emitln!(self.writer);
     }
 
-    /// Determines whether the after-update invariant is trivial, and can therefore be omitted.
+    /// Determines whether a after-update invariant is generated.
     pub fn has_after_update_invariant(struct_env: &StructEnv<'_>) -> bool {
         !struct_env.get_update_invariants().is_empty()
             || !struct_env.get_pack_invariants().is_empty()
@@ -476,15 +553,11 @@ impl<'env> SpecTranslator<'env> {
         emit!(self.writer, ")");
     }
 
-    fn translate_value(&self, node_id: NodeId, val: &Value) {
+    fn translate_value(&self, _node_id: NodeId, val: &Value) {
         match val {
             Value::Address(addr) => emit!(self.writer, "Address({})", addr),
             Value::Number(val) => emit!(self.writer, "Integer({})", val),
             Value::Bool(val) => emit!(self.writer, "Boolean({})", val),
-            Value::Bytearray(_) => self.error(
-                &self.module_env.get_node_loc(node_id),
-                "bytearray not supported",
-            ),
         }
     }
 
@@ -575,10 +648,14 @@ impl<'env> SpecTranslator<'env> {
             Operation::Global => self.translate_resource_access(node_id, args),
             Operation::Exists => self.translate_resource_exists(node_id, args),
             Operation::Len => self.translate_primitive_call("$vlen_value", args),
+            Operation::Sender => emit!(self.writer, "$TxnSender($txn)"),
             Operation::All => self.translate_all_or_exists(&loc, true, args),
             Operation::Any => self.translate_all_or_exists(&loc, false, args),
             Operation::Update => self.translate_primitive_call("$update_vector", args),
             Operation::Old => self.translate_old(args),
+            Operation::MaxU8 => emit!(self.writer, "Integer(MAX_U8)"),
+            Operation::MaxU64 => emit!(self.writer, "Integer(MAX_U64)"),
+            Operation::MaxU128 => emit!(self.writer, "Integer(MAX_U128)"),
         }
     }
 

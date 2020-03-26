@@ -305,13 +305,13 @@ function {:inline} $select_vector_by_value(v: Value, i: Value) : Value {
 function {:inline} swap_vector(v: Value, i: int, j: int): Value {
     Vector(SwapValueArray(v#Vector(v), i, j))
 }
-function {:inline} $slice_vector(v: Value, i: int, j: int) : Value {
-    Vector(SliceValueArray(v#Vector(v), i, j))
+function {:inline} $slice_vector(v: Value, r: Value) : Value {
+    Vector(SliceValueArray(v#Vector(v), i#Integer(lb#$Range(r)), i#Integer(ub#$Range(r))))
 }
-
 function {:inline} $InVectorRange(v: Value, i: int): bool {
     i >= 0 && i < $vlen(v)
 }
+
 function {:inline} $InRange(r: Value, i: int): bool {
    i#Integer(lb#$Range(r)) <= i && i < i#Integer(ub#$Range(r))
 }
@@ -419,6 +419,10 @@ function {:inline} $ExistsTxnSenderAccount(m: Memory, txn: Transaction): bool {
    domain#Memory(m)[Global(LibraAccount_T_type_value(), sender#Transaction(txn))]
 }
 
+function {:inline} $TxnSender(txn: Transaction): Value {
+    Address(sender#Transaction(txn))
+}
+
 // Forward declaration of type value of LibraAccount. This is declared so we can define
 // ExistsTxnSenderAccount.
 function LibraAccount_T_type_value(): TypeValue;
@@ -470,7 +474,6 @@ procedure {:inline 1} MoveFrom(address: Value, ta: TypeValue) returns (dst: Valu
 procedure {:inline 1} BorrowGlobal(address: Value, ta: TypeValue) returns (dst: Reference)
 {
     var a: int;
-    var v: Value;
     var l: Location;
     assume is#Address(address);
     a := a#Address(address);
@@ -757,7 +760,7 @@ procedure {:inline 1} GetTxnPublicKey() returns (ret_public_key: Value)
 
 procedure {:inline 1} GetTxnSenderAddress() returns (ret_sender: Value)
 {
-  ret_sender := Address(sender#Transaction($txn));
+  ret_sender := $TxnSender($txn);
 }
 
 procedure {:inline 1} GetTxnMaxGasUnits() returns (ret_max_gas_units: Value)
@@ -778,7 +781,7 @@ function {:inline} $Vector_type_value(tv: TypeValue): TypeValue {
 }
 
 function {:inline} $Vector_is_well_formed(v: Value): bool {
-    is#Vector(v)
+    is#Vector(v) && l#ValueArray(v#Vector(v)) >= 0
 }
 
 procedure {:inline 1} $Vector_empty(ta: TypeValue) returns (v: Value) {

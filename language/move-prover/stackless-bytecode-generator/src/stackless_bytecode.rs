@@ -3,17 +3,17 @@
 
 use vm::file_format::{
     AddressPoolIndex, ByteArrayPoolIndex, CodeOffset, FieldDefinitionIndex, FunctionHandleIndex,
-    LocalIndex, LocalsSignatureIndex, StructDefinitionIndex,
+    LocalsSignatureIndex, StructDefinitionIndex,
 };
 
-type TempIndex = usize;
+pub type TempIndex = usize;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StacklessBytecode {
-    MoveLoc(TempIndex, LocalIndex),   // t = move(l)
-    CopyLoc(TempIndex, LocalIndex),   // t = copy(l)
-    StLoc(LocalIndex, TempIndex),     // l = t
-    BorrowLoc(TempIndex, LocalIndex), // t1 = &t2
+    MoveLoc(TempIndex, TempIndex),   // t = move(l)
+    CopyLoc(TempIndex, TempIndex),   // t = copy(l)
+    StLoc(TempIndex, TempIndex),     // l = t
+    BorrowLoc(TempIndex, TempIndex), // t1 = &t2
 
     ReadRef(TempIndex, TempIndex),   // t1 = *t2
     WriteRef(TempIndex, TempIndex),  // *t1 = t2
@@ -111,19 +111,17 @@ pub enum StacklessBytecode {
 
 impl StacklessBytecode {
     pub fn is_unconditional_branch(&self) -> bool {
-        match self {
-            StacklessBytecode::Ret(_)
-            | StacklessBytecode::Abort(_)
-            | StacklessBytecode::Branch(_) => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            StacklessBytecode::Ret(_) | StacklessBytecode::Abort(_) | StacklessBytecode::Branch(_)
+        )
     }
 
     pub fn is_conditional_branch(&self) -> bool {
-        match self {
-            StacklessBytecode::BrFalse(_, _) | StacklessBytecode::BrTrue(_, _) => true,
-            _ => false,
-        }
+        matches!(
+            self,
+            StacklessBytecode::BrFalse(_, _) | StacklessBytecode::BrTrue(_, _)
+        )
     }
 
     pub fn is_branch(&self) -> bool {

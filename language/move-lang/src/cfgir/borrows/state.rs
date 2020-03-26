@@ -6,10 +6,12 @@
 //**************************************************************************************************
 
 use crate::{
-    cfgir::{absint::*, ast::*},
+    cfgir::absint::*,
     errors::*,
-    hlir::translate::{display_var, DisplayVar},
-    naming::ast::TypeName_,
+    hlir::{
+        ast::{TypeName_, *},
+        translate::{display_var, DisplayVar},
+    },
     parser::ast::{Field, StructName, Var},
     shared::*,
 };

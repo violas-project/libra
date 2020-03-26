@@ -6,11 +6,10 @@ use crate::{
     spec_language_ast::{Condition, Invariant, SyntheticDefinition},
 };
 use anyhow::Result;
-use libra_types::{
-    account_address::AccountAddress, byte_array::ByteArray, language_storage::ModuleId,
-};
+use libra_types::{account_address::AccountAddress, language_storage::ModuleId};
 use move_core_types::identifier::Identifier;
 use once_cell::sync::Lazy;
+use serde::{Deserialize, Serialize};
 use std::{
     collections::{HashSet, VecDeque},
     fmt,
@@ -180,8 +179,6 @@ pub enum Type {
     U128,
     /// `bool`
     Bool,
-    /// `bytearray`
-    ByteArray,
     /// `vector`
     Vector(Box<Type>),
     /// A module defined struct
@@ -490,7 +487,7 @@ pub enum CopyableVal_ {
     /// true or false
     Bool(bool),
     /// `b"<bytes>"`
-    ByteArray(ByteArray),
+    ByteArray(Vec<u8>),
 }
 
 /// The type of a value and its location
@@ -599,26 +596,30 @@ pub type Exp = Spanned<Exp_>;
 // Bytecode
 //**************************************************************************************************
 
-pub type BytecodeBlocks = Vec<(Label, BytecodeBlock)>;
+pub type BytecodeBlocks = Vec<(BlockLabel, BytecodeBlock)>;
 pub type BytecodeBlock = Vec<Bytecode>;
 
-#[derive(Debug, Clone, Hash, Eq, PartialEq)]
-pub struct Label(pub String);
+#[derive(Debug, Clone, Hash, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct BlockLabel(pub String);
+
+#[derive(Debug, Clone, Hash, Eq, PartialEq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct NopLabel(pub String);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Bytecode_ {
     Pop,
     Ret,
-    BrTrue(Label),
-    BrFalse(Label),
-    Branch(Label),
+    Nop(Option<NopLabel>),
+    BrTrue(BlockLabel),
+    BrFalse(BlockLabel),
+    Branch(BlockLabel),
     LdU8(u8),
     LdU64(u64),
     LdU128(u128),
     CastU8,
     CastU64,
     CastU128,
-    LdByteArray(ByteArray),
+    LdByteArray(Vec<u8>),
     LdAddr(AccountAddress),
     LdTrue,
     LdFalse,
@@ -633,8 +634,8 @@ pub enum Bytecode_ {
     FreezeRef,
     MutBorrowLoc(Var),
     ImmBorrowLoc(Var),
-    MutBorrowField(StructName, Field),
-    ImmBorrowField(StructName, Field),
+    MutBorrowField(StructName, Vec<Type>, Field),
+    ImmBorrowField(StructName, Vec<Type>, Field),
     MutBorrowGlobal(StructName, Vec<Type>),
     ImmBorrowGlobal(StructName, Vec<Type>),
     Add,
@@ -824,11 +825,6 @@ impl Type {
     /// Creates a new bool type
     pub fn bool() -> Type {
         Type::Bool
-    }
-
-    /// Creates a new bytearray type
-    pub fn bytearray() -> Type {
-        Type::ByteArray
     }
 }
 
@@ -1129,7 +1125,7 @@ impl Exp_ {
     }
 
     /// Creates a new bytearray `Exp` with no location information
-    pub fn byte_array(buf: ByteArray) -> Exp {
+    pub fn byte_array(buf: Vec<u8>) -> Exp {
         Exp_::value(CopyableVal_::ByteArray(buf))
     }
 
@@ -1490,7 +1486,6 @@ impl fmt::Display for Type {
             Type::U128 => write!(f, "u128"),
             Type::Bool => write!(f, "bool"),
             Type::Address => write!(f, "address"),
-            Type::ByteArray => write!(f, "bytearray"),
             Type::Vector(ty) => write!(f, "vector<{}>", ty),
             Type::Struct(ident, tys) => write!(f, "{}{}", ident, format_type_actuals(tys)),
             Type::Reference(is_mutable, t) => {
@@ -1660,8 +1655,8 @@ impl fmt::Display for CopyableVal_ {
             CopyableVal_::U64(v) => write!(f, "{}", v),
             CopyableVal_::U128(v) => write!(f, "{}u128", v),
             CopyableVal_::Bool(v) => write!(f, "{}", v),
-            CopyableVal_::ByteArray(v) => write!(f, "{}", v),
-            CopyableVal_::Address(v) => write!(f, "0x{}", hex::encode(&v)),
+            CopyableVal_::ByteArray(v) => write!(f, "0b{}", hex::encode(v)),
+            CopyableVal_::Address(v) => write!(f, "0x{}", hex::encode(v)),
         }
     }
 }
@@ -1762,6 +1757,8 @@ impl fmt::Display for Bytecode_ {
         match self {
             Bytecode_::Pop => write!(f, "Pop"),
             Bytecode_::Ret => write!(f, "Ret"),
+            Bytecode_::Nop(None) => write!(f, "Nop"),
+            Bytecode_::Nop(Some(s)) => write!(f, "Nop {}", &s.0),
             Bytecode_::BrTrue(lbl) => write!(f, "BrTrue {}", &lbl.0),
             Bytecode_::BrFalse(lbl) => write!(f, "BrFalse {}", &lbl.0),
             Bytecode_::Branch(lbl) => write!(f, "Branch {}", &lbl.0),
@@ -1771,7 +1768,7 @@ impl fmt::Display for Bytecode_ {
             Bytecode_::CastU8 => write!(f, "CastU8"),
             Bytecode_::CastU64 => write!(f, "CastU64"),
             Bytecode_::CastU128 => write!(f, "CastU128"),
-            Bytecode_::LdByteArray(b) => write!(f, "LdByteArray {}", b),
+            Bytecode_::LdByteArray(b) => write!(f, "LdByteArray 0b{}", hex::encode(b)),
             Bytecode_::LdAddr(a) => write!(f, "LdAddr {}", a),
             Bytecode_::LdTrue => write!(f, "LdTrue"),
             Bytecode_::LdFalse => write!(f, "LdFalse"),
@@ -1786,8 +1783,20 @@ impl fmt::Display for Bytecode_ {
             Bytecode_::FreezeRef => write!(f, "FreezeRef"),
             Bytecode_::MutBorrowLoc(v) => write!(f, "MutBorrowLoc {}", v),
             Bytecode_::ImmBorrowLoc(v) => write!(f, "ImmBorrowLoc {}", v),
-            Bytecode_::MutBorrowField(n, field) => write!(f, "MutBorrowField {}.{}", n, field),
-            Bytecode_::ImmBorrowField(n, field) => write!(f, "ImmBorrowField {}.{}", n, field),
+            Bytecode_::MutBorrowField(n, tys, field) => write!(
+                f,
+                "MutBorrowField {}{}.{}",
+                n,
+                format_type_actuals(tys),
+                field
+            ),
+            Bytecode_::ImmBorrowField(n, tys, field) => write!(
+                f,
+                "ImmBorrowField {}{}.{}",
+                n,
+                format_type_actuals(tys),
+                field
+            ),
             Bytecode_::MutBorrowGlobal(n, tys) => {
                 write!(f, "MutBorrowGlobal {}{}", n, format_type_actuals(tys))
             }
