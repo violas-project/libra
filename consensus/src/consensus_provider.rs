@@ -17,9 +17,9 @@ use libra_config::config::NodeConfig;
 use libra_mempool::ConsensusRequest;
 use libra_types::transaction::SignedTransaction;
 use libra_vm::LibraVM;
-use libradb::LibraDBTrait;
 use state_synchronizer::StateSyncClient;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use storage_interface::DbReader;
 
 /// Public interface to a consensus protocol.
 pub trait ConsensusProvider {
@@ -39,10 +39,10 @@ pub fn make_consensus_provider(
     node_config: &mut NodeConfig,
     network_sender: ConsensusNetworkSender<Vec<SignedTransaction>>,
     network_receiver: ConsensusNetworkEvents<Vec<SignedTransaction>>,
-    executor: Arc<Executor<LibraVM>>,
+    executor: Arc<Mutex<Executor<LibraVM>>>,
     state_sync_client: Arc<StateSyncClient>,
     consensus_to_mempool_sender: mpsc::Sender<ConsensusRequest>,
-    libra_db: Arc<dyn LibraDBTrait>,
+    libra_db: Arc<dyn DbReader>,
 ) -> Box<dyn ConsensusProvider> {
     let storage = Arc::new(StorageWriteProxy::new(node_config, libra_db));
     let txn_manager = Box::new(MempoolProxy::new(consensus_to_mempool_sender));

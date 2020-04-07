@@ -13,7 +13,7 @@ edition = "2018"
 anyhow = "1.0"
 async-trait = "0.1"
 tokio = { version = "0.2.13", features = ["full"] }
-tonic = "0.1"
+tonic = "0.2"
 futures = "0.3.0"
 
 lcs = { path = "../../common/lcs", version = "0.1.0", package = "libra-canonical-serialization" }
@@ -22,6 +22,7 @@ libra-crypto = { path = "../../crypto/crypto", version = "0.1.0" }
 libradb = { path = "../libradb", version = "0.1.0" }
 libra-logger = { path = "../../common/logger", version = "0.1.0" }
 libra-metrics = { path = "../../common/metrics", version = "0.1.0" }
+storage-interface = { path = "../storage-interface", version = "0.1.0" }
 storage-proto = { path = "../storage-proto", version = "0.1.0" }
 libra-types = { path = "../../types", version = "0.1.0" }
 rand = "0.6.5"

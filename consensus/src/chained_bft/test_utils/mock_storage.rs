@@ -1,17 +1,17 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::chained_bft::persistent_liveness_storage::{
-    LedgerRecoveryData, PersistentLivenessStorage, RecoveryData,
+use crate::chained_bft::{
+    epoch_manager::LivenessStorageData,
+    persistent_liveness_storage::{
+        LedgerRecoveryData, PersistentLivenessStorage, RecoveryData, RootMetadata,
+    },
 };
-
-use crate::chained_bft::epoch_manager::LivenessStorageData;
 use anyhow::Result;
 use consensus_types::{
     block::Block, common::Payload, quorum_cert::QuorumCert,
     timeout_certificate::TimeoutCertificate, vote::Vote,
 };
-use executor_types::ExecutedTrees;
 use libra_crypto::HashValue;
 use libra_types::{ledger_info::LedgerInfo, validator_set::ValidatorSet};
 use std::{
@@ -19,6 +19,7 @@ use std::{
     marker::PhantomData,
     sync::{Arc, Mutex},
 };
+use storage_interface::DbReader;
 
 pub struct MockSharedStorage<T> {
     // Safety state
@@ -112,8 +113,8 @@ impl<T: Payload> MockStorage<T> {
             self.shared_storage.last_vote.lock().unwrap().clone(),
             ledger_recovery_data,
             blocks,
+            RootMetadata::new_empty(),
             quorum_certs,
-            ExecutedTrees::new_empty(),
             self.shared_storage
                 .highest_timeout_certificate
                 .lock()
@@ -217,6 +218,10 @@ impl<T: Payload> PersistentLivenessStorage<T> for MockStorage<T> {
             .replace(highest_timeout_certificate);
         Ok(())
     }
+
+    fn libra_db(&self) -> Arc<dyn DbReader> {
+        unimplemented!()
+    }
 }
 
 /// A storage that ignores any requests, used in the tests that don't care about the storage.
@@ -262,8 +267,8 @@ impl<T: Payload> PersistentLivenessStorage<T> for EmptyStorage<T> {
             None,
             self.recover_from_ledger(),
             vec![],
+            RootMetadata::new_empty(),
             vec![],
-            ExecutedTrees::new_empty(),
             None,
         ) {
             Ok(recovery_data) => LivenessStorageData::RecoveryData(recovery_data),
@@ -273,7 +278,12 @@ impl<T: Payload> PersistentLivenessStorage<T> for EmptyStorage<T> {
             }
         }
     }
+
     fn save_highest_timeout_cert(&self, _: TimeoutCertificate) -> Result<()> {
         Ok(())
+    }
+
+    fn libra_db(&self) -> Arc<dyn DbReader> {
+        unimplemented!()
     }
 }

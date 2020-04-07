@@ -119,6 +119,7 @@ data "template_file" "user_data" {
   template = file("templates/ec2_user_data.sh")
 
   vars = {
+    persistent       = var.persist_libra_data
     ecs_cluster      = aws_ecs_cluster.testnet.name
     host_log_path    = "/data/libra/libra.log"
     host_structlog_path   = "/data/libra/libra_structlog.log"
@@ -186,10 +187,6 @@ locals {
   logstash_config        = "input { file { path => '${var.structlog_path}'\\n codec => 'json'\\n}}\\n filter {  json {  \\nsource => 'message'\\n}}\\n output {  amazon_es { \\nhosts => ['https://${local.aws_elasticsearch_host}']\\nregion => 'us-west-2'\\nindex => 'validator-logs-%%{+YYYY.MM.dd}'\\n}}"
 }
 
-data "template_file" "validator_config" {
-  template = file("templates/validator.config.toml")
-}
-
 data "template_file" "ecs_task_definition" {
   count    = var.num_validators
   template = file("templates/validator.json")
@@ -199,11 +196,10 @@ data "template_file" "ecs_task_definition" {
     image_version                 = local.override_image_versions == [] ? local.image_version : local.override_image_versions[count.index % length(local.override_image_versions)]
     cpu                           = (var.enable_logstash ? local.cpu_by_instance[var.validator_type] - 584 : local.cpu_by_instance[var.validator_type]) - 512
     mem                           = (var.enable_logstash ? local.mem_by_instance[var.validator_type] - 1024 : local.mem_by_instance[var.validator_type]) - 256
-    cfg_base_config               = jsonencode(data.template_file.validator_config.rendered)
     cfg_listen_addr               = var.validator_use_public_ip == true ? element(aws_instance.validator.*.public_ip, count.index) : element(aws_instance.validator.*.private_ip, count.index)
     cfg_node_index                = count.index
     cfg_num_validators            = var.cfg_num_validators_override == 0 ? var.num_validators : var.cfg_num_validators_override
-    cfg_num_validators_in_genesis = var.num_validators_in_genesis
+    cfg_num_validators_in_genesis = var.num_validators_in_genesis == 0? var.num_validators : var.num_validators_in_genesis
     cfg_seed                      = var.config_seed
     cfg_seed_peer_ip              = local.seed_peer_ip
 
@@ -222,6 +218,10 @@ data "template_file" "ecs_task_definition" {
     logstash_config            = local.logstash_config
     safety_rules_image         = local.safety_rules_image_repo
     safety_rules_image_version = local.safety_rules_image_version
+    push_metrics_endpoint      = "http://${aws_instance.monitoring.private_ip}:9092/metrics/job/safety_rules/role/validator/peer_id/val-${count.index}"
+    cfg_vault_addr             = "http://${aws_instance.vault.private_ip}:8200"
+    cfg_vault_namespace        = "val-${count.index}"
+    use_vault                  = var.safety_rules_use_vault
     structlog_path             = var.log_to_file || var.enable_logstash ? var.structlog_path : ""
   }
 }
@@ -238,7 +238,7 @@ resource "aws_ecs_task_definition" "validator" {
 
   volume {
     name      = "libra-data"
-    host_path = "/data/libra"
+    host_path = var.persist_libra_data ? "/data/libra" : ""
   }
 
   placement_constraints {
