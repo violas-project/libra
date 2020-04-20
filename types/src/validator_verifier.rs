@@ -1,7 +1,7 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{account_address::AccountAddress, validator_set::ValidatorSet};
+use crate::{account_address::AccountAddress, on_chain_config::ValidatorSet};
 use anyhow::{ensure, Result};
 use libra_crypto::{
     ed25519::{Ed25519PublicKey, Ed25519Signature},
@@ -281,12 +281,12 @@ impl From<&ValidatorSet> for ValidatorVerifier {
     fn from(validator_set: &ValidatorSet) -> Self {
         ValidatorVerifier::new(validator_set.payload().iter().fold(
             BTreeMap::new(),
-            |mut map, key| {
+            |mut map, validator| {
                 map.insert(
-                    key.account_address().clone(),
+                    validator.account_address().clone(),
                     ValidatorConsensusInfo::new(
-                        key.consensus_public_key().clone(),
-                        key.consensus_voting_power(),
+                        validator.consensus_public_key().clone(),
+                        validator.consensus_voting_power(),
                     ),
                 );
                 map
@@ -298,11 +298,15 @@ impl From<&ValidatorSet> for ValidatorVerifier {
 #[cfg(any(test, feature = "fuzzing"))]
 impl From<&ValidatorVerifier> for ValidatorSet {
     fn from(verifier: &ValidatorVerifier) -> Self {
+        use libra_crypto::test_utils::TEST_SEED;
+        use rand::prelude::*;
+        let mut rng = StdRng::from_seed(TEST_SEED);
         ValidatorSet::new(
             verifier
                 .get_ordered_account_addresses_iter()
                 .map(|addr| {
-                    crate::validator_info::ValidatorInfo::new_with_random_network_keys(
+                    crate::validator_info::ValidatorInfo::new_with_test_network_keys(
+                        &mut rng,
                         addr,
                         verifier.get_public_key(&addr).unwrap(),
                         verifier.get_voting_power(&addr).unwrap(),

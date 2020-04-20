@@ -23,16 +23,16 @@ use libra_crypto::{
 };
 use libra_types::{
     ledger_info::LedgerInfoWithSignatures,
+    on_chain_config::ValidatorSet,
     proof::{
         definition::LeafCount, position::Position, AccumulatorConsistencyProof,
         TransactionAccumulatorProof, TransactionAccumulatorRangeProof,
     },
     transaction::{TransactionInfo, Version},
-    validator_set::ValidatorSet,
 };
 use schemadb::{ReadOptions, SchemaIterator, DB};
 use std::{ops::Deref, sync::Arc};
-use storage_proto::{StartupInfo, TreeState};
+use storage_interface::{StartupInfo, TreeState};
 
 pub(crate) struct LedgerStore {
     db: Arc<DB>,
@@ -50,7 +50,7 @@ impl LedgerStore {
             let mut iter = db
                 .iter::<LedgerInfoSchema>(ReadOptions::default())
                 .expect("Constructing iterator should work.");
-            iter.seek_to_last().expect("Unable to seek to last entry!");
+            iter.seek_to_last();
             iter.next()
                 .transpose()
                 .expect("Reading latest ledger info from DB should work.")
@@ -229,7 +229,7 @@ impl LedgerStore {
         let mut iter = self
             .db
             .iter::<TransactionInfoSchema>(ReadOptions::default())?;
-        iter.seek_to_last()?;
+        iter.seek_to_last();
         iter.next().transpose()
     }
 

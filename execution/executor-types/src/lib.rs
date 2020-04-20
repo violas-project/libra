@@ -11,13 +11,13 @@ use libra_types::{
     account_address::AccountAddress,
     account_state_blob::AccountStateBlob,
     contract_event::ContractEvent,
+    on_chain_config::ValidatorSet,
     proof::{accumulator::InMemoryAccumulator, SparseMerkleProof},
     transaction::{TransactionStatus, Version},
-    validator_set::ValidatorSet,
 };
 use scratchpad::{ProofRead, SparseMerkleTree};
 use std::{cmp::max, collections::HashMap, sync::Arc};
-use storage_proto::TreeState;
+use storage_interface::TreeState;
 
 /// A structure that summarizes the result of the execution needed for consensus to agree on.
 /// The execution is responsible for generating the ID of the new state, which is returned in the

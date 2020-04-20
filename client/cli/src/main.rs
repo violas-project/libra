@@ -32,7 +32,7 @@ struct Args {
     /// Path to the generated keypair for the faucet account. The faucet account can be used to
     /// mint coins. If not passed, a new keypair will be generated for
     /// you and placed in a temporary directory.
-    /// To manually generate a keypair, use generate-keypair:
+    /// To manually generate a keypair, use generate-key:
     /// `cargo run -p generate-keypair -- -o <output_file_path>`
     #[structopt(short = "m", long = "faucet-key-file-path")]
     pub faucet_account_file: Option<String>,
@@ -100,7 +100,7 @@ fn main() {
     .expect("Failed to construct client.");
 
     // Test connection to validator
-    let latest_li = client_proxy
+    let block_metadata = client_proxy
         .test_validator_connection()
         .unwrap_or_else(|e| {
             panic!(
@@ -110,10 +110,8 @@ fn main() {
         });
     let ledger_info_str = format!(
         "latest version = {}, timestamp = {}",
-        latest_li.ledger_info().version(),
-        DateTime::<Utc>::from(
-            UNIX_EPOCH + Duration::from_micros(latest_li.ledger_info().timestamp_usecs())
-        )
+        block_metadata.version,
+        DateTime::<Utc>::from(UNIX_EPOCH + Duration::from_micros(block_metadata.timestamp))
     );
     let cli_info = format!(
         "Connected to validator at: {}, {}",

@@ -2,19 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use admission_control_service::admission_control_service::AdmissionControlService;
-use consensus::consensus_provider::{make_consensus_provider, ConsensusProvider};
+use consensus::consensus_provider::start_consensus;
 use debug_interface::{
     node_debug_service::NodeDebugService,
     proto::node_debug_interface_server::NodeDebugInterfaceServer,
 };
-use executor::{db_bootstrapper::maybe_bootstrap_db, Executor};
+use executor::{db_bootstrapper::bootstrap_db_if_empty, Executor};
 use futures::{channel::mpsc::channel, executor::block_on};
-use libra_config::config::{NetworkConfig, NodeConfig, RoleType};
+use libra_config::{
+    config::{NetworkConfig, NodeConfig, RoleType},
+    utils::get_genesis_txn,
+};
 use libra_json_rpc::bootstrap_from_config as bootstrap_rpc;
 use libra_logger::prelude::*;
 use libra_mempool::MEMPOOL_SUBSCRIBED_CONFIGS;
 use libra_metrics::metric_server;
-use libra_types::event_subscription::ReconfigSubscription;
+use libra_types::on_chain_config::ON_CHAIN_CONFIG_REGISTRY;
 use libra_vm::LibraVM;
 use network::validator_network::network_builder::{NetworkBuilder, TransportType};
 use state_synchronizer::StateSynchronizer;
@@ -25,8 +28,10 @@ use std::{
     thread,
     time::Instant,
 };
-use storage_client::{StorageReadServiceClient, StorageWriteServiceClient};
+use storage_client::SyncStorageClient;
+use storage_interface::DbReader;
 use storage_service::{init_libra_db, start_storage_service_with_db};
+use subscription_service::ReconfigSubscription;
 use tokio::runtime::{Builder, Runtime};
 
 const AC_SMP_CHANNEL_BUFFER_SIZE: usize = 1_024;
@@ -38,25 +43,14 @@ pub struct LibraHandle {
     _mempool: Runtime,
     _state_synchronizer: StateSynchronizer,
     _network_runtimes: Vec<Runtime>,
-    consensus: Option<Box<dyn ConsensusProvider>>,
+    _consensus_runtime: Option<Runtime>,
     _storage: Runtime,
     _debug: Runtime,
 }
 
-impl Drop for LibraHandle {
-    fn drop(&mut self) {
-        if let Some(consensus) = &mut self.consensus {
-            consensus.stop();
-        }
-    }
-}
-
 fn setup_executor(config: &NodeConfig) -> Arc<Mutex<Executor<LibraVM>>> {
-    let storage_read_client = Arc::new(StorageReadServiceClient::new(&config.storage.address));
-    let storage_write_client = Arc::new(StorageWriteServiceClient::new(&config.storage.address));
     Arc::new(Mutex::new(Executor::new(
-        storage_read_client,
-        storage_write_client,
+        SyncStorageClient::new(&config.storage.address).into(),
     )))
 }
 
@@ -108,17 +102,17 @@ pub fn setup_network(config: &mut NetworkConfig, role: RoleType) -> (Runtime, Ne
             .network_keypairs
             .as_mut()
             .expect("Network keypairs are not defined");
-        let signing_keys = &mut network_keypairs.signing_keys;
-        let identity_keys = &mut network_keypairs.identity_keys;
-
-        let signing_private = signing_keys
+        let signing_keypair = &mut network_keypairs.signing_keypair;
+        let signing_private = signing_keypair
             .take_private()
             .expect("Failed to take Network signing private key, key absent or already read");
-        let signing_public = signing_keys.public().clone();
-        let identity_private = identity_keys
+        let signing_public = signing_keypair.public_key();
+
+        let identity_key = network_keypairs
+            .identity_keypair
             .take_private()
-            .expect("Failed to take Network identity private key, key absent or already read");
-        let identity_public = identity_keys.public().clone();
+            .expect("identity key should be present");
+
         let trusted_peers = if role == RoleType::Validator {
             // for validators, trusted_peers is empty will be populated from consensus
             HashMap::new()
@@ -126,33 +120,25 @@ pub fn setup_network(config: &mut NetworkConfig, role: RoleType) -> (Runtime, Ne
             config.network_peers.peers.clone()
         };
         network_builder
-            .transport(TransportType::TcpNoise(Some((
-                identity_private,
-                identity_public,
-            ))))
+            .transport(TransportType::TcpNoise(Some(identity_key)))
             .connectivity_check_interval_ms(config.connectivity_check_interval_ms)
             .seed_peers(seed_peers)
             .trusted_peers(trusted_peers)
-            .signing_keys((signing_private, signing_public))
+            .signing_keypair((signing_private, signing_public))
             .discovery_interval_ms(config.discovery_interval_ms)
             .add_discovery();
     } else if config.enable_noise {
-        let identity_keys = &mut config
+        let identity_key = config
             .network_keypairs
             .as_mut()
             .expect("Network keypairs are not defined")
-            .identity_keys;
-        let identity_private = identity_keys
+            .identity_keypair
             .take_private()
-            .expect("Failed to take Network identity private key, key absent or already read");
-        let identity_public = identity_keys.public().clone();
+            .expect("identity key should be present");
         // Even if a network end-point operates without remote authentication, it might want to prove
         // its identity to another peer it connects to. For this, we use TCP + Noise but without
         // enforcing a trusted peers set.
-        network_builder.transport(TransportType::TcpNoise(Some((
-            identity_private,
-            identity_public,
-        ))));
+        network_builder.transport(TransportType::TcpNoise(Some(identity_key)));
     } else {
         network_builder.transport(TransportType::Tcp);
     }
@@ -170,9 +156,10 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
         .expect("Building rayon global thread pool should work.");
 
     let mut instant = Instant::now();
-    let libra_db = init_libra_db(&node_config);
+    let (libra_db, db_rw) = init_libra_db(&node_config);
     let storage = start_storage_service_with_db(&node_config, Arc::clone(&libra_db));
-    maybe_bootstrap_db::<LibraVM>(node_config).expect("Db-bootstrapper should not fail.");
+    bootstrap_db_if_empty::<LibraVM>(&db_rw, get_genesis_txn(&node_config).unwrap())
+        .expect("Db-bootstrapper should not fail.");
 
     debug!(
         "Storage service started in {} ms",
@@ -191,6 +178,10 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
     let (mempool_reconfig_subscription, mempool_reconfig_events) =
         ReconfigSubscription::subscribe(MEMPOOL_SUBSCRIBED_CONFIGS);
     reconfig_subscriptions.push(mempool_reconfig_subscription);
+    // consensus has to subscribe to ALL on-chain configs
+    let (consensus_reconfig_subscription, consensus_reconfig_events) =
+        ReconfigSubscription::subscribe(ON_CHAIN_CONFIG_REGISTRY);
+    reconfig_subscriptions.push(consensus_reconfig_subscription);
 
     if let Some(network) = node_config.validator_network.as_mut() {
         let (runtime, mut network_builder) = setup_network(network, RoleType::Validator);
@@ -227,6 +218,7 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
     let state_synchronizer = StateSynchronizer::bootstrap(
         state_sync_network_handles,
         state_sync_to_mempool_sender,
+        Arc::clone(&libra_db) as Arc<dyn DbReader>,
         Arc::clone(&executor),
         &node_config,
         reconfig_subscriptions,
@@ -237,7 +229,7 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
         AdmissionControlService::bootstrap(&node_config, mp_client_sender.clone());
     let rpc_runtime = bootstrap_rpc(&node_config, libra_db.clone(), mp_client_sender);
 
-    let mut consensus = None;
+    let mut consensus_runtime = None;
     let (consensus_to_mempool_sender, consensus_requests) = channel(INTRA_NODE_CHANNEL_BUFFER_SIZE);
 
     instant = Instant::now();
@@ -278,7 +270,7 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
 
         // Initialize and start consensus.
         instant = Instant::now();
-        let mut consensus_provider = make_consensus_provider(
+        consensus_runtime = Some(start_consensus(
             node_config,
             consensus_network_sender,
             consensus_network_events,
@@ -286,11 +278,8 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
             state_synchronizer.create_client(),
             consensus_to_mempool_sender,
             libra_db,
-        );
-        consensus_provider
-            .start()
-            .expect("Failed to start consensus. Can't proceed.");
-        consensus = Some(consensus_provider);
+            consensus_reconfig_events,
+        ));
         debug!("Consensus started in {} ms", instant.elapsed().as_millis());
     }
 
@@ -311,7 +300,7 @@ pub fn setup_environment(node_config: &mut NodeConfig) -> LibraHandle {
         _rpc: rpc_runtime,
         _mempool: mempool,
         _state_synchronizer: state_synchronizer,
-        consensus,
+        _consensus_runtime: consensus_runtime,
         _storage: storage,
         _debug: debug_if,
     }

@@ -95,17 +95,12 @@ use mirai_annotations::*;
 use once_cell::sync::Lazy;
 #[cfg(any(test, feature = "fuzzing"))]
 use proptest_derive::Arbitrary;
-use rand::{rngs::EntropyRng, Rng};
+use rand::{rngs::OsRng, Rng};
 use serde::{de, ser};
 use std::{self, convert::AsRef, fmt};
 use tiny_keccak::{Hasher, Sha3};
 
 const LIBRA_HASH_SUFFIX: &[u8] = b"@@$$LIBRA$$@@";
-
-#[cfg(test)]
-#[path = "unit_tests/hash_test.rs"]
-mod hash_test;
-
 const SHORT_STRING_LENGTH: usize = 4;
 
 /// Output value of our hash function. Intentionally opaque for safety and modularity.
@@ -161,7 +156,7 @@ impl HashValue {
 
     /// Create a cryptographically random instance.
     pub fn random() -> Self {
-        let mut rng = EntropyRng::new();
+        let mut rng = OsRng;
         let hash: [u8; HashValue::LENGTH] = rng.gen();
         HashValue { hash }
     }
@@ -249,7 +244,7 @@ impl HashValue {
 
     /// Returns first SHORT_STRING_LENGTH bytes as String in hex
     pub fn short_str(&self) -> String {
-        hex::encode(&self.hash[0..SHORT_STRING_LENGTH])
+        hex::encode(&self.hash[..SHORT_STRING_LENGTH])
     }
 
     /// Full hex representation of a given hash value.
@@ -275,7 +270,8 @@ impl ser::Serialize for HashValue {
             // In order to preserve the Serde data model and help analysis tools,
             // make sure to wrap our value in a container with the same name
             // as the original type.
-            serializer.serialize_newtype_struct("HashValue", &self.hash[..])
+            serializer
+                .serialize_newtype_struct("HashValue", serde_bytes::Bytes::new(&self.hash[..]))
         }
     }
 }

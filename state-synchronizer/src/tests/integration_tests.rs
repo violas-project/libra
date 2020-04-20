@@ -10,15 +10,15 @@ use executor_types::ExecutedTrees;
 use futures::executor::block_on;
 use libra_config::config::RoleType;
 use libra_crypto::{
-    ed25519::Ed25519PrivateKey, hash::ACCUMULATOR_PLACEHOLDER_HASH, test_utils::TEST_SEED,
-    x25519::X25519StaticPrivateKey, PrivateKey, Uniform,
+    ed25519::Ed25519PrivateKey, hash::ACCUMULATOR_PLACEHOLDER_HASH, test_utils::TEST_SEED, x25519,
+    PrivateKey, Uniform,
 };
 use libra_mempool::mocks::MockSharedMempool;
 use libra_types::{
     contract_event::ContractEvent, ledger_info::LedgerInfoWithSignatures,
-    proof::TransactionListProof, transaction::TransactionListWithProof,
-    validator_change::ValidatorChangeProof, validator_info::ValidatorInfo,
-    validator_set::ValidatorSet, validator_signer::ValidatorSigner,
+    on_chain_config::ValidatorSet, proof::TransactionListProof,
+    transaction::TransactionListWithProof, validator_change::ValidatorChangeProof,
+    validator_info::ValidatorInfo, validator_signer::ValidatorSigner,
     validator_verifier::random_validator_verifier, waypoint::Waypoint,
 };
 use network::{
@@ -51,13 +51,12 @@ impl MockExecutorProxy {
     }
 }
 
-#[async_trait::async_trait]
 impl ExecutorProxyTrait for MockExecutorProxy {
-    async fn get_local_storage_state(&self) -> Result<SynchronizerState> {
+    fn get_local_storage_state(&self) -> Result<SynchronizerState> {
         Ok(self.storage.read().unwrap().get_local_storage_state())
     }
 
-    async fn execute_chunk(
+    fn execute_chunk(
         &mut self,
         txn_list_with_proof: TransactionListWithProof,
         ledger_info_with_sigs: LedgerInfoWithSignatures,
@@ -72,7 +71,7 @@ impl ExecutorProxyTrait for MockExecutorProxy {
         Ok(())
     }
 
-    async fn get_chunk(
+    fn get_chunk(
         &self,
         known_version: u64,
         limit: u64,
@@ -93,23 +92,19 @@ impl ExecutorProxyTrait for MockExecutorProxy {
         (self.handler)(txns_with_proof)
     }
 
-    async fn get_epoch_proof(
-        &self,
-        start_epoch: u64,
-        _end_epoch: u64,
-    ) -> Result<ValidatorChangeProof> {
+    fn get_epoch_proof(&self, start_epoch: u64, _end_epoch: u64) -> Result<ValidatorChangeProof> {
         Ok(self.storage.read().unwrap().get_epoch_changes(start_epoch))
     }
 
-    async fn get_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures> {
+    fn get_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures> {
         self.storage.read().unwrap().get_ledger_info(version)
     }
 
-    async fn load_on_chain_configs(&mut self) -> Result<()> {
+    fn load_on_chain_configs(&mut self) -> Result<()> {
         Ok(())
     }
 
-    async fn publish_on_chain_config_updates(&mut self, _events: Vec<ContractEvent>) -> Result<()> {
+    fn publish_on_chain_config_updates(&mut self, _events: Vec<ContractEvent>) -> Result<()> {
         Ok(())
     }
 }
@@ -140,12 +135,12 @@ impl SynchronizerEnv {
 
         // Setup signing public keys.
         let mut rng = StdRng::from_seed(TEST_SEED);
-        let signing_keys: Vec<_> = (0..count)
+        let signing_private_keys: Vec<_> = (0..count)
             .map(|_| Ed25519PrivateKey::generate(&mut rng))
             .collect();
         // Setup identity public keys.
-        let identity_keys: Vec<_> = (0..count)
-            .map(|_| X25519StaticPrivateKey::generate(&mut rng))
+        let identity_private_keys: Vec<_> = (0..count)
+            .map(|_| x25519::PrivateKey::for_test(&mut rng))
             .collect();
 
         let mut validators_keys = vec![];
@@ -156,12 +151,12 @@ impl SynchronizerEnv {
                 signer.author(),
                 signer.public_key(),
                 voting_power,
-                signing_keys[idx].public_key(),
-                identity_keys[idx].public_key(),
+                signing_private_keys[idx].public_key(),
+                identity_private_keys[idx].public_key(),
             );
             validators_keys.push(validator_info);
         }
-        (signers, signing_keys, validators_keys)
+        (signers, signing_private_keys, validators_keys)
     }
 
     // Moves peer 0 to the next epoch. Note that other peers are not going to be able to discover
@@ -180,7 +175,7 @@ impl SynchronizerEnv {
                     signers[idx].public_key(),
                     validator_keys.consensus_voting_power(),
                     validator_keys.network_signing_public_key().clone(),
-                    validator_keys.network_identity_public_key().clone(),
+                    validator_keys.network_identity_public_key(),
                 )
             })
             .collect::<Vec<ValidatorInfo>>();
@@ -233,7 +228,7 @@ impl SynchronizerEnv {
                     *public_keys.account_address(),
                     NetworkPublicKeys {
                         signing_public_key: public_keys.network_signing_public_key().clone(),
-                        identity_public_key: public_keys.network_identity_public_key().clone(),
+                        identity_public_key: public_keys.network_identity_public_key(),
                     },
                 )
             })
@@ -255,7 +250,7 @@ impl SynchronizerEnv {
             RoleType::Validator,
         );
         network_builder
-            .signing_keys((
+            .signing_keypair((
                 self.network_signers[new_peer_idx].clone(),
                 self.public_keys[new_peer_idx]
                     .network_signing_public_key()
@@ -293,6 +288,7 @@ impl SynchronizerEnv {
         )));
         let (mempool_channel, mempool_requests) = futures::channel::mpsc::channel(1_024);
         let synchronizer = StateSynchronizer::bootstrap_with_executor_proxy(
+            Runtime::new().unwrap(),
             vec![(sender, events)],
             mempool_channel,
             role,

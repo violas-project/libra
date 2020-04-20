@@ -31,7 +31,7 @@
 //!
 //! [`ConnectivityManager`]: ../../connectivity_manager
 use crate::{
-    connectivity_manager::ConnectivityRequest,
+    connectivity_manager::{ConnectivityRequest, DiscoverySource},
     counters,
     error::{NetworkError, NetworkErrorKind},
     peer_manager::{ConnectionRequestSender, PeerManagerRequestSender},
@@ -55,7 +55,7 @@ use libra_logger::prelude::*;
 use libra_security_logger::{security_log, SecurityEvent};
 use libra_types::PeerId;
 use parity_multiaddr::Multiaddr;
-use rand::{rngs::SmallRng, FromEntropy, Rng};
+use rand::{rngs::SmallRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::{
     cmp::max,
@@ -376,6 +376,7 @@ where
 
                         self.conn_mgr_reqs_tx
                             .send(ConnectivityRequest::UpdateAddresses(
+                                DiscoverySource::Gossip,
                                 note.as_note().peer_id,
                                 peer_addrs,
                             ))

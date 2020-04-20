@@ -138,11 +138,11 @@ locals {
 }
 
 resource "aws_ebs_snapshot" "restore_snapshot" {
-  count     = var.restore_vol_id == "" ? 0 : 1
-  volume_id = var.restore_vol_id
+  count     = length(var.restore_vol_ids) == 0 ? 0 : var.num_validators
+  volume_id   = length(var.restore_vol_ids) == 0 ? "" : var.restore_vol_ids[count.index]
 
   tags = {
-    Name = "${terraform.workspace}-restore-snap"
+    Name = "${terraform.workspace}-validator-${count.index}-restore-snap"
   }
 }
 
@@ -156,6 +156,7 @@ resource "aws_instance" "validator" {
   )
   depends_on                  = [aws_main_route_table_association.testnet, aws_iam_role_policy.ecs_extra]
   vpc_security_group_ids      = [aws_security_group.validator.id]
+  private_ip                  = length(var.override_validator_ips) == 0 ? null : var.override_validator_ips[count.index]
   associate_public_ip_address = local.instance_public_ip
   key_name                    = aws_key_pair.libra.key_name
   iam_instance_profile        = aws_iam_instance_profile.ecsInstanceRole.name
@@ -166,8 +167,8 @@ resource "aws_instance" "validator" {
     content {
       device_name = "/dev/xvdb"
       volume_type = "io1"
-      volume_size = var.restore_vol_id == "" ? var.validator_ebs_size : aws_ebs_snapshot.restore_snapshot.0.volume_size
-      snapshot_id = var.restore_vol_id == "" ? "" : aws_ebs_snapshot.restore_snapshot.0.id
+      volume_size = length(var.restore_vol_ids) == 0 ? var.validator_ebs_size : aws_ebs_snapshot.restore_snapshot[count.index].volume_size
+      snapshot_id = length(var.restore_vol_ids) == 0 ? "" : aws_ebs_snapshot.restore_snapshot[count.index].id
       iops        = var.validator_ebs_size * 50 # max 50iops/gb
     }
   }

@@ -14,6 +14,7 @@ use libra_types::{
     event::EventHandle,
     get_with_proof::{RequestItem, ResponseItem},
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
+    move_resource::MoveResource,
     proof::{AccumulatorConsistencyProof, SparseMerkleProof, SparseMerkleRangeProof},
     proto::types::{
         request_item::RequestedItems, response_item::ResponseItems, AccountStateWithProof,
@@ -33,9 +34,9 @@ use rand::{
 };
 use std::{collections::BTreeMap, convert::TryFrom};
 use storage_client::StorageRead;
+use storage_interface::StartupInfo;
 use storage_proto::{
     BackupAccountStateResponse, BackupTransactionInfoResponse, BackupTransactionResponse,
-    StartupInfo,
 };
 
 /// This is a mock of the storage read client used in tests.
@@ -243,7 +244,7 @@ fn get_mock_account_state_blob() -> AccountStateBlob {
 
     let mut account_state = AccountState::default();
     account_state.insert(
-        libra_types::account_config::ACCOUNT_RESOURCE_PATH.to_vec(),
+        libra_types::account_config::AccountResource::resource_path(),
         lcs::to_bytes(&account_resource).unwrap(),
     );
 
@@ -255,7 +256,7 @@ fn get_mock_txn_data(
     start_seq: u64,
     end_seq: u64,
 ) -> Vec<libra_types::proto::types::Transaction> {
-    let mut seed_rng = OsRng::new().expect("can't access OsRng");
+    let mut seed_rng = OsRng;
     let seed_buf: [u8; 32] = seed_rng.gen();
     let mut rng = StdRng::from_seed(seed_buf);
     let priv_key = Ed25519PrivateKey::generate(&mut rng);

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::executor_proxy::{ExecutorProxy, ExecutorProxyTrait};
+use executor::BlockExecutor;
 use executor_utils::{
     create_storage_service_and_executor,
     test_helpers::{
@@ -16,15 +17,15 @@ use libra_crypto::{
 };
 use libra_types::{
     account_config::{association_address, lbr_type_tag},
-    event_subscription::ReconfigSubscription,
-    on_chain_config::{OnChainConfig, VMPublishingOption},
+    on_chain_config::{OnChainConfig, VMConfig, VMPublishingOption},
     transaction::authenticator::AuthenticationKey,
 };
 use std::sync::{Arc, Mutex};
 use stdlib::transaction_scripts::StdlibScript;
+use subscription_service::ReconfigSubscription;
 use transaction_builder::{
     encode_block_prologue_script, encode_publishing_option_script,
-    encode_rotate_consensus_pubkey_script, encode_transfer_script,
+    encode_rotate_consensus_pubkey_script, encode_transfer_with_metadata_script,
 };
 
 // TODO test for subscription with multiple subscribed configs once there are >1 on-chain configs
@@ -32,22 +33,32 @@ use transaction_builder::{
 fn test_on_chain_config_pub_sub() {
     let mut rt = tokio::runtime::Runtime::new().unwrap();
     // set up reconfig subscription
-    let subscribed_configs = &[VMPublishingOption::CONFIG_ID];
+    let subscribed_configs = &[VMConfig::CONFIG_ID];
     let (subscription, mut reconfig_receiver) = ReconfigSubscription::subscribe(subscribed_configs);
 
     let (mut config, genesis_key) = config_builder::test_config();
-    let (_storage_server_handle, executor) = create_storage_service_and_executor(&config);
+    let (db, _handle, executor) = create_storage_service_and_executor(&config);
     let executor = Arc::new(Mutex::new(executor));
-    let mut executor_proxy = ExecutorProxy::new(executor.clone(), &config, vec![subscription]);
+    let mut executor_proxy = ExecutorProxy::new(db, executor.clone(), vec![subscription]);
+
+    assert!(
+        reconfig_receiver
+            .select_next_some()
+            .now_or_never()
+            .is_some(),
+        "expect initial config notification",
+    );
 
     // start state sync with initial loading of on-chain configs
-    rt.block_on(executor_proxy.load_on_chain_configs())
+    executor_proxy
+        .load_on_chain_configs()
         .expect("failed to load on-chain configs");
 
     ////////////////////////////////////////////////////////
     // Case 1: don't publish for no reconfiguration event //
     ////////////////////////////////////////////////////////
-    rt.block_on(executor_proxy.publish_on_chain_config_updates(vec![]))
+    executor_proxy
+        .publish_on_chain_config_updates(vec![])
         .expect("failed to publish on-chain configs");
 
     assert_eq!(
@@ -71,7 +82,7 @@ fn test_on_chain_config_pub_sub() {
         .unwrap();
 
     let validator_privkey = keys.take_private().unwrap();
-    let validator_pubkey = keys.public().clone();
+    let validator_pubkey = keys.public_key();
     let auth_key = AuthenticationKey::ed25519(&validator_pubkey);
     let validator_auth_key_prefix = auth_key.prefix().to_vec();
 
@@ -120,13 +131,14 @@ fn test_on_chain_config_pub_sub() {
         !reconfig_events.is_empty(),
         "expected reconfig events from executor commit"
     );
-    rt.block_on(executor_proxy.publish_on_chain_config_updates(reconfig_events))
+    executor_proxy
+        .publish_on_chain_config_updates(reconfig_events)
         .expect("failed to publish on-chain configs");
 
     let receive_reconfig = async {
         let payload = reconfig_receiver.select_next_some().await;
-        let received_config = payload.get::<VMPublishingOption>().unwrap();
-        assert_eq!(received_config, vm_publishing_option);
+        let received_config = payload.get::<VMConfig>().unwrap();
+        assert_eq!(received_config.publishing_option, vm_publishing_option);
     };
 
     rt.block_on(receive_reconfig);
@@ -140,11 +152,12 @@ fn test_on_chain_config_pub_sub() {
         /* sequence_number = */ 2,
         genesis_key.clone(),
         genesis_key.public_key(),
-        Some(encode_transfer_script(
+        Some(encode_transfer_with_metadata_script(
             lbr_type_tag(),
             &validator_account,
             validator_auth_key_prefix,
             1_000_000,
+            vec![],
         )),
     );
 
@@ -187,7 +200,8 @@ fn test_on_chain_config_pub_sub() {
         "expected reconfig events from executor commit"
     );
 
-    rt.block_on(executor_proxy.publish_on_chain_config_updates(reconfig_events))
+    executor_proxy
+        .publish_on_chain_config_updates(reconfig_events)
         .expect("failed to publish on-chain configs");
 
     assert_eq!(

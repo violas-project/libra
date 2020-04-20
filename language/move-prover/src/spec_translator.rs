@@ -6,15 +6,15 @@
 use std::{cell::RefCell, collections::BTreeMap};
 
 use spec_lang::{
-    env::{FieldId, FunctionEnv, Loc, ModuleEnv, ModuleId, NodeId, SpecFunId, StructEnv, StructId},
+    env::{FieldId, Loc, ModuleEnv, ModuleId, NodeId, SpecFunId, StructEnv, StructId},
     ty::{PrimitiveType, Type},
 };
 
 use crate::{
     boogie_helpers::{
-        boogie_declare_global, boogie_field_name, boogie_local_type, boogie_spec_fun_name,
-        boogie_spec_var_name, boogie_struct_name, boogie_type_value, boogie_well_formed_expr,
-        WellFormedMode,
+        boogie_declare_global, boogie_field_name, boogie_global_declarator, boogie_local_type,
+        boogie_spec_fun_name, boogie_spec_var_name, boogie_struct_name, boogie_type_value,
+        boogie_well_formed_expr, WellFormedMode,
     },
     code_writer::CodeWriter,
 };
@@ -24,11 +24,18 @@ use spec_lang::{
     env::GlobalEnv,
     symbol::Symbol,
 };
-use vm::file_format::CodeOffset;
+use stackless_bytecode_generator::{
+    function_target::FunctionTarget, stackless_bytecode::SpecBlockId,
+};
+
+enum SpecEnv<'env> {
+    Module(&'env ModuleEnv<'env>),
+    Function(&'env FunctionTarget<'env>),
+}
 
 pub struct SpecTranslator<'env> {
     /// The module in which context translation happens.
-    module_env: &'env ModuleEnv<'env>,
+    spec_env: SpecEnv<'env>,
     /// The code writer.
     writer: &'env CodeWriter,
     /// Whether the translation context supports native `old`,
@@ -44,6 +51,24 @@ pub struct SpecTranslator<'env> {
     name_to_idx_map: BTreeMap<Symbol, usize>,
 }
 
+impl<'env> SpecTranslator<'env> {
+    fn module_env(&self) -> &'env ModuleEnv<'env> {
+        use SpecEnv::*;
+        match self.spec_env {
+            Module(module_env) => module_env,
+            Function(func_target) => &func_target.func_env.module_env,
+        }
+    }
+
+    fn function_target(&self) -> &'env FunctionTarget<'env> {
+        use SpecEnv::*;
+        match self.spec_env {
+            Module(_) => panic!(),
+            Function(func_target) => func_target,
+        }
+    }
+}
+
 // General
 // =======
 
@@ -55,7 +80,7 @@ impl<'env> SpecTranslator<'env> {
         supports_native_old: bool,
     ) -> SpecTranslator<'env> {
         SpecTranslator {
-            module_env,
+            spec_env: SpecEnv::Module(module_env),
             writer,
             supports_native_old,
             in_old: RefCell::new(false),
@@ -68,24 +93,24 @@ impl<'env> SpecTranslator<'env> {
     /// Creates a translator for use in translating spec blocks inside function implementation
     pub fn new_for_spec_in_impl(
         writer: &'env CodeWriter,
-        func_env: &'env FunctionEnv<'env>,
+        func_target: &'env FunctionTarget<'env>,
         supports_native_old: bool,
     ) -> SpecTranslator<'env> {
         SpecTranslator {
-            module_env: &func_env.module_env,
+            spec_env: SpecEnv::Function(func_target),
             writer,
             supports_native_old,
             in_old: RefCell::new(false),
             invariant_target: RefCell::new(("".to_string(), "".to_string())),
             fresh_var_count: RefCell::new(0),
-            name_to_idx_map: (0..func_env.get_local_count())
-                .map(|idx| (func_env.get_local_name(idx), idx))
+            name_to_idx_map: (0..func_target.get_local_count())
+                .map(|idx| (func_target.get_local_name(idx), idx))
                 .collect(),
         }
     }
 
     pub fn error(&self, loc: &Loc, msg: &str) {
-        self.module_env
+        self.module_env()
             .env
             .error(loc, &format!("[boogie translator] {}", msg));
     }
@@ -93,7 +118,7 @@ impl<'env> SpecTranslator<'env> {
     /// Sets the location of the code writer from node id.
     fn set_writer_location(&self, node_id: NodeId) {
         self.writer
-            .set_location(&self.module_env.get_node_loc(node_id));
+            .set_location(&self.module_env().get_node_loc(node_id));
     }
 
     /// Sets the current invariant target.
@@ -147,15 +172,20 @@ impl<'env> SpecTranslator<'env> {
         emitln!(
             self.writer,
             "\n\n// ** spec vars of module {}\n",
-            self.module_env
+            self.module_env()
                 .get_name()
-                .display(self.module_env.symbol_pool())
+                .display(self.module_env().symbol_pool())
         );
-        for (_, var) in self.module_env.get_spec_vars() {
-            let boogie_name = boogie_spec_var_name(&self.module_env, var.name);
+        for (_, var) in self.module_env().get_spec_vars() {
+            let boogie_name = boogie_spec_var_name(&self.module_env(), var.name);
             emitln!(
                 self.writer,
-                &boogie_declare_global(&self.module_env.env, &boogie_name, &var.type_)
+                &boogie_declare_global(
+                    &self.module_env().env,
+                    &boogie_name,
+                    var.type_params.len(),
+                    &var.type_
+                )
             );
         }
     }
@@ -169,11 +199,11 @@ impl<'env> SpecTranslator<'env> {
         emitln!(
             self.writer,
             "\n\n// ** spec funs of module {}\n",
-            self.module_env
+            self.module_env()
                 .get_name()
-                .display(self.module_env.symbol_pool())
+                .display(self.module_env().symbol_pool())
         );
-        for (id, fun) in self.module_env.get_spec_funs() {
+        for (id, fun) in self.module_env().get_spec_funs() {
             if fun.body.is_none() {
                 // This function is native and expected to be found in the prelude.
                 continue;
@@ -183,6 +213,17 @@ impl<'env> SpecTranslator<'env> {
                 continue;
             }
             let result_type = boogie_local_type(&fun.result_type);
+            let spec_var_params = fun.used_spec_vars.iter().map(|(mid, vid)| {
+                let declaring_module = self.module_env().env.get_module(*mid);
+                let decl = declaring_module.get_spec_var(*vid);
+                let boogie_name = boogie_spec_var_name(&declaring_module, decl.name);
+                boogie_global_declarator(
+                    declaring_module.env,
+                    &boogie_name,
+                    decl.type_params.len(),
+                    &decl.type_,
+                )
+            });
             let type_params = fun
                 .type_params
                 .iter()
@@ -191,7 +232,7 @@ impl<'env> SpecTranslator<'env> {
             let params = fun.params.iter().map(|(name, ty)| {
                 format!(
                     "{}: {}",
-                    name.display(self.module_env.symbol_pool()),
+                    name.display(self.module_env().symbol_pool()),
                     boogie_local_type(ty)
                 )
             });
@@ -199,8 +240,13 @@ impl<'env> SpecTranslator<'env> {
             emitln!(
                 self.writer,
                 "function {{:inline}} {}({}): {} {{",
-                boogie_spec_fun_name(&self.module_env, *id),
-                type_params.chain(params).join(", "),
+                boogie_spec_fun_name(&self.module_env(), *id),
+                vec!["$m: Memory".to_string()]
+                    .into_iter()
+                    .chain(spec_var_params)
+                    .chain(type_params)
+                    .chain(params)
+                    .join(", "),
                 result_type
             );
             self.writer.indent();
@@ -218,42 +264,38 @@ impl<'env> SpecTranslator<'env> {
 
 impl<'env> SpecTranslator<'env> {
     // Generate boogie for asserts/assumes inside function bodies
-    pub fn translate_conditions_inside_impl(
-        &self,
-        func_env: &'env FunctionEnv<'env>,
-        offset: CodeOffset,
-    ) {
-        let conds = func_env.get_specification_on_impl(offset);
-        if let Some(conds) = conds {
-            if !conds.is_empty() {
-                self.translate_seq(conds.iter(), "\n", |cond| {
-                    self.writer.set_location(&cond.loc);
-                    emit!(
-                        self.writer,
-                        if cond.kind == SpecConditionKind::Assert {
-                            "assert "
-                        } else {
-                            "assume "
-                        }
-                    );
-                    emit!(self.writer, "b#Boolean(");
-                    self.translate_exp(&cond.exp);
-                    emit!(self.writer, ");")
-                });
-                emitln!(self.writer);
-            }
+    pub fn translate_conditions_inside_impl(&self, block_id: SpecBlockId) {
+        let func_target = self.function_target();
+        let conds = func_target.get_specification_on_impl(block_id);
+        if !conds.is_empty() {
+            self.translate_seq(conds.iter(), "\n", |cond| {
+                self.writer.set_location(&cond.loc);
+                emit!(
+                    self.writer,
+                    if cond.kind == SpecConditionKind::Assert {
+                        "assert "
+                    } else {
+                        "assume "
+                    }
+                );
+                emit!(self.writer, "b#Boolean(");
+                self.translate_exp(&cond.exp);
+                emit!(self.writer, ");")
+            });
+            emitln!(self.writer);
         }
     }
 
     /// Generates boogie for pre/post conditions.
-    pub fn translate_conditions(&self, func_env: &'env FunctionEnv<'env>) {
+    pub fn translate_conditions(&self) {
         // Generate pre-conditions
         // For this transaction to be executed, it MUST have had
         // a valid signature for the sender's account. Therefore,
         // the senders account resource (which contains the pubkey)
         // must have existed! So we can assume txn_sender account
         // exists in pre-condition.
-        let conds = func_env.get_specification_on_decl();
+        let func_target = self.function_target();
+        let conds = func_target.get_specification_on_decl();
         emitln!(self.writer, "requires $ExistsTxnSenderAccount($m, $txn);");
 
         // Generate requires.
@@ -280,13 +322,13 @@ impl<'env> SpecTranslator<'env> {
             .collect_vec();
         if !aborts_if.is_empty() {
             self.writer.set_location(&aborts_if[0].loc);
-            emit!(self.writer, "ensures ");
+            emit!(self.writer, "ensures (");
             self.translate_seq(aborts_if.iter(), " || ", |c| {
                 emit!(self.writer, "b#Boolean(old(");
                 self.translate_exp_parenthesised(&c.exp);
                 emit!(self.writer, "))")
             });
-            emitln!(self.writer, " == $abort_flag;");
+            emitln!(self.writer, ") <==> $abort_flag;");
         }
 
         // Generate ensures
@@ -305,8 +347,8 @@ impl<'env> SpecTranslator<'env> {
         }
 
         // Generate implicit requires/ensures from module invariants if this is a public function.
-        if func_env.is_public() {
-            let invariants = func_env.module_env.get_module_invariants();
+        if func_target.is_public() {
+            let invariants = func_target.func_env.module_env.get_module_invariants();
             if !invariants.is_empty() {
                 self.translate_seq(invariants.iter(), "\n", |inv| {
                     self.writer.set_location(&inv.loc);
@@ -327,11 +369,12 @@ impl<'env> SpecTranslator<'env> {
     }
 
     /// Assumes preconditions for function.
-    pub fn assume_preconditions(&self, func_env: &FunctionEnv<'_>) {
+    pub fn assume_preconditions(&self) {
         emitln!(self.writer, "assume $ExistsTxnSenderAccount($m, $txn);");
 
         // Explicit pre-conditions.
-        let requires = func_env
+        let func_target = self.function_target();
+        let requires = func_target
             .get_specification_on_decl()
             .iter()
             .filter(|cond| cond.kind == SpecConditionKind::Requires)
@@ -347,13 +390,13 @@ impl<'env> SpecTranslator<'env> {
         }
 
         // Implict module invariants.
-        self.assume_module_invariants(func_env);
+        self.assume_module_invariants(func_target);
     }
 
     /// Assume module invariants of function.
-    pub fn assume_module_invariants(&self, func_env: &FunctionEnv<'_>) {
-        if func_env.is_public() {
-            let invariants = func_env.module_env.get_module_invariants();
+    pub fn assume_module_invariants(&self, func_target: &FunctionTarget<'_>) {
+        if func_target.is_public() {
+            let invariants = func_target.func_env.module_env.get_module_invariants();
             if !invariants.is_empty() {
                 self.translate_seq(invariants.iter(), "\n", |inv| {
                     self.writer.set_location(&inv.loc);
@@ -462,6 +505,13 @@ impl<'env> SpecTranslator<'env> {
         inv.target.is_some()
     }
 
+    /// Translate type parameters for given struct.
+    pub fn translate_type_parameters(struct_env: &StructEnv<'_>) -> Vec<String> {
+        (0..struct_env.get_type_parameters().len())
+            .map(|i| format!("$tv{}: TypeValue", i))
+            .collect_vec()
+    }
+
     /// Generates a procedure which asserts the before-update invariants of the struct.
     pub fn translate_before_update_invariant(&self, struct_env: &StructEnv<'env>) {
         if !Self::has_before_update_invariant(struct_env) {
@@ -469,8 +519,12 @@ impl<'env> SpecTranslator<'env> {
         }
         emitln!(
             self.writer,
-            "procedure {{:inline 1}} {}_before_update_inv($before: Value) {{",
-            boogie_struct_name(struct_env)
+            "procedure {{:inline 1}} {}_before_update_inv({}) {{",
+            boogie_struct_name(struct_env),
+            Self::translate_type_parameters(struct_env)
+                .into_iter()
+                .chain(vec!["$before: Value".to_string()])
+                .join(", "),
         );
         self.writer.indent();
 
@@ -527,8 +581,12 @@ impl<'env> SpecTranslator<'env> {
         }
         emitln!(
             self.writer,
-            "procedure {{:inline 1}} {}_after_update_inv($before: Value, $after: Value) {{",
-            boogie_struct_name(struct_env)
+            "procedure {{:inline 1}} {}_after_update_inv({}) {{",
+            boogie_struct_name(struct_env),
+            Self::translate_type_parameters(struct_env)
+                .into_iter()
+                .chain(vec!["$before: Value, $after: Value".to_string()])
+                .join(", "),
         );
         self.writer.indent();
 
@@ -615,17 +673,30 @@ impl<'env> SpecTranslator<'env> {
     /// Emits spec var updates for given invariants.
     fn emit_spec_var_updates(&self, target: &str, old_target: &str, invariants: &[Invariant]) {
         for inv in invariants {
-            if let Some((module_id, spec_var_id)) = &inv.target {
+            if let Some((module_id, spec_var_id, tys)) = &inv.target {
                 self.writer.set_location(&inv.loc);
-                let module_env = self.module_env.env.get_module(*module_id);
+                let module_env = self.module_env().env.get_module(*module_id);
                 let spec_var = module_env.get_spec_var(*spec_var_id);
-                emit!(
-                    self.writer,
-                    "{} := ",
-                    boogie_spec_var_name(&self.module_env, spec_var.name),
-                );
+                let var_name = boogie_spec_var_name(&self.module_env(), spec_var.name);
+                if !tys.is_empty() {
+                    emit!(
+                        self.writer,
+                        "{} := {}[{} := ",
+                        var_name,
+                        var_name,
+                        tys.iter()
+                            .map(|ty| boogie_type_value(self.module_env().env, ty))
+                            .join(", ")
+                    );
+                } else {
+                    emit!(self.writer, "{} := ", var_name);
+                }
                 self.with_invariant_target(target, old_target, || self.translate_exp(&inv.exp));
-                emitln!(self.writer, ";")
+                if !tys.is_empty() {
+                    emitln!(self.writer, "];")
+                } else {
+                    emitln!(self.writer, ";")
+                }
             }
         }
     }
@@ -647,12 +718,25 @@ impl<'env> SpecTranslator<'env> {
             }
             Exp::SpecVar(node_id, module_id, var_id) => {
                 self.set_writer_location(*node_id);
-                let module_env = self.module_env.env.get_module(*module_id);
+                let module_env = self.module_env().env.get_module(*module_id);
                 let spec_var = module_env.get_spec_var(*var_id);
+                let instantiation = self.module_env().get_node_instantiation(*node_id);
+                let instantiation_str = if instantiation.is_empty() {
+                    "".to_string()
+                } else {
+                    format!(
+                        "[{}]",
+                        instantiation
+                            .iter()
+                            .map(|ty| boogie_type_value(self.module_env().env, ty))
+                            .join(", ")
+                    )
+                };
                 emit!(
                     self.writer,
-                    "{}",
-                    boogie_spec_var_name(&module_env, spec_var.name)
+                    "{}{}",
+                    boogie_spec_var_name(&module_env, spec_var.name),
+                    instantiation_str
                 );
             }
             Exp::Call(node_id, oper, args) => {
@@ -660,11 +744,11 @@ impl<'env> SpecTranslator<'env> {
                 self.translate_call(*node_id, oper, args);
             }
             Exp::Invoke(node_id, ..) => self.error(
-                &self.module_env.get_node_loc(*node_id),
+                &self.module_env().get_node_loc(*node_id),
                 "Invoke not yet supported",
             ),
             Exp::Lambda(node_id, ..) => self.error(
-                &self.module_env.get_node_loc(*node_id),
+                &self.module_env().get_node_loc(*node_id),
                 "`|x|e` (lambda) currently only supported as argument for `all` or `any`",
             ),
             Exp::Block(node_id, vars, scope) => {
@@ -699,19 +783,25 @@ impl<'env> SpecTranslator<'env> {
     }
 
     fn translate_local_var(&self, node_id: NodeId, name: Symbol) {
-        self.auto_dref(node_id, || {
+        let mut ty = &self.module_env().get_node_type(node_id);
+        // overwrite ty if func_target provides a binding for name
+        if let SpecEnv::Function(func_target) = self.spec_env {
+            if let Some(local_index) = func_target.get_local_index(name) {
+                ty = func_target.get_local_type(*local_index);
+            }
+        };
+        self.auto_dref(ty, || {
             emit!(
                 self.writer,
-                self.module_env.symbol_pool().string(name).as_ref()
+                self.module_env().symbol_pool().string(name).as_ref()
             );
         });
     }
 
-    fn auto_dref<F>(&self, node_id: NodeId, f: F)
+    fn auto_dref<F>(&self, ty: &Type, f: F)
     where
         F: Fn(),
     {
-        let ty = self.module_env.get_node_type(node_id);
         if ty.is_reference() {
             // Automatically dereference
             emit!(self.writer, "$Dereference($m, ");
@@ -726,9 +816,9 @@ impl<'env> SpecTranslator<'env> {
         if vars.is_empty() {
             return self.translate_exp(exp);
         }
-        let loc = self.module_env.get_node_loc(node_id);
+        let loc = self.module_env().get_node_loc(node_id);
         if let Some((name, binding)) = self.get_decl_var(&loc, vars) {
-            let name_str = self.module_env.symbol_pool().string(name);
+            let name_str = self.module_env().symbol_pool().string(name);
             emit!(self.writer, "(var {} := ", name_str);
             self.translate_exp(binding.as_ref().expect("binding"));
             emit!(self.writer, "; ");
@@ -740,7 +830,7 @@ impl<'env> SpecTranslator<'env> {
     }
 
     fn translate_call(&self, node_id: NodeId, oper: &Operation, args: &[Exp]) {
-        let loc = self.module_env.get_node_loc(node_id);
+        let loc = self.module_env().get_node_loc(node_id);
         match oper {
             Operation::Function(module_id, fun_id) => {
                 self.translate_spec_fun_call(node_id, *module_id, *fun_id, args)
@@ -757,9 +847,11 @@ impl<'env> SpecTranslator<'env> {
                     self.name_to_idx_map[sym],
                 );
             }
-            Operation::Result(pos) => self.auto_dref(node_id, || {
-                emit!(self.writer, "$ret{}", pos);
-            }),
+            Operation::Result(pos) => {
+                self.auto_dref(self.function_target().get_return_type(*pos), || {
+                    emit!(self.writer, "$ret{}", pos);
+                })
+            }
             Operation::Index => self.translate_primitive_call("$select_vector_by_value", args),
             Operation::Slice => self.translate_primitive_call("$slice_vector", args),
             Operation::Range => self.translate_primitive_call("$Range", args),
@@ -810,24 +902,27 @@ impl<'env> SpecTranslator<'env> {
         fun_id: SpecFunId,
         args: &[Exp],
     ) {
-        let instantiation = self.module_env.get_node_instantiation(node_id);
-        let module_env = self.module_env.env.get_module(module_id);
+        let instantiation = self.module_env().get_node_instantiation(node_id);
+        let module_env = self.module_env().env.get_module(module_id);
+        let fun_decl = module_env.get_spec_fun(fun_id);
         let name = boogie_spec_fun_name(&module_env, fun_id);
         emit!(self.writer, "{}(", name);
-        let mut first = true;
-        let mut maybe_comma = || {
-            if first {
-                first = false;
-            } else {
-                emit!(self.writer, ", ");
-            }
-        };
+        emit!(self.writer, "$m");
+        for (mid, vid) in &fun_decl.used_spec_vars {
+            emit!(self.writer, ", ");
+            let declaring_module = self.module_env().env.get_module(*mid);
+            let var_decl = declaring_module.get_spec_var(*vid);
+            emit!(
+                self.writer,
+                &boogie_spec_var_name(&declaring_module, var_decl.name)
+            );
+        }
         for ty in instantiation.iter() {
-            maybe_comma();
-            emit!(self.writer, &boogie_type_value(self.module_env.env, ty));
+            emit!(self.writer, ", ");
+            emit!(self.writer, &boogie_type_value(self.module_env().env, ty));
         }
         for exp in args {
-            maybe_comma();
+            emit!(self.writer, ", ");
             self.translate_exp(exp);
         }
         emit!(self.writer, ")");
@@ -840,7 +935,7 @@ impl<'env> SpecTranslator<'env> {
         field_id: FieldId,
         args: &[Exp],
     ) {
-        let module_env = self.module_env.env.get_module(module_id);
+        let module_env = self.module_env().env.get_module(module_id);
         let struct_env = module_env.get_struct(struct_id);
         let field_env = struct_env.get_field(field_id);
         let field_name = boogie_field_name(&field_env);
@@ -855,16 +950,16 @@ impl<'env> SpecTranslator<'env> {
     }
 
     fn translate_resource_access(&self, node_id: NodeId, args: &[Exp]) {
-        let rty = &self.module_env.get_node_instantiation(node_id)[0];
-        let type_value = boogie_type_value(self.module_env.env, rty);
+        let rty = &self.module_env().get_node_instantiation(node_id)[0];
+        let type_value = boogie_type_value(self.module_env().env, rty);
         emit!(self.writer, "$ResourceValue($m, {}, ", type_value);
         self.translate_exp(&args[0]);
         emit!(self.writer, ")");
     }
 
     fn translate_resource_exists(&self, node_id: NodeId, args: &[Exp]) {
-        let rty = &self.module_env.get_node_instantiation(node_id)[0];
-        let type_value = boogie_type_value(self.module_env.env, rty);
+        let rty = &self.module_env().get_node_instantiation(node_id)[0];
+        let type_value = boogie_type_value(self.module_env().env, rty);
         emit!(self.writer, "$ResourceExists($m, {}, ", type_value);
         self.translate_exp(&args[0]);
         emit!(self.writer, ")");
@@ -879,11 +974,11 @@ impl<'env> SpecTranslator<'env> {
         //      (var $r := v; exists $i: int :: $InVectorRange($v, $i) && (var x:=$r[$i]; x > 0))
         // any(r, |x| x > 0) -->
         //      (var $r := r; exists $i: int :: $InRange($r, $i) && (var x:=$i; x > 0))
-        let quant_ty = self.module_env.get_node_type(args[0].node_id());
+        let quant_ty = self.module_env().get_node_type(args[0].node_id());
         let connective = if is_all { "==>" } else { "&&" };
         if let Exp::Lambda(_, vars, exp) = &args[1] {
             if let Some((var, _)) = self.get_decl_var(loc, vars) {
-                let var_name = self.module_env.symbol_pool().string(var);
+                let var_name = self.module_env().symbol_pool().string(var);
                 let quant_var = self.fresh_var_name("i");
                 let is_vector = match quant_ty {
                     Type::Vector(..) => true,

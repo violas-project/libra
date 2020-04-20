@@ -46,7 +46,7 @@ impl EventKey {
     #[cfg(feature = "fuzzing")]
     /// Create a random event key for testing
     pub fn random() -> Self {
-        let mut rng = OsRng::new().expect("can't access OsRng");
+        let mut rng = OsRng;
         let salt = rng.next_u64();
         EventKey::new_from_address(&AccountAddress::random(), salt)
     }
@@ -82,7 +82,7 @@ impl ser::Serialize for EventKey {
         // In order to preserve the Serde data model and help analysis tools,
         // make sure to wrap our value in a container with the same name
         // as the original type.
-        serializer.serialize_newtype_struct("EventKey", &self.0[..])
+        serializer.serialize_newtype_struct("EventKey", serde_bytes::Bytes::new(&self.0))
     }
 }
 

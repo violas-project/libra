@@ -19,7 +19,10 @@ use libra_types::{
     language_storage::ModuleId,
     vm_error::{StatusCode, StatusType},
 };
-use move_core_types::identifier::Identifier;
+use move_core_types::{
+    gas_schedule::{GasAlgebra, GasUnits},
+    identifier::Identifier,
+};
 use move_vm_cache::Arena;
 use move_vm_state::{
     data_cache::{BlockDataCache, RemoteCache},
@@ -27,12 +30,7 @@ use move_vm_state::{
 };
 use move_vm_types::loaded_data::types::{StructType, Type};
 use std::collections::HashMap;
-use vm::{
-    access::ModuleAccess,
-    errors::VMResult,
-    file_format::*,
-    gas_schedule::{GasAlgebra, GasUnits},
-};
+use vm::{access::ModuleAccess, errors::VMResult, file_format::*};
 
 struct NullStateView;
 
@@ -78,7 +76,7 @@ fn test_module(name: &'static str) -> VerifiedModule {
     let compiled_module = CompiledModuleMut {
         module_handles: vec![ModuleHandle {
             name: IdentifierIndex(0),
-            address: AddressPoolIndex(0),
+            address: AddressIdentifierIndex(0),
         }],
         struct_handles: vec![],
         signatures: vec![Signature(vec![]), Signature(vec![SignatureToken::U64])],
@@ -110,7 +108,6 @@ fn test_module(name: &'static str) -> VerifiedModule {
                 flags: CodeUnit::PUBLIC,
                 acquires_global_resources: vec![],
                 code: CodeUnit {
-                    max_stack_size: 10,
                     locals: SignatureIndex(0),
                     code: vec![Bytecode::LdTrue, Bytecode::Pop, Bytecode::Ret],
                 },
@@ -120,15 +117,14 @@ fn test_module(name: &'static str) -> VerifiedModule {
                 flags: CodeUnit::PUBLIC,
                 acquires_global_resources: vec![],
                 code: CodeUnit {
-                    max_stack_size: 10,
                     locals: SignatureIndex(1),
                     code: vec![Bytecode::Ret],
                 },
             },
         ],
         identifiers: idents(vec![name, "func1", "func2"]),
-        byte_array_pool: vec![],
-        address_pool: vec![AccountAddress::default()],
+        address_identifiers: vec![AccountAddress::default()],
+        constant_pool: vec![],
     }
     .freeze()
     .expect("test module should satisfy bounds checker");
@@ -142,18 +138,17 @@ fn test_script() -> VerifiedScript {
             flags: CodeUnit::PUBLIC,
             acquires_global_resources: vec![],
             code: CodeUnit {
-                max_stack_size: 10,
                 locals: SignatureIndex(0),
                 code: vec![Bytecode::Ret],
             },
         },
         module_handles: vec![
             ModuleHandle {
-                address: AddressPoolIndex(0),
+                address: AddressIdentifierIndex(0),
                 name: IdentifierIndex(0),
             },
             ModuleHandle {
-                address: AddressPoolIndex(0),
+                address: AddressIdentifierIndex(0),
                 name: IdentifierIndex(1),
             },
         ],
@@ -184,8 +179,8 @@ fn test_script() -> VerifiedScript {
         ],
         function_instantiations: vec![],
         identifiers: idents(vec!["hello", "module", "func1", "func2", "main"]),
-        byte_array_pool: vec![],
-        address_pool: vec![AccountAddress::default()],
+        address_identifiers: vec![AccountAddress::default()],
+        constant_pool: vec![],
     }
     .freeze()
     .expect("test script should satisfy bounds checker");
@@ -365,7 +360,6 @@ fn test_multi_level_cache_write_back() {
             flags: CodeUnit::PUBLIC,
             acquires_global_resources: vec![],
             code: CodeUnit {
-                max_stack_size: 10,
                 locals: SignatureIndex(0),
                 code: vec![Bytecode::Ret],
             },
@@ -373,17 +367,17 @@ fn test_multi_level_cache_write_back() {
         module_handles: vec![
             // Self
             ModuleHandle {
-                address: AddressPoolIndex(0),
+                address: AddressIdentifierIndex(0),
                 name: IdentifierIndex(0),
             },
             // To-be-published Module
             ModuleHandle {
-                address: AddressPoolIndex(0),
+                address: AddressIdentifierIndex(0),
                 name: IdentifierIndex(1),
             },
             // Existing module on chain
             ModuleHandle {
-                address: AddressPoolIndex(0),
+                address: AddressIdentifierIndex(0),
                 name: IdentifierIndex(2),
             },
         ],
@@ -424,8 +418,8 @@ fn test_multi_level_cache_write_back() {
             "func2",
             "main",
         ]),
-        byte_array_pool: vec![],
-        address_pool: vec![AccountAddress::default()],
+        address_identifiers: vec![AccountAddress::default()],
+        constant_pool: vec![],
     }
     .freeze()
     .expect("test script should satisfy bounds checker");
