@@ -140,7 +140,7 @@ impl SynchronizerEnv {
             .collect();
         // Setup identity public keys.
         let identity_private_keys: Vec<_> = (0..count)
-            .map(|_| x25519::PrivateKey::for_test(&mut rng))
+            .map(|_| x25519::PrivateKey::generate(&mut rng))
             .collect();
 
         let mut validators_keys = vec![];
@@ -259,7 +259,8 @@ impl SynchronizerEnv {
             .trusted_peers(trusted_peers)
             .seed_peers(seed_peers)
             .transport(TransportType::Memory)
-            .add_discovery();
+            .add_connectivity_manager()
+            .add_gossip_discovery();
 
         let (sender, events) = crate::network::add_to_network(&mut network_builder);
         let peer_addr = network_builder.build();

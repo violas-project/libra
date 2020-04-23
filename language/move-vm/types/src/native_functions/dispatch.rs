@@ -3,21 +3,21 @@
 
 use super::{hash, lcs, signature};
 use crate::{
-    loaded_data::types::Type,
+    loaded_data::runtime_types::{Type, TypeConverter},
     values::{debug, vector, Value},
 };
 use libra_types::{
     account_address::AccountAddress,
-    account_config::{account_module_name, AccountResource, BalanceResource, CORE_CODE_ADDRESS},
+    account_config::{
+        account_type_module_name, account_type_struct_name, event_handle_generator_struct_name,
+        event_module_name, AccountResource, BalanceResource, CORE_CODE_ADDRESS,
+    },
     language_storage::ModuleId,
     move_resource::MoveResource,
     vm_error::{StatusCode, VMStatus},
 };
-use move_core_types::{
-    gas_schedule::{
-        AbstractMemorySize, CostTable, GasAlgebra, GasCarrier, GasUnits, NativeCostIndex,
-    },
-    identifier::IdentStr,
+use move_core_types::gas_schedule::{
+    AbstractMemorySize, CostTable, GasAlgebra, GasCarrier, GasUnits, NativeCostIndex,
 };
 use std::collections::VecDeque;
 use vm::{
@@ -90,14 +90,10 @@ pub enum NativeFunction {
 }
 
 impl NativeFunction {
-    pub fn resolve(module: &ModuleId, function_name: &IdentStr) -> Option<Self> {
+    pub fn resolve(module: &ModuleId, function_name: &str) -> Option<Self> {
         use NativeFunction::*;
 
-        let case = (
-            module.address(),
-            module.name().as_str(),
-            function_name.as_str(),
-        );
+        let case = (module.address(), module.name().as_str(), function_name);
         Some(match case {
             (&CORE_CODE_ADDRESS, "Hash", "sha2_256") => HashSha2_256,
             (&CORE_CODE_ADDRESS, "Hash", "sha3_256") => HashSha3_256,
@@ -114,7 +110,7 @@ impl NativeFunction {
             (&CORE_CODE_ADDRESS, "Vector", "pop_back") => VectorPopBack,
             (&CORE_CODE_ADDRESS, "Vector", "destroy_empty") => VectorDestroyEmpty,
             (&CORE_CODE_ADDRESS, "Vector", "swap") => VectorSwap,
-            (&CORE_CODE_ADDRESS, "LibraAccount", "write_to_event_store") => AccountWriteEvent,
+            (&CORE_CODE_ADDRESS, "Event", "write_to_event_store") => AccountWriteEvent,
             (&CORE_CODE_ADDRESS, "LibraAccount", "save_account") => AccountSaveAccount,
             (&CORE_CODE_ADDRESS, "Debug", "print") => DebugPrint,
             (&CORE_CODE_ADDRESS, "Debug", "print_stack_trace") => DebugPrintStackTrace,
@@ -130,11 +126,11 @@ impl NativeFunction {
         t: Vec<Type>,
         v: VecDeque<Value>,
         c: &CostTable,
+        type_converter: &dyn TypeConverter,
     ) -> VMResult<NativeResult> {
         match self {
             Self::HashSha2_256 => hash::native_sha2_256(t, v, c),
             Self::HashSha3_256 => hash::native_sha3_256(t, v, c),
-            Self::LCSToBytes => lcs::native_to_bytes(t, v, c),
             Self::SigED25519Verify => signature::native_ed25519_signature_verification(t, v, c),
             Self::SigED25519ThresholdVerify => {
                 signature::native_ed25519_threshold_signature_verification(t, v, c)
@@ -152,7 +148,20 @@ impl NativeFunction {
             )),
             Self::AccountSaveAccount => Err(VMStatus::new(StatusCode::UNREACHABLE)
                 .with_message("save_account does not have a native implementation".to_string())),
-            Self::DebugPrint => debug::native_print(t, v, c),
+            Self::LCSToBytes => {
+                let mut fat_ty_args = vec![];
+                for ty in &t {
+                    fat_ty_args.push(type_converter.type_to_fat_type(ty)?);
+                }
+                lcs::native_to_bytes(fat_ty_args, v, c)
+            }
+            Self::DebugPrint => {
+                let mut fat_ty_args = vec![];
+                for ty in &t {
+                    fat_ty_args.push(type_converter.type_to_fat_type(ty)?);
+                }
+                debug::native_print(fat_ty_args, v, c)
+            }
             Self::DebugPrintStackTrace => Err(VMStatus::new(StatusCode::UNREACHABLE).with_message(
                 "print_stack_trace does not have a native implementation".to_string(),
             )),
@@ -177,7 +186,7 @@ impl NativeFunction {
             Self::VectorDestroyEmpty => 1,
             Self::VectorSwap => 3,
             Self::AccountWriteEvent => 3,
-            Self::AccountSaveAccount => 3,
+            Self::AccountSaveAccount => 5,
             Self::DebugPrint => 1,
             Self::DebugPrintStackTrace => 0,
         }
@@ -337,22 +346,36 @@ impl NativeFunction {
                 vec![]
             ),
             Self::AccountSaveAccount => {
-                let type_parameters = vec![Kind::All];
+                let type_parameters = vec![Kind::All, Kind::Copyable];
                 let self_t_idx = struct_handle_idx(
                     m?,
                     &CORE_CODE_ADDRESS,
-                    account_module_name().as_str(),
+                    AccountResource::MODULE_NAME,
                     AccountResource::STRUCT_NAME,
                 )?;
                 let balance_t_idx = struct_handle_idx(
                     m?,
                     &CORE_CODE_ADDRESS,
-                    account_module_name().as_str(),
+                    AccountResource::MODULE_NAME,
                     BalanceResource::STRUCT_NAME,
                 )?;
+                let assoc_cap_t_idx = struct_handle_idx(
+                    m?,
+                    &CORE_CODE_ADDRESS,
+                    account_type_module_name().as_str(),
+                    account_type_struct_name().as_str(),
+                )?;
+                let event_generator_t_idx = struct_handle_idx(
+                    m?,
+                    &CORE_CODE_ADDRESS,
+                    event_module_name().as_str(),
+                    event_handle_generator_struct_name().as_str(),
+                )?;
                 let parameters = vec![
+                    StructInstantiation(assoc_cap_t_idx, vec![TypeParameter(1)]),
                     StructInstantiation(balance_t_idx, vec![TypeParameter(0)]),
                     Struct(self_t_idx),
+                    Struct(event_generator_t_idx),
                     Address,
                 ];
                 let return_ = vec![];

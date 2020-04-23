@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 pub enum Value {
     Ed25519PrivateKey(Ed25519PrivateKey),
     HashValue(HashValue),
+    String(String),
     U64(u64),
 }
 
@@ -30,53 +31,19 @@ impl Value {
         }
     }
 
-    pub fn u64(self) -> Result<u64, Error> {
-        if let Value::U64(value) = self {
+    pub fn string(self) -> Result<String, Error> {
+        if let Value::String(value) = self {
             Ok(value)
         } else {
             Err(Error::UnexpectedValueType)
         }
     }
 
-    pub fn from_base64(input: &str) -> Result<Value, Error> {
-        let bytes = base64::decode(input)?;
-        let value = lcs::from_bytes(&bytes)?;
-        Ok(value)
-    }
-
-    pub fn to_base64(&self) -> Result<String, Error> {
-        let bytes = lcs::to_bytes(self)?;
-        Ok(base64::encode(&bytes))
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use libra_crypto::Uniform;
-
-    #[test]
-    fn ed25519_private_key() {
-        let value = Ed25519PrivateKey::generate_for_testing();
-        let value = Value::Ed25519PrivateKey(value);
-        let base64 = value.to_base64().unwrap();
-        let out_value = Value::from_base64(&base64).unwrap();
-        assert_eq!(value, out_value);
-    }
-
-    #[test]
-    fn hash_value() {
-        let value = Value::HashValue(HashValue::random());
-        let base64 = value.to_base64().unwrap();
-        let out_value = Value::from_base64(&base64).unwrap();
-        assert_eq!(value, out_value);
-    }
-
-    #[test]
-    fn u64() {
-        let value = Value::U64(12341);
-        let base64 = value.to_base64().unwrap();
-        let out_value = Value::from_base64(&base64).unwrap();
-        assert_eq!(value, out_value);
+    pub fn u64(self) -> Result<u64, Error> {
+        if let Value::U64(value) = self {
+            Ok(value)
+        } else {
+            Err(Error::UnexpectedValueType)
+        }
     }
 }
