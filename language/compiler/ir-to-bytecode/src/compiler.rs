@@ -24,7 +24,7 @@ use std::{
 use vm::{
     access::ModuleAccess,
     file_format::{
-        self, Bytecode, CodeOffset, CodeUnit, CompiledModule, CompiledModuleMut, CompiledScript,
+        Bytecode, CodeOffset, CodeUnit, CompiledModule, CompiledModuleMut, CompiledScript,
         CompiledScriptMut, Constant, FieldDefinition, FunctionDefinition, FunctionSignature, Kind,
         Signature, SignatureToken, StructDefinition, StructDefinitionIndex, StructFieldInformation,
         StructHandleIndex, TableIndex, TypeParameterIndex, TypeSignature,
@@ -393,28 +393,24 @@ impl FunctionFrame {
 
 /// Compile a transaction script.
 pub fn compile_script<'a, T: 'a + ModuleAccess>(
-    address: AccountAddress,
+    address: Option<AccountAddress>,
     script: Script,
     dependencies: impl IntoIterator<Item = &'a T>,
 ) -> Result<(CompiledScript, SourceMap<Loc>)> {
-    let current_module = QualifiedModuleIdent {
-        address,
-        name: ModuleName::new(file_format::self_module_name().to_string()),
-    };
-    let mut context = Context::new(dependencies, current_module)?;
-    let self_name = ModuleName::new(ModuleName::self_name().into());
+    let mut context = Context::new(dependencies, None)?;
 
     compile_imports(&mut context, address, script.imports)?;
     compile_explicit_dependency_declarations(
         &mut context,
         script.explicit_dependency_declarations,
     )?;
-    let main_name = FunctionName::new("main".to_string());
     let function = script.main;
 
     let sig = function_signature(&mut context, &function.value.signature)?;
-    context.declare_function(self_name.clone(), main_name.clone(), sig)?;
-    let main = compile_function(&mut context, &self_name, main_name, function, 0)?;
+    let parameters_sig_idx = context.signature_index(Signature(sig.parameters))?;
+
+    record_src_loc!(function_decl: context, function.loc, 0);
+    let code = compile_function_body_impl(&mut context, function.value)?.unwrap();
 
     let (
         MaterializedPools {
@@ -439,11 +435,14 @@ pub fn compile_script<'a, T: 'a + ModuleAccess>(
         identifiers,
         address_identifiers,
         constant_pool,
-        main,
+
+        type_parameters: sig.type_parameters,
+        parameters: parameters_sig_idx,
+        code,
     };
     compiled_script
         .freeze()
-        .map_err(|errs| InternalCompilerError::BoundsCheckErrors(errs).into())
+        .map_err(|err| InternalCompilerError::BoundsCheckErrors(err).into())
         .map(|frozen_script| (frozen_script, source_map))
 }
 
@@ -457,10 +456,10 @@ pub fn compile_module<'a, T: 'a + ModuleAccess>(
         address,
         name: module.name,
     };
-    let mut context = Context::new(dependencies, current_module)?;
+    let mut context = Context::new(dependencies, Some(current_module))?;
     let self_name = ModuleName::new(ModuleName::self_name().into());
     // Explicitly declare all imports as they will be included even if not used
-    compile_imports(&mut context, address, module.imports)?;
+    compile_imports(&mut context, Some(address), module.imports)?;
 
     // Explicitly declare all structs as they will be included even if not used
     for s in &module.structs {
@@ -522,7 +521,7 @@ pub fn compile_module<'a, T: 'a + ModuleAccess>(
     };
     compiled_module
         .freeze()
-        .map_err(|errs| InternalCompilerError::BoundsCheckErrors(errs).into())
+        .map_err(|err| InternalCompilerError::BoundsCheckErrors(err).into())
         .map(|frozen_module| (frozen_module, source_map))
 }
 
@@ -557,13 +556,19 @@ fn compile_explicit_dependency_declarations(
 
 fn compile_imports(
     context: &mut Context,
-    address: AccountAddress,
+    address_opt: Option<AccountAddress>,
     imports: Vec<ImportDefinition>,
 ) -> Result<()> {
     for import in imports {
-        let ident = match import.ident {
-            ModuleIdent::Transaction(name) => QualifiedModuleIdent { address, name },
-            ModuleIdent::Qualified(id) => id,
+        let ident = match (address_opt, import.ident) {
+            (Some(address), ModuleIdent::Transaction(name)) => {
+                QualifiedModuleIdent { address, name }
+            }
+            (None, ModuleIdent::Transaction(name)) => bail!(
+                "Invalid import '{}'. No address specified for script so cannot resolve import",
+                name
+            ),
+            (_, ModuleIdent::Qualified(id)) => id,
         };
         context.declare_import(ident, import.alias)?;
     }
@@ -749,6 +754,41 @@ fn compile_functions(
         .collect()
 }
 
+fn compile_function_body_impl(
+    context: &mut Context,
+    ast_function: Function_,
+) -> Result<Option<CodeUnit>> {
+    Ok(match ast_function.body {
+        FunctionBody::Move { locals, code } => {
+            let m = type_parameter_indexes(&ast_function.signature.type_formals)?;
+            Some(compile_function_body(
+                context,
+                m,
+                ast_function.signature.formals,
+                locals,
+                code,
+            )?)
+        }
+        FunctionBody::Bytecode { locals, code } => {
+            let m = type_parameter_indexes(&ast_function.signature.type_formals)?;
+            Some(compile_function_body_bytecode(
+                context,
+                m,
+                ast_function.signature.formals,
+                locals,
+                code,
+            )?)
+        }
+
+        FunctionBody::Native => {
+            for (var, _) in ast_function.signature.formals.into_iter() {
+                record_src_loc!(local: context, var)
+            }
+            None
+        }
+    })
+}
+
 fn compile_function(
     context: &mut Context,
     self_name: &ModuleName,
@@ -765,13 +805,9 @@ fn compile_function(
 
     let ast_function = ast_function.value;
 
-    let flags = match ast_function.visibility {
-        FunctionVisibility::Internal => 0,
-        FunctionVisibility::Public => CodeUnit::PUBLIC,
-    } | match &ast_function.body {
-        FunctionBody::Move { .. } => 0,
-        FunctionBody::Bytecode { .. } => 0,
-        FunctionBody::Native => CodeUnit::NATIVE,
+    let is_public = match ast_function.visibility {
+        FunctionVisibility::Internal => false,
+        FunctionVisibility::Public => true,
     };
     let acquires_global_resources = ast_function
         .acquires
@@ -779,32 +815,11 @@ fn compile_function(
         .map(|name| context.struct_definition_index(name))
         .collect::<Result<_>>()?;
 
-    let code = match ast_function.body {
-        FunctionBody::Move { locals, code } => {
-            let m = type_parameter_indexes(&ast_function.signature.type_formals)?;
-            compile_function_body(context, m, ast_function.signature.formals, locals, code)?
-        }
-        FunctionBody::Bytecode { locals, code } => {
-            let m = type_parameter_indexes(&ast_function.signature.type_formals)?;
-            compile_function_body_bytecode(
-                context,
-                m,
-                ast_function.signature.formals,
-                locals,
-                code,
-            )?
-        }
+    let code = compile_function_body_impl(context, ast_function)?;
 
-        FunctionBody::Native => {
-            for (var, _) in ast_function.signature.formals.into_iter() {
-                record_src_loc!(local: context, var)
-            }
-            CodeUnit::default()
-        }
-    };
     Ok(FunctionDefinition {
         function: fh_idx,
-        flags,
+        is_public,
         acquires_global_resources,
         code,
     })

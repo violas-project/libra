@@ -3,9 +3,9 @@
 
 use crate::{
     parser::ast::{
-        BinOp, Field, FunctionName, FunctionVisibility, InvariantKind, Kind, ModuleIdent,
-        ModuleName, PragmaProperty, ResourceLoc, SpecApplyFragment, SpecBlockTarget,
-        SpecConditionKind, StructName, UnaryOp, Value, Var,
+        BinOp, Field, FunctionName, FunctionVisibility, Kind, ModuleIdent, ModuleName,
+        PragmaProperty, ResourceLoc, SpecApplyPattern, SpecBlockTarget, SpecConditionKind,
+        StructName, UnaryOp, Value, Var,
     },
     shared::{ast_debug::*, unique_map::UniqueMap, *},
 };
@@ -22,7 +22,21 @@ use std::{
 #[derive(Debug)]
 pub struct Program {
     pub modules: UniqueMap<ModuleIdent, ModuleDefinition>,
-    pub main: Option<(Vec<ModuleIdent>, Address, FunctionName, Function)>,
+    pub scripts: BTreeMap<String, Script>,
+}
+
+//**************************************************************************************************
+// Scripts
+//**************************************************************************************************
+
+#[derive(Debug)]
+pub struct Script {
+    pub loc: Loc,
+    pub uses: BTreeMap<ModuleIdent, Loc>,
+    pub unused_aliases: Vec<ModuleIdent>,
+    pub function_name: FunctionName,
+    pub function: Function,
+    pub specs: Vec<SpecBlock>,
 }
 
 //**************************************************************************************************
@@ -97,15 +111,6 @@ pub struct Function {
 //**************************************************************************************************
 
 #[derive(Debug, PartialEq)]
-pub struct SpecApplyPattern_ {
-    pub visibility: Option<FunctionVisibility>,
-    pub name_pattern: Vec<SpecApplyFragment>,
-    pub type_arguments: Option<Vec<Type>>,
-}
-
-pub type SpecApplyPattern = Spanned<SpecApplyPattern_>;
-
-#[derive(Debug, PartialEq)]
 pub struct SpecBlock_ {
     pub target: SpecBlockTarget,
     pub uses: Vec<(ModuleIdent, Option<ModuleName>)>,
@@ -121,10 +126,6 @@ pub enum SpecBlockMember_ {
         kind: SpecConditionKind,
         exp: Exp,
     },
-    Invariant {
-        kind: InvariantKind,
-        exp: Exp,
-    },
     Function {
         name: FunctionName,
         signature: FunctionSignature,
@@ -137,14 +138,10 @@ pub enum SpecBlockMember_ {
         type_: Type,
     },
     Include {
-        name: ModuleAccess,
-        type_arguments: Option<Vec<Type>>,
-        arguments: Vec<(Name, Exp)>,
+        exp: Exp,
     },
     Apply {
-        name: ModuleAccess,
-        type_arguments: Option<Vec<Type>>,
-        arguments: Vec<(Name, Exp)>,
+        exp: Exp,
         patterns: Vec<SpecApplyPattern>,
         exclusion_patterns: Vec<SpecApplyPattern>,
     },
@@ -322,25 +319,53 @@ impl fmt::Display for SpecId {
 
 impl AstDebug for Program {
     fn ast_debug(&self, w: &mut AstWriter) {
-        let Program { modules, main } = self;
+        let Program { modules, scripts } = self;
         for (m, mdef) in modules {
             w.write(&format!("module {}", m));
             w.block(|w| mdef.ast_debug(w));
             w.new_line();
         }
 
-        if let Some((unused_aliases, addr, n, fdef)) = main {
-            w.writeln(&format!("address {}:", addr));
-            if !unused_aliases.is_empty() {
-                w.writeln("unused_aliases: ");
-                w.indent(2, |w| {
-                    w.list(unused_aliases, ",", |w, m| {
-                        w.write(&format!("{}", m));
-                        true
-                    })
-                });
-            }
-            (n.clone(), fdef).ast_debug(w);
+        for (n, s) in scripts {
+            w.write(&format!("script {}", n));
+            w.block(|w| s.ast_debug(w));
+            w.new_line()
+        }
+    }
+}
+
+impl AstDebug for Script {
+    fn ast_debug(&self, w: &mut AstWriter) {
+        let Script {
+            loc: _loc,
+            uses,
+            unused_aliases,
+            function_name,
+            function,
+            specs,
+        } = self;
+        if !uses.is_empty() {
+            w.writeln("uses: ");
+            w.indent(2, |w| {
+                w.list(uses, ",", |w, (m, _)| {
+                    w.write(&format!("{}", m));
+                    true
+                })
+            });
+        }
+        if !unused_aliases.is_empty() {
+            w.writeln("unused_aliases: ");
+            w.indent(2, |w| {
+                w.list(unused_aliases, ",", |w, m| {
+                    w.write(&format!("{}", m));
+                    true
+                })
+            });
+        }
+        (function_name.clone(), function).ast_debug(w);
+        for spec in specs {
+            spec.ast_debug(w);
+            w.new_line();
         }
     }
 }
@@ -443,16 +468,6 @@ impl AstDebug for SpecBlockMember_ {
                 kind.ast_debug(w);
                 exp.ast_debug(w);
             }
-            SpecBlockMember_::Invariant { kind, exp } => {
-                w.write("invariant ");
-                match kind {
-                    InvariantKind::Data => {}
-                    InvariantKind::Update => w.write("update "),
-                    InvariantKind::Pack => w.write("pack "),
-                    InvariantKind::Unpack => w.write("unpack "),
-                }
-                exp.ast_debug(w);
-            }
             SpecBlockMember_::Function {
                 signature,
                 name,
@@ -485,51 +500,17 @@ impl AstDebug for SpecBlockMember_ {
                 w.write(": ");
                 type_.ast_debug(w);
             }
-            SpecBlockMember_::Include {
-                name,
-                type_arguments,
-                arguments,
-            } => {
-                w.write(&format!("include {}", name));
-                if let Some(ty_args) = type_arguments {
-                    w.write("<");
-                    ty_args.ast_debug(w);
-                    w.write(">");
-                }
-                if !arguments.is_empty() {
-                    w.write("{");
-                    w.list(arguments, ", ", |w, (l, r)| {
-                        w.write(&l.value);
-                        w.write(" : ");
-                        r.ast_debug(w);
-                        true
-                    });
-                    w.write("}");
-                }
+            SpecBlockMember_::Include { exp } => {
+                w.write("include ");
+                exp.ast_debug(w);
             }
             SpecBlockMember_::Apply {
-                name,
-                type_arguments,
-                arguments,
+                exp,
                 patterns,
                 exclusion_patterns,
             } => {
-                w.write(&format!("apply {}", name));
-                if let Some(ty_args) = type_arguments {
-                    w.write("<");
-                    ty_args.ast_debug(w);
-                    w.write(">");
-                }
-                if !arguments.is_empty() {
-                    w.write("{");
-                    w.list(arguments, ", ", |w, (l, r)| {
-                        w.write(&l.value);
-                        w.write(" : ");
-                        r.ast_debug(w);
-                        true
-                    });
-                    w.write("}");
-                }
+                w.write("apply ");
+                exp.ast_debug(w);
                 w.write(" to ");
                 w.list(patterns, ", ", |w, p| {
                     p.ast_debug(w);
@@ -550,20 +531,6 @@ impl AstDebug for SpecBlockMember_ {
                     true
                 });
             }
-        }
-    }
-}
-
-impl AstDebug for SpecApplyPattern_ {
-    fn ast_debug(&self, w: &mut AstWriter) {
-        w.list(&self.name_pattern, "", |w, f| {
-            f.ast_debug(w);
-            true
-        });
-        if let Some(tys) = &self.type_arguments {
-            w.write("<");
-            tys.ast_debug(w);
-            w.write(">");
         }
     }
 }

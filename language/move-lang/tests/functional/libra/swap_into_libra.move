@@ -35,40 +35,44 @@ module MultiCurrencyAccount {
 
 //! new-transaction
 //! sender: bob
+script {
 use {{default}}::MultiCurrencyAccount;
 // Setup bob's account as a multi-currency account.
 fun main() {
     MultiCurrencyAccount::init();
 }
+}
 // check: EXECUTED
 
 //! new-transaction
 //! sender: alice
-//! max-gas: 100000
 //! gas-price: 0
+script {
 use {{default}}::MultiCurrencyAccount;
 // Now add coin1 (alice's) account to the multi currency account in bob's
 fun main() {
     MultiCurrencyAccount::add_cap({{bob}});
 }
+}
 // check: EXECUTED
 
 //! new-transaction
 //! sender: cody
-//! max-gas: 100000
 //! gas-price: 0
+script {
 use {{default}}::MultiCurrencyAccount;
 // Now add coin1 (alice's) account to the multi currency account in bob's
 fun main() {
     MultiCurrencyAccount::add_cap({{bob}});
+}
 }
 // check: EXECUTED
 
 // Now mint LBR to bob's account
 //! new-transaction
 //! sender: bob
-//! max-gas: 1000000
 //! gas-price: 0
+script {
 use 0x0::Coin1;
 use 0x0::Coin2;
 use 0x0::LBR;
@@ -88,13 +92,14 @@ fun main() {
     Libra::destroy_zero(coin1);
     Libra::destroy_zero(coin2);
 }
+}
 // check: EXECUTED
 
 // Now mint LBR to bob's account
 //! new-transaction
 //! sender: bob
-//! max-gas: 1000000
 //! gas-price: 0
+script {
 use 0x0::LBR;
 use 0x0::LibraAccount;
 use 0x0::Transaction;
@@ -106,5 +111,6 @@ fun main() {
     Transaction::assert(Libra::value(&coin2) == 9, 2);
     LibraAccount::deposit({{alice}}, coin1);
     LibraAccount::deposit({{cody}}, coin2);
+}
 }
 // check: EXECUTED

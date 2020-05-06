@@ -3,39 +3,35 @@
 // 7001 -> INVALID_ROOT_VASP_ACCOUNT
 // 7002 -> INVALID_CHILD_VASP_ACCOUNT
 // 7003 -> CHILD_ACCOUNT_STILL_PARENT
-address 0x0:
+// 7004 -> INVALID_PUBLIC_KEY
+address 0x0 {
 
 module VASP {
-    use 0x0::Association;
-    use 0x0::Transaction;
-    use 0x0::LibraTimestamp;
     use 0x0::AccountType;
-    use 0x0::AccountLimits;
+    use 0x0::Association;
+    use 0x0::LibraTimestamp;
+    use 0x0::Transaction;
+    use 0x0::Vector;
 
-    // A RootCredential is held only by the root VASP account and holds the
+    // A RootVASP is held only by the root VASP account and holds the
     // VASP-related metadata for the account. It is subject to a time
     // limitation, and needs to be re-certified by an association
     // account before the certification expires.
-    struct RootCredential {
+    struct RootVASP {
         // The human readable name of this VASP.
         human_name: vector<u8>,
         // The base_url holds the URL to be used for off-chain
         // communication. This contains the whole URL (e.g. https://...).
         base_url: vector<u8>,
-        // Expiration date in microseconds from unix epoch
+        // Expiration date in microseconds from unix epoch. Mutable, but only by Association
         expiration_date: u64,
-        // Certificate used for TLS keys off-chain
+        // Certificate used for TLS keys off-chain. Mutable
         ca_cert: vector<u8>,
-    }
-
-    // Interior data for a RootVASP account type. Holds the metadata for
-    // the VASP along with an account limits window to track
-    // holding/inflow/outflow.
-    struct RootVASP {
-        // The root credential for the VASP
-        credential: RootCredential,
-        // The record-keeping for the VASP
-        limit_tracker: AccountLimits::Window,
+        // 32 byte single Ed25519 public key whose counterpart must be used to sign the payment
+        // metadata for travel rule transactions. Note that this is different (and simpler) than the
+        // `authentication_key` used in LibraAccount::T, which is a hash of a public key + signature
+        // scheme identifier. Mutable
+        travel_rule_public_key: vector<u8>,
     }
 
     // A ChildVASP type for representing `AccountType<ChildVASP>` accounts.
@@ -80,7 +76,7 @@ module VASP {
         // account type.
         Transaction::assert(AccountType::is_a<RootVASP>(addr), 7001);
         let root_vasp = AccountType::account_metadata<RootVASP>(addr);
-        root_vasp.credential.expiration_date = LibraTimestamp::now_microseconds() + cert_lifetime();
+        root_vasp.expiration_date = LibraTimestamp::now_microseconds() + cert_lifetime();
         // The sending account must have a TransitionCapability<RootVASP>.
         AccountType::update<RootVASP>(addr, root_vasp);
     }
@@ -102,7 +98,7 @@ module VASP {
         Transaction::assert(is_root_vasp(addr), 7001);
         let root_vasp = AccountType::account_metadata<RootVASP>(addr);
         // Expire the root credential.
-        root_vasp.credential.expiration_date = 0;
+        root_vasp.expiration_date = 0;
         // Updat the root vasp metadata for the account with the new root vasp
         // credential.
         AccountType::update<RootVASP>(addr, root_vasp);
@@ -113,9 +109,10 @@ module VASP {
     public fun update_ca_cert(root_vasp_addr: address, ca_cert: vector<u8>) {
         Transaction::assert(is_root_vasp(root_vasp_addr), 7001);
         let root_vasp = AccountType::account_metadata<RootVASP>(root_vasp_addr);
-        root_vasp.credential.ca_cert = ca_cert;
+        root_vasp.ca_cert = ca_cert;
         AccountType::update<RootVASP>(root_vasp_addr, root_vasp);
     }
+
 
     ///////////////////////////////////////////////////////////////////////////
     // To-be root-vasp called functions
@@ -129,16 +126,17 @@ module VASP {
         human_name: vector<u8>,
         base_url: vector<u8>,
         ca_cert: vector<u8>,
+        travel_rule_public_key: vector<u8>
     ) {
         let current_time = LibraTimestamp::now_microseconds();
+        // Sanity check for key validity
+        Transaction::assert(Vector::length(&travel_rule_public_key) == 32, 7004);
         AccountType::apply_for<RootVASP>(RootVASP {
-            credential: RootCredential {
-                expiration_date: current_time + cert_lifetime(),
-                human_name,
-                base_url,
-                ca_cert,
-            },
-            limit_tracker: AccountLimits::create(),
+            expiration_date: current_time + cert_lifetime(),
+            human_name,
+            base_url,
+            ca_cert,
+            travel_rule_public_key,
         }, singleton_addr());
         AccountType::apply_for_granting_capability<ChildVASP>();
     }
@@ -242,7 +240,7 @@ module VASP {
     public fun is_root_vasp(addr: address): bool {
         if (AccountType::is_a<RootVASP>(addr)) {
             let root_vasp = AccountType::account_metadata<RootVASP>(addr);
-            !root_credential_expired(&root_vasp.credential)
+            !root_credential_expired(&root_vasp)
         } else {
             false
         }
@@ -292,23 +290,6 @@ module VASP {
         is_root_vasp(addr) || is_child_vasp(addr)
     }
 
-    // Return the account limit window for the root VASP.
-    public fun account_limits(root_addr: address): AccountLimits::Window {
-        let root_vasp = AccountType::account_metadata<RootVASP>(root_addr);
-        *&root_vasp.limit_tracker
-    }
-
-    // Update the account limits in the RootVASP and return the updated
-    // RootVASP structure.
-    // Note: Returning the RootVASP struct by value here is OK, since it
-    // cannot be stored anywhere unless the caller has the correct
-    // permissions.
-    public fun update_account_limits(root_addr: address, new_info: AccountLimits::Window): RootVASP {
-        let root_vasp = AccountType::account_metadata<RootVASP>(root_addr);
-        root_vasp.limit_tracker = new_info;
-        root_vasp
-    }
-
     // Return whether or not the root VASP at `root_vasp_addr` allows child
     // accounts.
     public fun allows_child_accounts(root_vasp_addr: address): bool {
@@ -327,31 +308,39 @@ module VASP {
     public fun ca_cert(addr: address): vector<u8> {
         let root_vasp_addr = root_vasp_address(addr);
         let root_vasp = AccountType::account_metadata<RootVASP>(root_vasp_addr);
-        *&root_vasp.credential.ca_cert
+        *&root_vasp.ca_cert
     }
 
     // Return the human-readable name for the VASP account at `addr`.
     public fun human_name(addr: address): vector<u8> {
         let root_vasp_addr = root_vasp_address(addr);
         let root_vasp = AccountType::account_metadata<RootVASP>(root_vasp_addr);
-        *&root_vasp.credential.human_name
+        *&root_vasp.human_name
     }
 
     // Return the base URL for the VASP account at `addr`.
     public fun base_url(addr: address): vector<u8> {
         let root_vasp_addr = root_vasp_address(addr);
         let root_vasp = AccountType::account_metadata<RootVASP>(root_vasp_addr);
-        *&root_vasp.credential.base_url
+        *&root_vasp.base_url
+    }
+
+
+    // Return the travel rule public key for the VASP account at `addr`.
+    public fun travel_rule_public_key(addr: address): vector<u8> {
+        let root_vasp_addr = root_vasp_address(addr);
+        let root_vasp = AccountType::account_metadata<RootVASP>(root_vasp_addr);
+        *&root_vasp.travel_rule_public_key
     }
 
     // Return the expiration date for the VASP account at `addr`.
     public fun expiration_date(addr: address): u64 {
         let root_vasp_addr = root_vasp_address(addr);
         let root_vasp = AccountType::account_metadata<RootVASP>(root_vasp_addr);
-        root_vasp.credential.expiration_date
+        root_vasp.expiration_date
     }
 
-    fun root_credential_expired(root_credential: &RootCredential): bool {
+    fun root_credential_expired(root_credential: &RootVASP): bool {
         root_credential.expiration_date < LibraTimestamp::now_microseconds()
     }
 
@@ -367,4 +356,6 @@ module VASP {
     fun cert_lifetime(): u64 {
         31540000000000
     }
+}
+
 }

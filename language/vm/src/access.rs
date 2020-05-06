@@ -111,7 +111,10 @@ pub trait ModuleAccess: Sync {
     fn function_def_at(&self, idx: FunctionDefinitionIndex) -> &FunctionDefinition {
         let result = &self.as_module().as_inner().function_defs[idx.into_index()];
         assumed_postcondition!(result.function.into_index() < self.function_handles().len()); // invariant
-        assumed_postcondition!(result.code.locals.into_index() < self.signatures().len()); // invariant
+        assumed_postcondition!(match &result.code {
+            Some(code) => code.locals.into_index() < self.signatures().len(),
+            None => true,
+        }); // invariant
         result
     }
 
@@ -252,8 +255,8 @@ pub trait ScriptAccess: Sync {
         &self.as_script().as_inner().address_identifiers
     }
 
-    fn main(&self) -> &FunctionDefinition {
-        &self.as_script().as_inner().main
+    fn code(&self) -> &CodeUnit {
+        &self.as_script().as_inner().code
     }
 }
 

@@ -1,29 +1,25 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 use crate::{
-    coordinator::{CoordinatorMessage, EpochRetrievalRequest, SyncCoordinator, SyncRequest},
+    coordinator::{CoordinatorMessage, SyncCoordinator, SyncRequest},
     executor_proxy::{ExecutorProxy, ExecutorProxyTrait},
     network::{StateSynchronizerEvents, StateSynchronizerSender},
     SynchronizerState,
 };
 use anyhow::{format_err, Result};
-use executor::Executor;
+use executor::ChunkExecutor;
 use futures::{
     channel::{mpsc, oneshot},
     future::Future,
     SinkExt,
 };
-use libra_config::config::{NodeConfig, RoleType, StateSyncConfig};
+use libra_config::config::{NodeConfig, RoleType, StateSyncConfig, UpstreamConfig};
 use libra_mempool::{CommitNotification, CommitResponse};
 use libra_types::{
     contract_event::ContractEvent, ledger_info::LedgerInfoWithSignatures, transaction::Transaction,
-    validator_change::ValidatorChangeProof, waypoint::Waypoint,
+    waypoint::Waypoint, PeerId,
 };
-use libra_vm::LibraVM;
-use std::{
-    sync::{Arc, Mutex},
-    time::Duration,
-};
+use std::{boxed::Box, collections::HashMap, sync::Arc, time::Duration};
 use storage_interface::DbReader;
 use subscription_service::ReconfigSubscription;
 use tokio::{
@@ -39,10 +35,10 @@ pub struct StateSynchronizer {
 impl StateSynchronizer {
     /// Setup state synchronizer. spawns coordinator and downloader routines on executor
     pub fn bootstrap(
-        network: Vec<(StateSynchronizerSender, StateSynchronizerEvents)>,
+        network: Vec<(PeerId, StateSynchronizerSender, StateSynchronizerEvents)>,
         state_sync_to_mempool_sender: mpsc::Sender<CommitNotification>,
         storage: Arc<dyn DbReader>,
-        executor: Arc<Mutex<Executor<LibraVM>>>,
+        executor: Box<dyn ChunkExecutor>,
         config: &NodeConfig,
         reconfig_event_subscriptions: Vec<ReconfigSubscription>,
     ) -> Self {
@@ -61,17 +57,19 @@ impl StateSynchronizer {
             config.base.role,
             config.base.waypoint,
             &config.state_sync,
+            config.upstream.clone(),
             executor_proxy,
         )
     }
 
     pub fn bootstrap_with_executor_proxy<E: ExecutorProxyTrait + 'static>(
         runtime: Runtime,
-        network: Vec<(StateSynchronizerSender, StateSynchronizerEvents)>,
+        network: Vec<(PeerId, StateSynchronizerSender, StateSynchronizerEvents)>,
         state_sync_to_mempool_sender: mpsc::Sender<CommitNotification>,
         role: RoleType,
         waypoint: Option<Waypoint>,
         state_sync_config: &StateSyncConfig,
+        upstream_config: UpstreamConfig,
         executor_proxy: E,
     ) -> Self {
         let (coordinator_sender, coordinator_receiver) = mpsc::unbounded();
@@ -80,12 +78,19 @@ impl StateSynchronizer {
             .get_local_storage_state()
             .expect("[state sync] Start failure: cannot sync with storage.");
 
+        let network_senders: HashMap<_, _> = network
+            .iter()
+            .map(|(network_id, sender, _events)| (*network_id, sender.clone()))
+            .collect();
+
         let coordinator = SyncCoordinator::new(
             coordinator_receiver,
             state_sync_to_mempool_sender,
+            network_senders,
             role,
             waypoint,
             state_sync_config.clone(),
+            upstream_config,
             executor_proxy,
             initial_state,
         );
@@ -178,26 +183,6 @@ impl StateSyncClient {
             sender.send(CoordinatorMessage::GetState(cb_sender)).await?;
             let info = cb_receiver.await?;
             Ok(info)
-        }
-    }
-
-    pub fn get_epoch_proof(
-        &self,
-        start_epoch: u64,
-        end_epoch: u64,
-    ) -> impl Future<Output = Result<ValidatorChangeProof>> {
-        let mut sender = self.coordinator_sender.clone();
-        let (cb_sender, cb_receiver) = oneshot::channel();
-        let request = EpochRetrievalRequest {
-            start_epoch,
-            end_epoch,
-            callback: cb_sender,
-        };
-        async move {
-            sender
-                .send(CoordinatorMessage::GetEpochProof(request))
-                .await?;
-            cb_receiver.await?
         }
     }
 }

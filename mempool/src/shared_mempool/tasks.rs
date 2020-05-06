@@ -8,13 +8,14 @@ use crate::{
     counters,
     network::{MempoolNetworkSender, MempoolSyncMsg},
     shared_mempool::types::{
-        notify_subscribers, PeerInfo, PeerSyncState, SharedMempool, SharedMempoolNotification,
+        notify_subscribers, ScheduledBroadcast, SharedMempool, SharedMempoolNotification,
     },
     CommitNotification, CommitResponse, CommittedTransaction, ConsensusRequest, ConsensusResponse,
     SubmissionStatus,
 };
 use anyhow::{ensure, format_err, Result};
-use futures::{channel::oneshot, future::join_all};
+use futures::{channel::oneshot, stream::FuturesUnordered};
+use libra_config::config::PeerNetworkId;
 use libra_logger::prelude::*;
 use libra_types::{
     mempool_status::{MempoolStatus, MempoolStatusCode},
@@ -28,87 +29,94 @@ use libra_types::{
 };
 use std::{
     cmp,
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     ops::Deref,
-    sync::{Arc, Mutex},
-    time::Duration,
+    sync::{Arc, Mutex, RwLock},
+    time::{Duration, Instant},
 };
-use tokio::sync::RwLock;
+use tokio::runtime::Handle;
 use vm_validator::vm_validator::{get_account_sequence_number, TransactionValidation};
 
 // ============================== //
 //  broadcast_coordinator tasks  //
 // ============================== //
-/// sync routine
-/// used to periodically broadcast ready to go transactions to peers
-pub(crate) async fn sync_with_peers<'a>(
-    peer_info: &'a Mutex<PeerInfo>,
-    mempool: &'a Mutex<CoreMempool>,
-    mut network_senders: HashMap<PeerId, MempoolNetworkSender>,
-    batch_size: usize,
-) {
-    // Clone the underlying peer_info map and use this to sync and collect
-    // state updates. We do this instead of holding the lock for the whole
-    // function since that would hold the lock across await points which is bad.
-    let peer_info_copy = peer_info
-        .lock()
-        .expect("[shared mempool] failed to acquire peer_info lock")
-        .deref()
-        .clone();
-    let mut state_updates = vec![];
 
-    for (peer_id, peer_state) in peer_info_copy.into_iter() {
-        if peer_state.is_alive {
-            let timeline_id = peer_state.timeline_id;
-            let (transactions, new_timeline_id) = mempool
-                .lock()
-                .expect("[shared mempool] failed to acquire mempool lock")
-                .read_timeline(timeline_id, batch_size);
+/// attempts broadcast to `peer` and schedules the next broadcast
+pub(crate) fn execute_broadcast<V>(
+    peer: PeerNetworkId,
+    smp: &mut SharedMempool<V>,
+    scheduled_broadcasts: &mut FuturesUnordered<ScheduledBroadcast>,
+    executor: Handle,
+) where
+    V: TransactionValidation,
+{
+    broadcast_single_peer(peer, smp);
 
-            if !transactions.is_empty() {
-                counters::SHARED_MEMPOOL_TRANSACTION_BROADCAST.inc_by(transactions.len() as i64);
+    let interval_ms = smp.config.shared_mempool_tick_interval_ms;
+    scheduled_broadcasts.push(ScheduledBroadcast::new(
+        Instant::now() + Duration::from_millis(interval_ms),
+        peer,
+        executor,
+    ))
+}
 
-                let network_sender = network_senders
-                    .get_mut(&peer_state.network_id)
-                    .expect("[shared mempool] missign network sender")
-                    .clone();
-
-                let request_id = create_request_id(timeline_id, new_timeline_id);
-                if let Err(e) = send_mempool_sync_msg(
-                    MempoolSyncMsg::BroadcastTransactionsRequest {
-                        request_id,
-                        transactions,
-                    },
-                    peer_id,
-                    network_sender,
-                ) {
-                    error!(
-                        "[shared mempool] error broadcasting transations to peer {}: {}",
-                        peer_id, e
-                    );
-                } else {
-                    // only update state for successful sends
-                    state_updates.push((peer_id, new_timeline_id));
-                }
-            }
+/// broadcasts txns to `peer` if alive
+fn broadcast_single_peer<V>(peer: PeerNetworkId, smp: &mut SharedMempool<V>)
+where
+    V: TransactionValidation,
+{
+    let peer_manager = &smp.peer_manager;
+    let timeline_id = if peer_manager.is_picked_peer(peer) {
+        let state = peer_manager.get_peer_state(peer);
+        if state.is_alive {
+            state.timeline_id
+        } else {
+            return;
         }
+    } else {
+        return;
+    };
+
+    let (transactions, new_timeline_id) = smp
+        .mempool
+        .lock()
+        .expect("[shared mempool] failed to acquire mempool lock")
+        .read_timeline(timeline_id, smp.config.shared_mempool_batch_size);
+
+    if transactions.is_empty() {
+        return;
     }
 
-    // Lock the shared peer_info and apply state updates.
-    let mut peer_info = peer_info
-        .lock()
-        .expect("[shared mempool] failed to acquire peer_info lock");
-    for (peer_id, new_timeline_id) in state_updates {
-        peer_info.entry(peer_id).and_modify(|t| {
-            t.timeline_id = new_timeline_id;
-        });
+    let mut network_sender = smp
+        .network_senders
+        .get_mut(&peer.network_id())
+        .expect("[shared mempool] missing network sender");
+
+    let request_id = create_request_id(timeline_id, new_timeline_id);
+    let txns_ct = transactions.len();
+    if let Err(e) = send_mempool_sync_msg(
+        MempoolSyncMsg::BroadcastTransactionsRequest {
+            request_id,
+            transactions,
+        },
+        peer.peer_id(),
+        &mut network_sender,
+    ) {
+        error!(
+            "[shared mempool] error broadcasting transactions to peer {:?}: {}",
+            peer, e
+        );
+    } else {
+        counters::SHARED_MEMPOOL_TRANSACTION_BROADCAST.inc_by(txns_ct as i64);
+        peer_manager.update_peer_broadcast(peer, new_timeline_id);
+        notify_subscribers(SharedMempoolNotification::Broadcast, &smp.subscribers);
     }
 }
 
 fn send_mempool_sync_msg(
     msg: MempoolSyncMsg,
     recipient: PeerId,
-    mut network_sender: MempoolNetworkSender,
+    network_sender: &mut MempoolNetworkSender,
 ) -> Result<()> {
     // Since this is a direct-send, this will only error if the network
     // module has unexpectedly crashed or shutdown.
@@ -133,8 +141,7 @@ pub(crate) async fn process_client_transaction_submission<V>(
     V: TransactionValidation,
 {
     let mut statuses =
-        process_incoming_transactions(smp.clone(), vec![transaction], TimelineState::NotReady)
-            .await;
+        process_incoming_transactions(&smp, vec![transaction], TimelineState::NotReady).await;
     log_txn_process_results(statuses.clone(), None);
     let status;
     if statuses.is_empty() {
@@ -158,27 +165,25 @@ pub(crate) async fn process_transaction_broadcast<V>(
     transactions: Vec<SignedTransaction>,
     request_id: String,
     timeline_state: TimelineState,
-    peer_id: PeerId,
-    network_id: PeerId,
+    peer: PeerNetworkId,
 ) where
     V: TransactionValidation,
 {
-    let network_sender = smp
-        .network_senders
-        .get_mut(&network_id)
-        .expect("[shared mempool] missing network sender")
-        .clone();
-    let results = process_incoming_transactions(smp, transactions, timeline_state).await;
-    log_txn_process_results(results, Some(peer_id));
+    let results = process_incoming_transactions(&smp, transactions, timeline_state).await;
+    log_txn_process_results(results, Some(peer.peer_id()));
     // send back ACK
+    let mut network_sender = smp
+        .network_senders
+        .get_mut(&peer.network_id())
+        .expect("[shared mempool] missing network sender");
     if let Err(e) = send_mempool_sync_msg(
         MempoolSyncMsg::BroadcastTransactionsResponse { request_id },
-        peer_id,
-        network_sender,
+        peer.peer_id(),
+        &mut network_sender,
     ) {
         error!(
-            "[shared mempool] failed to send ACK back to peer {}: {}",
-            peer_id, e
+            "[shared mempool] failed to send ACK back to peer {:?}: {}",
+            peer, e
         );
     }
 }
@@ -186,7 +191,7 @@ pub(crate) async fn process_transaction_broadcast<V>(
 /// submits a list of SignedTransaction to the local mempool
 /// and returns a vector containing AdmissionControlStatus
 async fn process_incoming_transactions<V>(
-    smp: SharedMempool<V>,
+    smp: &SharedMempool<V>,
     transactions: Vec<SignedTransaction>,
     timeline_state: TimelineState,
 ) -> Vec<SubmissionStatus>
@@ -195,12 +200,10 @@ where
 {
     let mut statuses = vec![];
 
-    let seq_numbers = join_all(
-        transactions
-            .iter()
-            .map(|t| get_account_sequence_number(smp.storage_read_client.clone(), t.sender())),
-    )
-    .await;
+    let seq_numbers = transactions
+        .iter()
+        .map(|t| get_account_sequence_number(smp.db.as_ref(), t.sender()))
+        .collect::<Vec<_>>();
 
     let transactions: Vec<_> =
         transactions
@@ -229,17 +232,15 @@ where
             })
             .collect();
 
-    let validation_results = join_all(transactions.iter().map(|t| {
-        let vm_validator = smp.validator.clone();
-        async move {
-            vm_validator
+    let validation_results = transactions
+        .iter()
+        .map(|t| {
+            smp.validator
                 .read()
-                .await
+                .unwrap()
                 .validate_transaction(t.0.clone())
-                .await
-        }
-    }))
-    .await;
+        })
+        .collect::<Vec<_>>();
 
     {
         let mut mempool = smp
@@ -277,6 +278,7 @@ where
     statuses
 }
 
+// TODO update counters to ID peers using PeerNetworkId
 fn log_txn_process_results(results: Vec<SubmissionStatus>, sender: Option<PeerId>) {
     let sender = match sender {
         Some(peer) => peer.to_string(),
@@ -306,21 +308,18 @@ fn log_txn_process_results(results: Vec<SubmissionStatus>, sender: Option<PeerId
 }
 
 /// processes ACK from peer node regarding txn submission to that node
-pub(crate) fn process_broadcast_ack<V>(
-    smp: SharedMempool<V>,
+pub(crate) fn process_broadcast_ack(
+    mempool: &Mutex<CoreMempool>,
     request_id: String,
     is_validator: bool, // whether this node is a validator or not
-) where
-    V: TransactionValidation,
-{
+) {
     if is_validator {
         return;
     }
 
     match parse_request_id(request_id) {
         Ok((start_id, end_id)) => {
-            let mut mempool = smp
-                .mempool
+            let mut mempool = mempool
                 .lock()
                 .expect("[shared mempool] failed to acquire mempool lock");
 
@@ -332,44 +331,14 @@ pub(crate) fn process_broadcast_ack<V>(
     }
 }
 
-// ===================== //
-// peer management tasks //
-// ===================== //
-/// new peer discovery handler
-/// adds new entry to `peer_info`
-/// `network_id` is the ID of the mempool network the peer belongs to
-pub(crate) fn new_peer(peer_info: &Mutex<PeerInfo>, peer_id: PeerId, network_id: PeerId) {
-    peer_info
-        .lock()
-        .expect("[shared mempool] failed to acquire peer_info lock")
-        .entry(peer_id)
-        .or_insert(PeerSyncState {
-            timeline_id: 0,
-            is_alive: true,
-            network_id,
-        })
-        .is_alive = true;
-}
-
-/// lost peer handler. Marks connection as dead
-pub(crate) fn lost_peer(peer_info: &Mutex<PeerInfo>, peer_id: PeerId) {
-    if let Some(state) = peer_info
-        .lock()
-        .expect("[shared mempool] failed to acquire peer_info lock")
-        .get_mut(&peer_id)
-    {
-        state.is_alive = false;
-    }
-}
-
 // ================================= //
 // intra-node communication handlers //
 // ================================= //
-pub(crate) async fn process_state_sync_request<V>(smp: SharedMempool<V>, req: CommitNotification)
-where
-    V: TransactionValidation,
-{
-    commit_txns(smp, req.transactions, req.block_timestamp_usecs, false).await;
+pub(crate) async fn process_state_sync_request(
+    mempool: Arc<Mutex<CoreMempool>>,
+    req: CommitNotification,
+) {
+    commit_txns(&mempool, req.transactions, req.block_timestamp_usecs, false).await;
     // send back to callback
     if let Err(e) = req
         .callback
@@ -387,10 +356,7 @@ where
     }
 }
 
-pub(crate) async fn process_consensus_request<V>(smp: SharedMempool<V>, req: ConsensusRequest)
-where
-    V: TransactionValidation,
-{
+pub(crate) async fn process_consensus_request(mempool: &Mutex<CoreMempool>, req: ConsensusRequest) {
     let (resp, callback) = match req {
         ConsensusRequest::GetBlockRequest(max_block_size, transactions, callback) => {
             let block_size = cmp::max(max_block_size, 1);
@@ -402,8 +368,7 @@ where
                 .iter()
                 .map(|txn| (txn.sender, txn.sequence_number))
                 .collect();
-            let mut txns = smp
-                .mempool
+            let mut txns = mempool
                 .lock()
                 .expect("[get_block] acquire mempool lock")
                 .get_block(block_size, exclude_transactions);
@@ -413,7 +378,7 @@ where
         }
         ConsensusRequest::RejectNotification(transactions, callback) => {
             // handle rejected txns
-            commit_txns(smp, transactions, 0, true).await;
+            commit_txns(mempool, transactions, 0, true).await;
             (ConsensusResponse::CommitResponse(), callback)
         }
     };
@@ -428,16 +393,13 @@ where
     }
 }
 
-async fn commit_txns<V>(
-    smp: SharedMempool<V>,
+async fn commit_txns(
+    mempool: &Mutex<CoreMempool>,
     transactions: Vec<CommittedTransaction>,
     block_timestamp_usecs: u64,
     is_rejected: bool,
-) where
-    V: TransactionValidation,
-{
-    let mut pool = smp
-        .mempool
+) {
+    let mut pool = mempool
         .lock()
         .expect("[shared mempool] failed to get mempool lock");
 
@@ -464,7 +426,7 @@ pub(crate) async fn process_config_update<V>(
     // restart VM validator
     validator
         .write()
-        .await
+        .unwrap()
         .restart(config_update)
         .expect("failed to restart VM validator");
 }

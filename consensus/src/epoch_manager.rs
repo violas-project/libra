@@ -30,9 +30,9 @@ use libra_config::config::{ConsensusConfig, ConsensusProposerType, NodeConfig};
 use libra_logger::prelude::*;
 use libra_types::{
     account_address::AccountAddress,
+    epoch_change::EpochChangeProof,
     epoch_info::EpochInfo,
     on_chain_config::{OnChainConfigPayload, ValidatorSet},
-    validator_change::{ValidatorChangeProof, VerifierType},
 };
 use network::protocols::network::Event;
 use safety_rules::SafetyRulesManager;
@@ -187,9 +187,9 @@ impl<T: Payload> EpochManager<T> {
         peer_id: AccountAddress,
     ) {
         let proof = match self
-            .state_computer
-            .get_epoch_proof(request.start_epoch, request.end_epoch)
-            .await
+            .storage
+            .libra_db()
+            .get_epoch_change_ledger_infos(request.start_epoch, request.end_epoch)
         {
             Ok(proof) => proof,
             Err(e) => {
@@ -197,7 +197,7 @@ impl<T: Payload> EpochManager<T> {
                 return;
             }
         };
-        let msg = ConsensusMsg::ValidatorChangeProof::<T>(Box::new(proof));
+        let msg = ConsensusMsg::EpochChangeProof::<T>(Box::new(proof));
         if let Err(e) = self.network_sender.send_to(peer_id, msg) {
             warn!(
                 "Failed to send a epoch retrieval to peer {}: {:?}",
@@ -239,12 +239,11 @@ impl<T: Payload> EpochManager<T> {
         }
     }
 
-    async fn start_new_epoch(&mut self, proof: ValidatorChangeProof) {
-        let verifier = VerifierType::TrustedVerifier(self.epoch_info().clone());
-        let ledger_info = match proof.verify(&verifier) {
+    async fn start_new_epoch(&mut self, proof: EpochChangeProof) {
+        let ledger_info = match proof.verify(self.epoch_info()) {
             Ok(ledger_info) => ledger_info,
             Err(e) => {
-                error!("Invalid ValidatorChangeProof: {:?}", e);
+                error!("Invalid EpochChangeProof: {:?}", e);
                 return;
             }
         };
@@ -294,7 +293,7 @@ impl<T: Payload> EpochManager<T> {
         let sr_waypoint = consensus_state.waypoint();
         let proofs = self
             .storage
-            .retrieve_validator_change_proof(sr_waypoint.version())
+            .retrieve_epoch_change_proof(sr_waypoint.version())
             .expect("Unable to retrieve Waypoint state from Storage");
 
         safety_rules
@@ -374,7 +373,7 @@ impl<T: Payload> EpochManager<T> {
             .expect("failed to get ValidatorSet from payload");
         let epoch_info = EpochInfo {
             epoch: payload.epoch(),
-            verifier: Arc::new((&validator_set).into()),
+            verifier: (&validator_set).into(),
         };
         let validator_keys = validator_set.payload().to_vec();
         info!("Update Network about new validators");
@@ -421,7 +420,7 @@ impl<T: Payload> EpochManager<T> {
                     self.process_different_epoch(event.epoch(), peer_id).await;
                 }
             }
-            ConsensusMsg::ValidatorChangeProof(proof) => {
+            ConsensusMsg::EpochChangeProof(proof) => {
                 let msg_epoch = proof.epoch().map_err(|e| warn!("{:?}", e)).ok()?;
                 if msg_epoch == self.epoch() {
                     self.start_new_epoch(*proof).await

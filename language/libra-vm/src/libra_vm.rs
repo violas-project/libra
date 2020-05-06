@@ -7,22 +7,23 @@ use libra_crypto::HashValue;
 use libra_logger::prelude::*;
 use libra_state_view::StateView;
 use libra_types::{
+    access_path::{AccessPath, Accesses},
     account_address::AccountAddress,
     account_config,
     block_metadata::BlockMetadata,
-    language_storage::TypeTag,
+    language_storage::{ResourceKey, StructTag, TypeTag},
     move_resource::MoveResource,
     on_chain_config::{LibraVersion, OnChainConfig, VMConfig},
     transaction::{
         ChangeSet, Module, Script, SignatureCheckedTransaction, SignedTransaction, Transaction,
         TransactionArgument, TransactionOutput, TransactionPayload, TransactionStatus,
-        VMValidatorResult, MAX_TRANSACTION_SIZE_IN_BYTES,
+        VMValidatorResult,
     },
     vm_error::{sub_status, StatusCode, VMStatus},
     write_set::{WriteSet, WriteSetMut},
 };
 use move_core_types::{
-    gas_schedule::{self, AbstractMemorySize, CostTable, GasAlgebra, GasCarrier, GasUnits},
+    gas_schedule::{AbstractMemorySize, CostTable, GasAlgebra, GasCarrier, GasUnits},
     identifier::{IdentStr, Identifier},
 };
 use move_vm_runtime::MoveVM;
@@ -30,9 +31,9 @@ use move_vm_state::{
     data_cache::{BlockDataCache, RemoteCache, RemoteStorage},
     execution_context::{ExecutionContext, SystemExecutionContext, TransactionExecutionContext},
 };
-use move_vm_types::{chain_state::ChainState, identifier::create_access_path, values::Value};
+use move_vm_types::{chain_state::ChainState, values::Value};
 use rayon::prelude::*;
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, convert::TryFrom, sync::Arc};
 use vm::{
     errors::{convert_prologue_runtime_error, VMResult},
     gas_schedule::{calculate_intrinsic_gas, zero_cost_schedule},
@@ -105,18 +106,19 @@ impl LibraVM {
     }
 
     fn check_gas(&self, txn: &SignedTransaction) -> VMResult<()> {
+        let gas_constants = &self.get_gas_schedule()?.gas_constants;
         let raw_bytes_len = AbstractMemorySize::new(txn.raw_txn_bytes_len() as GasCarrier);
         // The transaction is too large.
-        if txn.raw_txn_bytes_len() > MAX_TRANSACTION_SIZE_IN_BYTES {
+        if txn.raw_txn_bytes_len() > gas_constants.max_transaction_size_in_bytes as usize {
             let error_str = format!(
                 "max size: {}, txn size: {}",
-                MAX_TRANSACTION_SIZE_IN_BYTES,
+                gas_constants.max_transaction_size_in_bytes,
                 raw_bytes_len.get()
             );
             warn!(
                 "[VM] Transaction size too big {} (max {})",
                 raw_bytes_len.get(),
-                MAX_TRANSACTION_SIZE_IN_BYTES
+                gas_constants.max_transaction_size_in_bytes
             );
             return Err(
                 VMStatus::new(StatusCode::EXCEEDED_MAX_TRANSACTION_SIZE).with_message(error_str)
@@ -125,20 +127,20 @@ impl LibraVM {
 
         // Check is performed on `txn.raw_txn_bytes_len()` which is the same as
         // `raw_bytes_len`
-        assume!(raw_bytes_len.get() <= MAX_TRANSACTION_SIZE_IN_BYTES as u64);
+        assume!(raw_bytes_len.get() <= gas_constants.max_transaction_size_in_bytes);
 
         // The submitted max gas units that the transaction can consume is greater than the
         // maximum number of gas units bound that we have set for any
         // transaction.
-        if txn.max_gas_amount() > gas_schedule::MAXIMUM_NUMBER_OF_GAS_UNITS.get() {
+        if txn.max_gas_amount() > gas_constants.maximum_number_of_gas_units.get() {
             let error_str = format!(
                 "max gas units: {}, gas units submitted: {}",
-                gas_schedule::MAXIMUM_NUMBER_OF_GAS_UNITS.get(),
+                gas_constants.maximum_number_of_gas_units.get(),
                 txn.max_gas_amount()
             );
             warn!(
                 "[VM] Gas unit error; max {}, submitted {}",
-                gas_schedule::MAXIMUM_NUMBER_OF_GAS_UNITS.get(),
+                gas_constants.maximum_number_of_gas_units.get(),
                 txn.max_gas_amount()
             );
             return Err(
@@ -150,7 +152,7 @@ impl LibraVM {
         // The submitted transactions max gas units needs to be at least enough to cover the
         // intrinsic cost of the transaction as calculated against the size of the
         // underlying `RawTransaction`
-        let min_txn_fee = calculate_intrinsic_gas(raw_bytes_len);
+        let min_txn_fee = calculate_intrinsic_gas(raw_bytes_len, gas_constants);
         if txn.max_gas_amount() < min_txn_fee.get() {
             let error_str = format!(
                 "min gas required for txn: {}, gas submitted: {}",
@@ -172,16 +174,16 @@ impl LibraVM {
         // NB: MIN_PRICE_PER_GAS_UNIT may equal zero, but need not in the future. Hence why
         // we turn off the clippy warning.
         #[allow(clippy::absurd_extreme_comparisons)]
-        let below_min_bound = txn.gas_unit_price() < gas_schedule::MIN_PRICE_PER_GAS_UNIT.get();
+        let below_min_bound = txn.gas_unit_price() < gas_constants.min_price_per_gas_unit.get();
         if below_min_bound {
             let error_str = format!(
                 "gas unit min price: {}, submitted price: {}",
-                gas_schedule::MIN_PRICE_PER_GAS_UNIT.get(),
+                gas_constants.min_transaction_gas_units.get(),
                 txn.gas_unit_price()
             );
             warn!(
                 "[VM] Gas unit error; min {}, submitted {}",
-                gas_schedule::MIN_PRICE_PER_GAS_UNIT.get(),
+                gas_constants.min_transaction_gas_units.get(),
                 txn.gas_unit_price()
             );
             return Err(
@@ -190,15 +192,15 @@ impl LibraVM {
         }
 
         // The submitted gas price is greater than the maximum gas unit price set by the VM.
-        if txn.gas_unit_price() > gas_schedule::MAX_PRICE_PER_GAS_UNIT.get() {
+        if txn.gas_unit_price() > gas_constants.max_price_per_gas_unit.get() {
             let error_str = format!(
                 "gas unit max price: {}, submitted price: {}",
-                gas_schedule::MAX_PRICE_PER_GAS_UNIT.get(),
+                gas_constants.max_price_per_gas_unit.get(),
                 txn.gas_unit_price()
             );
             warn!(
                 "[VM] Gas unit error; min {}, submitted {}",
-                gas_schedule::MAX_PRICE_PER_GAS_UNIT.get(),
+                gas_constants.max_price_per_gas_unit.get(),
                 txn.gas_unit_price()
             );
             return Err(
@@ -325,7 +327,7 @@ impl LibraVM {
                     self.move_vm
                         .execute_script(s, gas_schedule, &mut ctx, txn_data, ty_args, args);
                 let gas_usage = txn_data.max_gas_amount().sub(ctx.remaining_gas()).get();
-                record_stats!(observe | TXN_EXECUTION_GAS_USAGE | gas_usage);
+                TXN_EXECUTION_GAS_USAGE.observe(gas_usage as f64);
                 ret
             }
         }
@@ -385,23 +387,20 @@ impl LibraVM {
     ) -> TransactionOutput {
         let txn_data = TransactionMetadata::new(txn);
         let account_currency_symbol = account_curreny_currency_code(txn.sender(), remote_cache);
-        let verified_payload = record_stats! {time_hist | TXN_VERIFICATION_TIME_TAKEN | {
-            account_currency_symbol.clone()
-                .and_then(|currency_code|
-                    self.verify_user_transaction_impl(txn, remote_cache, &currency_code)
-                )
-        }};
+        let verified_payload = account_currency_symbol.clone().and_then(|currency_code| {
+            let _timer = TXN_VERIFICATION_SECONDS.start_timer();
+            self.verify_user_transaction_impl(txn, remote_cache, &currency_code)
+        });
         let result = verified_payload
             .and_then(|verified_payload| {
                 account_currency_symbol.and_then(|account_currency_symbol| {
-                    record_stats! {time_hist | TXN_EXECUTION_TIME_TAKEN | {
+                    let _timer = TXN_EXECUTION_SECONDS.start_timer();
                     Ok(self.execute_verified_payload(
                         remote_cache,
                         &txn_data,
                         verified_payload,
                         &account_currency_symbol,
                     ))
-                    }}
                 })
             })
             .unwrap_or_else(discard_error_output);
@@ -603,26 +602,24 @@ impl LibraVM {
         let txn_gas_price = txn_data.gas_unit_price().get();
         let txn_max_gas_units = txn_data.max_gas_amount().get();
         let txn_expiration_time = txn_data.expiration_time();
-        record_stats! {time_hist | TXN_PROLOGUE_TIME_TAKEN | {
-                self.move_vm
-                    .execute_function(
-                        &account_config::ACCOUNT_MODULE,
-                        &PROLOGUE_NAME,
-                        self.get_gas_schedule()?,
-                        chain_state,
-                        &txn_data,
-                        vec![gas_currency_ty],
-                        vec![
-                            Value::u64(txn_sequence_number),
-                            Value::vector_u8(txn_public_key),
-                            Value::u64(txn_gas_price),
-                            Value::u64(txn_max_gas_units),
-                            Value::u64(txn_expiration_time),
-                        ],
-                    )
-                    .map_err(|err| convert_prologue_runtime_error(&err, &txn_data.sender))
-                }
-        }
+        let _timer = TXN_PROLOGUE_SECONDS.start_timer();
+        self.move_vm
+            .execute_function(
+                &account_config::ACCOUNT_MODULE,
+                &PROLOGUE_NAME,
+                self.get_gas_schedule()?,
+                chain_state,
+                &txn_data,
+                vec![gas_currency_ty],
+                vec![
+                    Value::u64(txn_sequence_number),
+                    Value::vector_u8(txn_public_key),
+                    Value::u64(txn_gas_price),
+                    Value::u64(txn_max_gas_units),
+                    Value::u64(txn_expiration_time),
+                ],
+            )
+            .map_err(|err| convert_prologue_runtime_error(&err, &txn_data.sender))
     }
 
     /// Run the epilogue of a transaction by calling into `EPILOGUE_NAME` function stored
@@ -639,23 +636,21 @@ impl LibraVM {
         let txn_gas_price = txn_data.gas_unit_price().get();
         let txn_max_gas_units = txn_data.max_gas_amount().get();
         let gas_remaining = chain_state.remaining_gas().get();
-        record_stats! {time_hist | TXN_EPILOGUE_TIME_TAKEN | {
-                self.move_vm.execute_function(
-                    &account_config::ACCOUNT_MODULE,
-                    &EPILOGUE_NAME,
-                    self.get_gas_schedule()?,
-                    chain_state,
-                    &txn_data,
-                    vec![gas_currency_ty],
-                    vec![
-                        Value::u64(txn_sequence_number),
-                        Value::u64(txn_gas_price),
-                        Value::u64(txn_max_gas_units),
-                        Value::u64(gas_remaining),
-                    ],
-                )
-            }
-        }
+        let _timer = TXN_EPILOGUE_SECONDS.start_timer();
+        self.move_vm.execute_function(
+            &account_config::ACCOUNT_MODULE,
+            &EPILOGUE_NAME,
+            self.get_gas_schedule()?,
+            chain_state,
+            &txn_data,
+            vec![gas_currency_ty],
+            vec![
+                Value::u64(txn_sequence_number),
+                Value::u64(txn_gas_price),
+                Value::u64(txn_max_gas_units),
+                Value::u64(gas_remaining),
+            ],
+        )
     }
 
     /// Run the prologue of a transaction by calling into `PROLOGUE_NAME` function stored
@@ -668,23 +663,21 @@ impl LibraVM {
         let txn_sequence_number = txn_data.sequence_number();
         let txn_public_key = txn_data.authentication_key_preimage().to_vec();
         let gas_schedule = zero_cost_schedule();
-        record_stats! {time_hist | TXN_PROLOGUE_TIME_TAKEN | {
-                self.move_vm
-                    .execute_function(
-                        &LIBRA_WRITESET_MANAGER_MODULE,
-                        &PROLOGUE_NAME,
-                        &gas_schedule,
-                        chain_state,
-                        &txn_data,
-                        vec![],
-                        vec![
-                            Value::u64(txn_sequence_number),
-                            Value::vector_u8(txn_public_key),
-                        ],
-                    )
-                    .map_err(|err| convert_prologue_runtime_error(&err, &txn_data.sender))
-                }
-        }
+        let _timer = TXN_PROLOGUE_SECONDS.start_timer();
+        self.move_vm
+            .execute_function(
+                &LIBRA_WRITESET_MANAGER_MODULE,
+                &PROLOGUE_NAME,
+                &gas_schedule,
+                chain_state,
+                &txn_data,
+                vec![],
+                vec![
+                    Value::u64(txn_sequence_number),
+                    Value::vector_u8(txn_public_key),
+                ],
+            )
+            .map_err(|err| convert_prologue_runtime_error(&err, &txn_data.sender))
     }
 
     /// Run the epilogue of a transaction by calling into `EPILOGUE_NAME` function stored
@@ -699,20 +692,16 @@ impl LibraVM {
             lcs::to_bytes(change_set).map_err(|_| VMStatus::new(StatusCode::INVALID_DATA))?;
         let gas_schedule = zero_cost_schedule();
 
-        record_stats! {time_hist | TXN_EPILOGUE_TIME_TAKEN | {
-                self.move_vm.execute_function(
-                    &LIBRA_WRITESET_MANAGER_MODULE,
-                    &EPILOGUE_NAME,
-                    &gas_schedule,
-                    chain_state,
-                    &txn_data,
-                    vec![],
-                    vec![
-                        Value::vector_u8(change_set_bytes),
-                    ],
-                )
-            }
-        }
+        let _timer = TXN_EPILOGUE_SECONDS.start_timer();
+        self.move_vm.execute_function(
+            &LIBRA_WRITESET_MANAGER_MODULE,
+            &EPILOGUE_NAME,
+            &gas_schedule,
+            chain_state,
+            &txn_data,
+            vec![],
+            vec![Value::vector_u8(change_set_bytes)],
+        )
     }
 
     fn execute_block_impl(
@@ -752,7 +741,13 @@ impl LibraVM {
                 }
             }
         }
-        report_block_count(count);
+
+        // Record the histogram count for transactions per block.
+        match i64::try_from(count) {
+            Ok(val) => BLOCK_TRANSACTION_COUNT.set(val),
+            Err(_) => BLOCK_TRANSACTION_COUNT.set(std::i64::MAX),
+        }
+
         Ok(result)
     }
 
@@ -778,19 +773,28 @@ impl LibraVM {
         let mut result = vec![];
         trace_code_block!("libra_vm::execute_transactions", {"block", block_id});
         for transaction in signature_verified_block {
-            record_stats! {time_hist | TXN_TOTAL_TIME_TAKEN | {
-                    let output = match transaction {
-                        Ok(txn) => self.execute_user_transaction(state_view, data_cache, &txn),
-                        Err(e) => discard_error_output(e),
-                    };
-                    report_execution_status(output.status());
-
-                    // `result` is initially empty, a single element is pushed per loop iteration and
-                    // the number of iterations is bound to the max size of `signature_verified_block`
-                    assume!(result.len() < usize::max_value());
-                    result.push(output);
+            let output = match transaction {
+                Ok(txn) => {
+                    let _timer = TXN_TOTAL_SECONDS.start_timer();
+                    self.execute_user_transaction(state_view, data_cache, &txn)
                 }
+                Err(e) => discard_error_output(e),
+            };
+
+            // Increment the counter for transactions executed.
+            let counter_label = match output.status() {
+                TransactionStatus::Keep(_) => Some("success"),
+                TransactionStatus::Discard(_) => Some("discarded"),
+                TransactionStatus::Retry => None,
+            };
+            if let Some(label) = counter_label {
+                TRANSACTIONS_EXECUTED.with_label_values(&[label]).inc();
             }
+
+            // `result` is initially empty, a single element is pushed per loop iteration and
+            // the number of iterations is bound to the max size of `signature_verified_block`
+            assume!(result.len() < usize::max_value());
+            result.push(output);
         }
         Ok(result)
     }
@@ -825,52 +829,59 @@ impl VMValidator for LibraVM {
         state_view: &dyn StateView,
     ) -> VMValidatorResult {
         let data_cache = BlockDataCache::new(state_view);
-        record_stats! {time_hist | TXN_VALIDATION_TIME_TAKEN | {
-                let gas_price = transaction.gas_unit_price();
-                let txn_sender = transaction.sender();
-                let signature_verified_txn = if let Ok(t) = transaction.check_signature() {
-                    t
+        let _timer = TXN_VALIDATION_SECONDS.start_timer();
+        let gas_price = transaction.gas_unit_price();
+        let txn_sender = transaction.sender();
+        let signature_verified_txn = if let Ok(t) = transaction.check_signature() {
+            t
+        } else {
+            return VMValidatorResult::new(
+                Some(VMStatus::new(StatusCode::INVALID_SIGNATURE)),
+                gas_price,
+                false,
+            );
+        };
+
+        let is_governance_txn = is_governance_txn(txn_sender, &data_cache);
+        let currency_code = match account_curreny_currency_code(txn_sender, &data_cache) {
+            Ok(code) => code,
+            Err(err) => return VMValidatorResult::new(Some(err), gas_price, false),
+        };
+
+        let normalized_gas_price = match normalize_gas_price(gas_price, &currency_code, &data_cache)
+        {
+            Ok(price) => price,
+            Err(err) => return VMValidatorResult::new(Some(err), gas_price, false),
+        };
+
+        let res = match self.verify_transaction_impl(
+            &signature_verified_txn,
+            &data_cache,
+            &currency_code,
+        ) {
+            Ok(_) => None,
+            Err(err) => {
+                if err.major_status == StatusCode::SEQUENCE_NUMBER_TOO_NEW {
+                    None
                 } else {
-                    return VMValidatorResult::new(
-                        Some(VMStatus::new(StatusCode::INVALID_SIGNATURE)),
-                        gas_price,
-                        false,
-                    );
-                };
-
-                let is_governance_txn = is_governance_txn(txn_sender, &data_cache);
-                let currency_code = match account_curreny_currency_code(txn_sender, &data_cache) {
-                    Ok(code) => code,
-                    Err(err) => return VMValidatorResult::new(Some(err), gas_price, false),
-                };
-
-                let normalized_gas_price = match normalize_gas_price(gas_price, &currency_code, &data_cache) {
-                    Ok(price) => price,
-                    Err(err) => return VMValidatorResult::new(Some(err), gas_price, false),
-                };
-
-                let res = match self.verify_transaction_impl(
-                    &signature_verified_txn,
-                    &data_cache,
-                    &currency_code,
-                ) {
-                    Ok(_) => None,
-                    Err(err) => {
-                        if err.major_status == StatusCode::SEQUENCE_NUMBER_TOO_NEW {
-                            None
-                        } else {
-                            Some(convert_prologue_runtime_error(
-                                &err,
-                                &signature_verified_txn.sender(),
-                            ))
-                        }
-                    }
-                };
-
-                report_verification_status(&res);
-                VMValidatorResult::new(res, normalized_gas_price, is_governance_txn)
+                    Some(convert_prologue_runtime_error(
+                        &err,
+                        &signature_verified_txn.sender(),
+                    ))
+                }
             }
-        }
+        };
+
+        // Increment the counter for transactions verified.
+        let counter_label = match res {
+            None => "success",
+            Some(_) => "failure",
+        };
+        TRANSACTIONS_VERIFIED
+            .with_label_values(&[counter_label])
+            .inc();
+
+        VMValidatorResult::new(res, normalized_gas_price, is_governance_txn)
     }
 }
 
@@ -1037,6 +1048,12 @@ fn convert_txn_args(args: &[TransactionArgument]) -> Vec<Value> {
         .collect()
 }
 
+/// Get the AccessPath to a resource stored under `address` with type name `tag`
+fn create_access_path(address: AccountAddress, tag: StructTag) -> AccessPath {
+    let resource_tag = ResourceKey::new(address, tag);
+    AccessPath::resource_access_path(&resource_tag, &Accesses::empty())
+}
+
 fn get_transaction_output(
     ctx: &mut (impl ChainState + ExecutionContext),
     txn_data: &TransactionMetadata,
@@ -1048,7 +1065,7 @@ fn get_transaction_output(
         .mul(txn_data.gas_unit_price())
         .get();
     let write_set = ctx.make_write_set()?;
-    record_stats!(observe | TXN_TOTAL_GAS_USAGE | gas_used);
+    TXN_TOTAL_GAS_USAGE.observe(gas_used as f64);
     Ok(TransactionOutput::new(
         write_set,
         ctx.events().to_vec(),

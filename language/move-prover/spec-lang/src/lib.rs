@@ -15,6 +15,7 @@ use move_lang::{
     errors::Errors,
     expansion::ast::Program,
     move_compile_no_report, move_compile_to_expansion_no_report,
+    parser::ast::FunctionName,
     shared::Address,
 };
 
@@ -24,8 +25,15 @@ pub mod symbol;
 mod translate;
 pub mod ty;
 
+use crate::env::SCRIPT_MODULE_NAME;
 #[allow(unused_imports)]
 use log::{info, warn};
+use move_ir_types::location::Spanned;
+use move_lang::{
+    expansion::ast::ModuleDefinition,
+    parser::ast::{ModuleIdent, ModuleIdent_},
+    shared::{unique_map::UniqueMap, Name},
+};
 
 // =================================================================================================
 // Entry Point
@@ -40,11 +48,14 @@ pub fn run_spec_lang_compiler(
         .transpose()
         .map_err(|s| anyhow!(s))?;
 
+    // Construct all sources from targets and deps, as we need bytecode for all of them.
+    let mut all_sources = targets;
+    all_sources.extend(deps.clone());
     let mut env = GlobalEnv::new();
     // First pass: compile move code.
-    let (files, units_or_errors) = move_compile_no_report(&targets, &deps, address_opt)?;
+    let (files, units_or_errors) = move_compile_no_report(&all_sources, &[], address_opt)?;
     for (fname, fsrc) in files {
-        env.add_source(fname, &fsrc);
+        env.add_source(fname, &fsrc, deps.contains(&fname.to_string()));
     }
     match units_or_errors {
         Err(errors) => {
@@ -60,7 +71,7 @@ pub fn run_spec_lang_compiler(
                 // The alternative to do a second parse and expansion pass is to make the expansion
                 // AST clonable and tee it somehow out of the regular compile chain.
                 let (_, eprog_or_errors) =
-                    move_compile_to_expansion_no_report(&targets, &deps, address_opt)?;
+                    move_compile_to_expansion_no_report(&all_sources, &[], address_opt)?;
                 let eprog = eprog_or_errors.expect("no compilation errors");
                 // Run the spec checker on verified units plus expanded AST. This will
                 // populate the environment including any errors.
@@ -84,6 +95,7 @@ fn add_move_lang_errors(env: &mut GlobalEnv, errors: Errors) {
     }
 }
 
+#[allow(deprecated)]
 fn run_spec_checker(
     env: &mut GlobalEnv,
     units: Vec<CompiledUnit>,
@@ -94,33 +106,86 @@ fn run_spec_checker(
     // units which is topological w.r.t. use relation.
     let modules = units
         .into_iter()
-        .filter_map(|unit| {
-            let (module_id, compiled_module, source_map, function_infos) = match unit {
+        .flat_map(|unit| {
+            Some(match unit {
                 CompiledUnit::Module {
                     ident,
                     module,
                     source_map,
                     function_infos,
-                } => (ident, module, source_map, function_infos),
-                CompiledUnit::Script { .. } => return None,
-            };
-            let expanded_module = match eprog.modules.remove(&module_id) {
-                Some(m) => m,
-                None => {
-                    warn!(
-                        "[internal] cannot associate bytecode module `{}` with AST",
-                        module_id
-                    );
-                    return None;
+                } => {
+                    let expanded_module = match eprog.modules.remove(&ident) {
+                        Some(m) => m,
+                        None => {
+                            warn!(
+                                "[internal] cannot associate bytecode module `{}` with AST",
+                                ident
+                            );
+                            return None;
+                        }
+                    };
+                    (ident, expanded_module, module, source_map, function_infos)
                 }
-            };
-            Some((
-                module_id,
-                expanded_module,
-                compiled_module,
-                source_map,
-                function_infos,
-            ))
+                CompiledUnit::Script {
+                    loc: _loc,
+                    key,
+                    script,
+                    source_map,
+                    function_info,
+                } => {
+                    let move_lang::expansion::ast::Script {
+                        loc,
+                        uses,
+                        unused_aliases: _unused_aliases,
+                        function_name,
+                        function,
+                        specs,
+                    } = match eprog.scripts.remove(&key) {
+                        Some(s) => s,
+                        None => {
+                            warn!(
+                                "[internal] cannot associate bytecode script `{}` with AST",
+                                key
+                            );
+                            return None;
+                        }
+                    };
+                    // Convert the script into a module.
+                    let ident = ModuleIdent(Spanned {
+                        loc,
+                        value: ModuleIdent_ {
+                            name: move_lang::parser::ast::ModuleName(Name {
+                                loc,
+                                value: SCRIPT_MODULE_NAME.to_string(),
+                            }),
+                            address: Address::default(),
+                        },
+                    });
+                    let mut function_infos = UniqueMap::new();
+                    function_infos
+                        .add(FunctionName(Name { loc, value: key }), function_info)
+                        .unwrap();
+                    // Construct a pseudo module definition.
+                    let mut functions = UniqueMap::new();
+                    functions.add(function_name.clone(), function).unwrap();
+                    // As we now know the real function name and address, replace it in the
+                    // data we got from bytecode.
+                    let function_info = function_infos.into_iter().next().unwrap().1;
+                    function_infos = UniqueMap::new();
+                    function_infos.add(function_name, function_info).unwrap();
+                    let expanded_module = ModuleDefinition {
+                        loc,
+                        uses,
+                        unused_aliases: vec![],
+                        is_source_module: true,
+                        structs: UniqueMap::new(),
+                        functions,
+                        specs,
+                    };
+                    let module = script.into_module().1;
+                    (ident, expanded_module, module, source_map, function_infos)
+                }
+            })
         })
         .enumerate();
     for (module_count, (module_id, expanded_module, compiled_module, source_map, function_infos)) in

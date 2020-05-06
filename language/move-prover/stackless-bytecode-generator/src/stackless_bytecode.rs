@@ -107,7 +107,6 @@ pub enum Operation {
     GetGlobal(ModuleId, StructId, Vec<Type>),
 
     // Builtins
-    Abort,
     Destroy,
     ReadRef,
     WriteRef,
@@ -140,14 +139,6 @@ pub enum Operation {
     Neq,
 }
 
-/// A branch condition.
-#[derive(Debug, Clone, PartialEq, Eq, Copy)]
-pub enum BranchCond {
-    Always,
-    True(TempIndex),
-    False(TempIndex),
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Bytecode {
     SpecBlock(AttrId, SpecBlockId),
@@ -158,8 +149,10 @@ pub enum Bytecode {
     Ret(AttrId, Vec<TempIndex>),
 
     Load(AttrId, TempIndex, Constant),
-    Branch(AttrId, Label, BranchCond),
+    Branch(AttrId, Label, Label, TempIndex),
+    Jump(AttrId, Label),
     Label(AttrId, Label),
+    Abort(AttrId, TempIndex),
     Nop(AttrId),
 }
 
@@ -173,7 +166,9 @@ impl Bytecode {
             | Ret(id, ..)
             | Load(id, ..)
             | Branch(id, ..)
+            | Jump(id, ..)
             | Label(id, ..)
+            | Abort(id, ..)
             | Nop(id) => *id,
         }
     }
@@ -185,26 +180,24 @@ impl Bytecode {
     pub fn is_unconditional_branch(&self) -> bool {
         matches!(
             self,
-            Bytecode::Ret(..) | Bytecode::Branch(_, _, BranchCond::Always)
+            Bytecode::Ret(..) | Bytecode::Jump(..) | Bytecode::Abort(..)
         )
     }
 
     pub fn is_conditional_branch(&self) -> bool {
-        matches!(
-            self,
-            Bytecode::Branch(_, _, BranchCond::False(_)) | Bytecode::Branch(_, _, BranchCond::True(_))
-        )
+        matches!(self, Bytecode::Branch(..))
     }
 
     pub fn is_branch(&self) -> bool {
         self.is_conditional_branch() || self.is_unconditional_branch()
     }
 
-    /// Return the destination of branching if self is a branching instruction
-    pub fn branch_dest(&self) -> Option<Label> {
+    /// Return the destination(s) if self is a branch/jump instruction
+    pub fn branch_dests(&self) -> Vec<Label> {
         match self {
-            Bytecode::Branch(_, label, _) => Some(*label),
-            _ => None,
+            Bytecode::Branch(_, then_label, else_label, _) => vec![*then_label, *else_label],
+            Bytecode::Jump(_, label) => vec![*label],
+            _ => vec![],
         }
     }
 
@@ -227,27 +220,15 @@ impl Bytecode {
         label_offsets: &BTreeMap<Label, CodeOffset>,
     ) -> Vec<CodeOffset> {
         let bytecode = &code[pc as usize];
+        assert!(bytecode.is_branch());
         let mut v = vec![];
-
-        if let Some(label) = bytecode.branch_dest() {
+        for label in bytecode.branch_dests() {
             v.push(*label_offsets.get(&label).expect("label defined"));
         }
-
-        let next_pc = pc + 1;
-        if next_pc >= code.len() as CodeOffset {
-            return v;
-        }
-
-        if !bytecode.is_unconditional_branch() && !v.contains(&next_pc) {
-            // avoid duplicates
-            v.push(next_pc);
-        }
-
         // always give successors in ascending order
         if v.len() > 1 && v[0] > v[1] {
             v.swap(0, 1);
         }
-
         v
     }
 }
@@ -309,21 +290,23 @@ impl<'env> fmt::Display for BytecodeDisplay<'env> {
             Load(_, dst, cons) => {
                 write!(f, "{} := {}", self.lstr(*dst), cons)?;
             }
-            Branch(_, label, cond) => {
-                use BranchCond::*;
-                match cond {
-                    True(src) => {
-                        write!(f, "if ({}) ", self.lstr(*src))?;
-                    }
-                    False(src) => {
-                        write!(f, "if (!{}) ", self.lstr(*src))?;
-                    }
-                    _ => {}
-                }
+            Branch(_, then_label, else_label, src) => {
+                write!(
+                    f,
+                    "if ({}) goto L{} else goto L{}",
+                    self.lstr(*src),
+                    then_label.as_usize(),
+                    else_label.as_usize()
+                )?;
+            }
+            Jump(_, label) => {
                 write!(f, "goto L{}", label.as_usize())?;
             }
             Label(_, label) => {
                 write!(f, "L{}:", label.as_usize(),)?;
+            }
+            Abort(_, src) => {
+                write!(f, "abort({})", self.lstr(*src))?;
             }
             Nop(_) => {
                 write!(f, "nop")?;
@@ -463,9 +446,6 @@ impl<'env> fmt::Display for OperationDisplay<'env> {
             }
 
             // Builtins
-            Abort => {
-                write!(f, "abort")?;
-            }
             Destroy => {
                 write!(f, "destroy")?;
             }

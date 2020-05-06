@@ -1,18 +1,4 @@
-// dep: tests/sources/stdlib/modules/libra.move
-// dep: tests/sources/stdlib/modules/vector.move
-// dep: tests/sources/stdlib/modules/lbr.move
-// dep: tests/sources/stdlib/modules/libra_account.move
-// dep: tests/sources/stdlib/modules/libra_system.move
-// dep: tests/sources/stdlib/modules/libra_time.move
-// dep: tests/sources/stdlib/modules/transaction.move
-// dep: tests/sources/stdlib/modules/transaction_fee.move
-// dep: tests/sources/stdlib/modules/validator_config.move
-// dep: tests/sources/stdlib/modules/hash.move
-// dep: tests/sources/stdlib/modules/lcs.move
-// dep: tests/sources/stdlib/modules/libra_transaction_timeout.move
-// no-verify
-
-address 0x0:
+address 0x0 {
 
 module LibraBlock {
     use 0x0::LBR;
@@ -21,6 +7,10 @@ module LibraBlock {
     use 0x0::LibraTimestamp;
     use 0x0::Transaction;
     use 0x0::TransactionFee;
+
+    spec module {
+        pragma verify = false;
+    }
 
     resource struct BlockMetadata {
       // Height of the current block
@@ -100,4 +90,5 @@ module LibraBlock {
     public fun get_current_block_height(): u64 acquires BlockMetadata {
       borrow_global<BlockMetadata>(0xA550C18).height
     }
+}
 }

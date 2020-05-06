@@ -5,8 +5,8 @@
 
 use config_builder::{FullNodeConfig, ValidatorConfig};
 use libra_config::config::NodeConfig;
-use parity_multiaddr::Multiaddr;
-use std::{convert::TryInto, fs, net::SocketAddr, path::PathBuf};
+use libra_network_address::NetworkAddress;
+use std::{convert::TryInto, fs, fs::File, io::Write, net::SocketAddr, path::PathBuf};
 use structopt::StructOpt;
 
 const NODE_CONFIG: &str = "node.config.toml";
@@ -33,6 +33,9 @@ struct FaucetArgs {
     #[structopt(short = "s", long)]
     /// Use the provided seed for generating keys for each of the validators
     seed: Option<String>,
+    #[structopt(short = "n", long)]
+    /// Specify the number of nodes coded in genesis blob to produce waypoint.
+    nodes_in_genesis: usize,
 }
 
 #[derive(Debug, StructOpt)]
@@ -56,10 +59,10 @@ struct FullNodeArgs {
     // Parameters for this full node config
     #[structopt(short = "a", long, parse(from_str = parse_addr))]
     /// Advertised address for this node, if this is null, listen is reused
-    advertised: Multiaddr,
+    advertised: NetworkAddress,
     #[structopt(short = "b", long, parse(from_str = parse_addr))]
     /// Advertised address for the first node in this test net
-    bootstrap: Multiaddr,
+    bootstrap: NetworkAddress,
     #[structopt(short = "d", long, parse(from_os_str))]
     /// The data directory for the configs (e.g. /opt/libra/data)
     data_dir: PathBuf,
@@ -74,7 +77,7 @@ struct FullNodeArgs {
     index: usize,
     #[structopt(short = "l", long, parse(from_str = parse_addr))]
     /// Listening address for this node
-    listen: Multiaddr,
+    listen: NetworkAddress,
     #[structopt(short = "o", long, parse(from_os_str))]
     /// The output directory, note if a config exists already here, it will be updated to include
     /// this full node network
@@ -97,13 +100,13 @@ struct SafetyRulesArgs {
 struct ValidatorArgs {
     #[structopt(short = "a", long, parse(from_str = parse_addr))]
     /// Advertised address for this node, if this is null, listen is reused
-    advertised: Multiaddr,
+    advertised: NetworkAddress,
     #[structopt(short = "b", long, parse(from_str = parse_addr))]
     /// Advertised address for the first node in this test net
-    bootstrap: Multiaddr,
+    bootstrap: NetworkAddress,
     #[structopt(short = "l", long, parse(from_str = parse_addr))]
     /// Listening address for this node
-    listen: Multiaddr,
+    listen: NetworkAddress,
     #[structopt(flatten)]
     validator_common: ValidatorCommonArgs,
 }
@@ -149,8 +152,8 @@ struct ValidatorCommonArgs {
     template: Option<PathBuf>,
 }
 
-fn parse_addr(src: &str) -> Multiaddr {
-    src.parse::<Multiaddr>().unwrap()
+fn parse_addr(src: &str) -> NetworkAddress {
+    src.parse::<NetworkAddress>().unwrap()
 }
 
 fn parse_socket_addr(src: &str) -> SocketAddr {
@@ -170,16 +173,25 @@ fn main() {
 
 fn build_faucet(args: FaucetArgs) {
     let mut config_builder = ValidatorConfig::new();
+    config_builder.nodes(args.nodes_in_genesis);
 
     if let Some(seed) = args.seed.as_ref() {
         let seed = hex::decode(seed).expect("Invalid hex in seed.");
         config_builder.seed(seed[..32].try_into().expect("Invalid seed"));
     }
 
-    let faucet_key = config_builder.build_faucet_client();
+    let (faucet_key, waypoint) = config_builder
+        .build_faucet_client()
+        .expect("Unable to build faucet");
     let key_path = args.output_dir.join("mint.key");
     fs::create_dir_all(&args.output_dir).expect("Unable to create output directory");
     generate_key::save_key(faucet_key, key_path);
+
+    let waypoint_path = args.output_dir.join("waypoint.txt");
+    let mut file =
+        File::create(waypoint_path).expect("Unable to create/truncate file at specified path");
+    file.write_all(waypoint.to_string().as_bytes())
+        .expect("Unable to write waypoint to file at specified path");
 }
 
 fn build_full_node(command: FullNodeCommand) {

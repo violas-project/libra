@@ -3,7 +3,7 @@
 
 use crate::SynchronizerState;
 use anyhow::{ensure, format_err, Result};
-use executor::{ChunkExecutor, Executor};
+use executor::ChunkExecutor;
 use executor_types::ExecutedTrees;
 use itertools::Itertools;
 use libra_types::{
@@ -14,14 +14,8 @@ use libra_types::{
     move_resource::MoveStorage,
     on_chain_config::{OnChainConfigPayload, ON_CHAIN_CONFIG_REGISTRY},
     transaction::TransactionListWithProof,
-    validator_change::ValidatorChangeProof,
 };
-use libra_vm::LibraVM;
-use std::{
-    collections::HashSet,
-    convert::TryFrom,
-    sync::{Arc, Mutex},
-};
+use std::{collections::HashSet, convert::TryFrom, sync::Arc};
 use storage_interface::DbReader;
 use subscription_service::ReconfigSubscription;
 
@@ -47,8 +41,8 @@ pub trait ExecutorProxyTrait: Send {
         target_version: u64,
     ) -> Result<TransactionListWithProof>;
 
-    /// Get the epoch change ledger info for [start_epoch, end_epoch) so that we can move to end_epoch.
-    fn get_epoch_proof(&self, start_epoch: u64, end_epoch: u64) -> Result<ValidatorChangeProof>;
+    /// Get the epoch change ledger info for epoch so that we can move to next epoch.
+    fn get_epoch_proof(&self, epoch: u64) -> Result<LedgerInfoWithSignatures>;
 
     /// Tries to find a LedgerInfo for a given version.
     fn get_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures>;
@@ -66,7 +60,7 @@ pub trait ExecutorProxyTrait: Send {
 
 pub(crate) struct ExecutorProxy {
     storage: Arc<dyn DbReader>,
-    executor: Arc<Mutex<Executor<LibraVM>>>,
+    executor: Box<dyn ChunkExecutor>,
     reconfig_subscriptions: Vec<ReconfigSubscription>,
     on_chain_configs: OnChainConfigPayload,
 }
@@ -74,7 +68,7 @@ pub(crate) struct ExecutorProxy {
 impl ExecutorProxy {
     pub(crate) fn new(
         storage: Arc<dyn DbReader>,
-        executor: Arc<Mutex<Executor<LibraVM>>>,
+        executor: Box<dyn ChunkExecutor>,
         mut reconfig_subscriptions: Vec<ReconfigSubscription>,
     ) -> Self {
         let on_chain_configs = Self::fetch_all_configs(&*storage)
@@ -132,7 +126,7 @@ impl ExecutorProxyTrait for ExecutorProxy {
             .get_startup_info()?
             .ok_or_else(|| format_err!("[state sync] Failed to access storage info"))?;
 
-        let current_verifier = storage_info.get_validator_set().into();
+        let current_epoch_info = storage_info.get_epoch_info().clone();
 
         let synced_trees = if let Some(synced_tree_state) = storage_info.synced_tree_state {
             ExecutedTrees::from(synced_tree_state)
@@ -143,7 +137,7 @@ impl ExecutorProxyTrait for ExecutorProxy {
         Ok(SynchronizerState::new(
             storage_info.latest_ledger_info,
             synced_trees,
-            current_verifier,
+            current_epoch_info,
         ))
     }
 
@@ -154,7 +148,7 @@ impl ExecutorProxyTrait for ExecutorProxy {
         intermediate_end_of_epoch_li: Option<LedgerInfoWithSignatures>,
         _synced_trees: &mut ExecutedTrees,
     ) -> Result<()> {
-        let reconfig_events = self.executor.lock().unwrap().execute_and_commit_chunk(
+        let reconfig_events = self.executor.execute_and_commit_chunk(
             txn_list_with_proof,
             verified_target_li,
             intermediate_end_of_epoch_li,
@@ -172,11 +166,14 @@ impl ExecutorProxyTrait for ExecutorProxy {
             .get_transactions(known_version + 1, limit, target_version, false)
     }
 
-    fn get_epoch_proof(&self, start_epoch: u64, end_epoch: u64) -> Result<ValidatorChangeProof> {
-        let validator_change_proof = self
+    fn get_epoch_proof(&self, epoch: u64) -> Result<LedgerInfoWithSignatures> {
+        let epoch_change_li = self
             .storage
-            .get_epoch_change_ledger_infos(start_epoch, end_epoch)?;
-        Ok(validator_change_proof)
+            .get_epoch_change_ledger_infos(epoch, epoch + 1)?
+            .ledger_info_with_sigs
+            .pop()
+            .ok_or_else(|| format_err!("Empty EpochChangeProof"))?;
+        Ok(epoch_change_li)
     }
 
     fn get_ledger_info(&self, version: u64) -> Result<LedgerInfoWithSignatures> {

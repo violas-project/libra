@@ -49,7 +49,7 @@ impl<V: VMExecutor> GenesisCommitter<V> {
         executor: Executor<V>,
         ledger_info_with_sigs: LedgerInfoWithSignatures,
     ) -> Result<Self> {
-        let waypoint = Waypoint::new(ledger_info_with_sigs.ledger_info())?;
+        let waypoint = Waypoint::new_epoch_boundary(ledger_info_with_sigs.ledger_info())?;
 
         Ok(Self {
             executor,
@@ -101,10 +101,10 @@ pub fn calculate_genesis<V: VMExecutor>(
         executor.execute_block((block_id, vec![genesis_txn.clone()]), *PRE_GENESIS_BLOCK_ID)?;
 
     let root_hash = result.root_hash();
-    let next_validator_set = result
-        .validators()
+    let next_epoch_info = result
+        .epoch_info()
         .as_ref()
-        .ok_or_else(|| format_err!("Genesis transaction must emit a validator set."))?;
+        .ok_or_else(|| format_err!("Genesis transaction must emit a epoch change."))?;
     let executed_trees = executor.get_executed_trees(block_id)?;
     let state_view = executor.get_executed_state_view(&executed_trees);
     let timestamp_usecs = if genesis_version == 0 {
@@ -127,7 +127,7 @@ pub fn calculate_genesis<V: VMExecutor>(
                 root_hash,
                 genesis_version,
                 timestamp_usecs,
-                Some(next_validator_set.clone()),
+                Some(next_epoch_info.clone()),
             ),
             HashValue::zero(), /* consensus_data_hash */
         ),

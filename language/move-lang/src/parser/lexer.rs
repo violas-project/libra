@@ -13,7 +13,7 @@ pub enum Tok {
     U64Value,
     U128Value,
     ByteStringValue,
-    NameValue,
+    IdentifierValue,
     Exclaim,
     ExclaimEqual,
     Percent,
@@ -74,6 +74,7 @@ pub enum Tok {
     PipePipe,
     RBrace,
     Fun,
+    Script,
 }
 
 impl fmt::Display for Tok {
@@ -87,7 +88,7 @@ impl fmt::Display for Tok {
             U64Value => "[U64]",
             U128Value => "[U128]",
             ByteStringValue => "[ByteString]",
-            NameValue => "[Name]",
+            IdentifierValue => "[Identifier]",
             Exclaim => "!",
             ExclaimEqual => "!=",
             Percent => "%",
@@ -148,6 +149,7 @@ impl fmt::Display for Tok {
             PipePipe => "||",
             RBrace => "}",
             Fun => "fun",
+            Script => "script",
         };
         fmt::Display::fmt(s, formatter)
     }
@@ -201,12 +203,6 @@ impl<'input> Lexer<'input> {
         let offset = self.text.len() - text.len();
         let (tok, _) = find_token(self.file, text, offset)?;
         Ok(tok)
-    }
-
-    // Return the starting offset for the next token after the current one.
-    pub fn lookahead_start_loc(&self) -> usize {
-        let text = self.text[self.cur_end..].trim_start();
-        self.text.len() - text.len()
     }
 
     pub fn advance(&mut self) -> Result<(), Error> {
@@ -420,11 +416,12 @@ fn get_name_token(name: &str) -> Tok {
         "public" => Tok::Public,
         "resource" => Tok::Resource,
         "return" => Tok::Return,
+        "script" => Tok::Script,
         "spec" => Tok::Spec,
         "struct" => Tok::Struct,
         "true" => Tok::True,
         "use" => Tok::Use,
         "while" => Tok::While,
-        _ => Tok::NameValue,
+        _ => Tok::IdentifierValue,
     }
 }

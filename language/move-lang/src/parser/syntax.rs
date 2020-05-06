@@ -80,12 +80,12 @@ fn consume_token<'input>(tokens: &mut Lexer<'input>, tok: Tok) -> Result<(), Err
     Ok(())
 }
 
-// Check for the name token with specified value and return an error if it does not match.
-fn consume_name_value<'input>(tokens: &mut Lexer<'input>, value: &str) -> Result<(), Error> {
-    if tokens.peek() == Tok::NameValue && tokens.content() == value {
+// Check for the identifier token with specified value and return an error if it does not match.
+fn consume_identifier<'input>(tokens: &mut Lexer<'input>, value: &str) -> Result<(), Error> {
+    if tokens.peek() == Tok::IdentifierValue && tokens.content() == value {
         tokens.advance()
     } else {
-        let expected = format!("name '{}'", value);
+        let expected = format!("'{}'", value);
         Err(unexpected_token_error(tokens, &expected))
     }
 }
@@ -206,20 +206,20 @@ where
 }
 
 //**************************************************************************************************
-// Names and Addresses
+// Identifiers, Addresses, and Names
 //**************************************************************************************************
 
-// Parse a name:
-//      Name = <NameValue>
-fn parse_name<'input>(tokens: &mut Lexer<'input>) -> Result<Spanned<String>, Error> {
-    if tokens.peek() != Tok::NameValue {
-        return Err(unexpected_token_error(tokens, "a name value"));
+// Parse an identifier:
+//      Identifier = <IdentifierValue>
+fn parse_identifier<'input>(tokens: &mut Lexer<'input>) -> Result<Spanned<String>, Error> {
+    if tokens.peek() != Tok::IdentifierValue {
+        return Err(unexpected_token_error(tokens, "an identifier"));
     }
     let start_loc = tokens.start_loc();
-    let name = tokens.content().to_string();
+    let id = tokens.content().to_string();
     tokens.advance()?;
     let end_loc = tokens.previous_end_loc();
-    Ok(spanned(tokens.file_name(), start_loc, end_loc, name))
+    Ok(spanned(tokens.file_name(), start_loc, end_loc, id))
 }
 
 // Parse an account address:
@@ -235,21 +235,21 @@ fn parse_address<'input>(tokens: &mut Lexer<'input>) -> Result<Address, Error> {
 }
 
 // Parse a variable name:
-//      Var = <Name>
+//      Var = <Identifier>
 fn parse_var<'input>(tokens: &mut Lexer<'input>) -> Result<Var, Error> {
-    Ok(Var(parse_name(tokens)?))
+    Ok(Var(parse_identifier(tokens)?))
 }
 
 // Parse a field name:
-//      Field = <Name>
+//      Field = <Identifier>
 fn parse_field<'input>(tokens: &mut Lexer<'input>) -> Result<Field, Error> {
-    Ok(Field(parse_name(tokens)?))
+    Ok(Field(parse_identifier(tokens)?))
 }
 
 // Parse a module name:
-//      ModuleName = <Name>
+//      ModuleName = <Identifier>
 fn parse_module_name<'input>(tokens: &mut Lexer<'input>) -> Result<ModuleName, Error> {
-    Ok(ModuleName(parse_name(tokens)?))
+    Ok(ModuleName(parse_identifier(tokens)?))
 }
 
 // Parse a module identifier:
@@ -269,32 +269,39 @@ fn parse_module_ident<'input>(tokens: &mut Lexer<'input>) -> Result<ModuleIdent,
     )))
 }
 
-// Parse a module access (either a struct or a function):
+// Parse a module access (a variable, struct type, or function):
 //      ModuleAccess =
-//          <Name>
-//          | <ModuleName> "::" <Name>
-//          | <ModuleIdent> "::" <Name>
+//          <Identifier>
+//          | "::" <Identifier>
+//          | <ModuleName> "::" <Identifier>
+//          | <ModuleIdent> "::" <Identifier>
 fn parse_module_access<'input, F: FnOnce() -> String>(
     tokens: &mut Lexer<'input>,
     item_description: F,
 ) -> Result<ModuleAccess, Error> {
     let start_loc = tokens.start_loc();
     let acc = match tokens.peek() {
-        Tok::NameValue => {
+        Tok::IdentifierValue => {
             // Check if this is a ModuleName followed by "::".
-            let m = parse_name(tokens)?;
+            let m = parse_identifier(tokens)?;
             if match_token(tokens, Tok::ColonColon)? {
-                let n = parse_name(tokens)?;
+                let n = parse_identifier(tokens)?;
                 ModuleAccess_::ModuleAccess(ModuleName(m), n)
             } else {
                 ModuleAccess_::Name(m)
             }
         }
 
+        Tok::ColonColon => {
+            tokens.advance()?;
+            let n = parse_identifier(tokens)?;
+            ModuleAccess_::Global(n)
+        }
+
         Tok::AddressValue => {
             let m = parse_module_ident(tokens)?;
             consume_token(tokens, Tok::ColonColon)?;
-            let n = parse_name(tokens)?;
+            let n = parse_identifier(tokens)?;
             ModuleAccess_::QualifiedModuleAccess(m, n)
         }
 
@@ -347,7 +354,7 @@ fn parse_bind_field<'input>(tokens: &mut Lexer<'input>) -> Result<(Field, Bind),
 //          | <ModuleAccess> <OptionalTypeArgs> "{" Comma<BindField> "}"
 fn parse_bind<'input>(tokens: &mut Lexer<'input>) -> Result<Bind, Error> {
     let start_loc = tokens.start_loc();
-    if tokens.peek() == Tok::NameValue {
+    if tokens.peek() == Tok::IdentifierValue {
         let next_tok = tokens.lookahead()?;
         if next_tok != Tok::LBrace && next_tok != Tok::Less && next_tok != Tok::ColonColon {
             let v = Bind_::Var(parse_var(tokens)?);
@@ -596,17 +603,13 @@ fn parse_sequence<'input>(tokens: &mut Lexer<'input>) -> Result<Sequence, Error>
 //      Term =
 //          "break"
 //          | "continue"
-//          | <Name>
-//          | <ModuleAccess> ("<" Comma<Type> ">")?          (spec only)
+//          | <NameExp>
 //          | <Value>
 //          | <Num>
 //          | "(" Comma<Exp> ")"
 //          | "(" <Exp> ":" <Type> ")"
 //          | "(" <Exp> "as" <Type> ")"
 //          | "{" <Sequence>
-//          | <ModuleAccess> ("<" Comma<Type> ">")? "{" Comma<ExpField> "}"
-//          | <ModuleAccess> ("<" Comma<Type> ">")? "(" Comma<Exp> ")"
-//          | "::" <Name> ("<" Comma<Type> ">")? "(" Comma<Exp> ")"
 fn parse_term<'input>(tokens: &mut Lexer<'input>) -> Result<Exp, Error> {
     let start_loc = tokens.start_loc();
     let term = match tokens.peek() {
@@ -620,40 +623,12 @@ fn parse_term<'input>(tokens: &mut Lexer<'input>) -> Result<Exp, Error> {
             Exp_::Continue
         }
 
-        Tok::NameValue => {
-            // Check if this is a ModuleAccess for a pack or call expression.
-            match tokens.lookahead()? {
-                Tok::ColonColon | Tok::LBrace | Tok::LParen => {
-                    parse_pack_or_call_or_generic_name(tokens)?
-                }
-                Tok::Less => {
-                    // There's an ambiguity here. If there is no whitespace after the
-                    // name, treat it as the start of a list of type arguments. Otherwise
-                    // assume that the "<" is a boolean operator.
-                    let next_start = tokens.lookahead_start_loc();
-                    if next_start == start_loc + tokens.content().len() {
-                        let loc = make_loc(tokens.file_name(), next_start, next_start);
-                        parse_pack_or_call_or_generic_name(tokens).or_else(|mut e| {
-                            let msg = "Perhaps you need a blank space before this '<' operator?";
-                            e.push((loc, msg.to_owned()));
-                            Err(e)
-                        })?
-                    } else {
-                        let name = parse_name(tokens)?;
-                        Exp_::Name(sp(name.loc, ModuleAccess_::Name(name)), None)
-                    }
-                }
-                _ => {
-                    let name = parse_name(tokens)?;
-                    Exp_::Name(sp(name.loc, ModuleAccess_::Name(name)), None)
-                }
-            }
-        }
+        Tok::ColonColon | Tok::IdentifierValue => parse_name_exp(tokens)?,
 
         Tok::AddressValue => {
             // Check if this is a ModuleIdent (in a ModuleAccess).
             if tokens.lookahead()? == Tok::ColonColon {
-                parse_pack_or_call_or_generic_name(tokens)?
+                parse_name_exp(tokens)?
             } else {
                 Exp_::Value(parse_value(tokens)?)
             }
@@ -716,15 +691,6 @@ fn parse_term<'input>(tokens: &mut Lexer<'input>) -> Result<Exp, Error> {
             Exp_::Block(parse_sequence(tokens)?)
         }
 
-        // "::" <Name> <OptionalTypeArgs> "(" Comma<Exp> ")"
-        Tok::ColonColon => {
-            tokens.advance()?; // consume the "::"
-            let n = parse_name(tokens)?;
-            let tys = parse_optional_type_args(tokens)?;
-            let rhs = parse_call_args(tokens)?;
-            Exp_::GlobalCall(n, tys, rhs)
-        }
-
         Tok::Spec => {
             let spec_block = parse_spec_block(tokens)?;
             Exp_::Spec(spec_block)
@@ -738,16 +704,32 @@ fn parse_term<'input>(tokens: &mut Lexer<'input>) -> Result<Exp, Error> {
     Ok(spanned(tokens.file_name(), start_loc, end_loc, term))
 }
 
-// Parse the subset of expression terms for pack and call operations, as well as for generic names
-// (in specifications only).
-// This is a helper function for parse_term.
-fn parse_pack_or_call_or_generic_name<'input>(tokens: &mut Lexer<'input>) -> Result<Exp_, Error> {
+// Parse a pack, call, or other reference to a name:
+//      NameExp =
+//          <ModuleAccess> <OptionalTypeArgs> "{" Comma<ExpField> "}"
+//          | <ModuleAccess> <OptionalTypeArgs> "(" Comma<Exp> ")"
+//          | <ModuleAccess> <OptionalTypeArgs>
+fn parse_name_exp<'input>(tokens: &mut Lexer<'input>) -> Result<Exp_, Error> {
     let n = parse_module_access(tokens, || {
-        panic!("parse_pack_or_call_or_generic_name with something other than a NameValue or AddressValue token")
+        panic!("parse_name_exp with something other than a ModuleAccess")
     })?;
-    let tys = parse_optional_type_args(tokens)?;
+
+    // There's an ambiguity if the name is followed by a "<". If there is no whitespace
+    // after the name, treat it as the start of a list of type arguments. Otherwise
+    // assume that the "<" is a boolean operator.
+    let mut tys = None;
+    let start_loc = tokens.start_loc();
+    if tokens.peek() == Tok::Less && start_loc == n.loc.span().end().to_usize() {
+        let loc = make_loc(tokens.file_name(), start_loc, start_loc);
+        tys = parse_optional_type_args(tokens).or_else(|mut e| {
+            let msg = "Perhaps you need a blank space before this '<' operator?";
+            e.push((loc, msg.to_owned()));
+            Err(e)
+        })?;
+    }
+
     match tokens.peek() {
-        // <ModuleAccess> ("<" Comma<Type> ">")? "{" Comma<ExpField> "}"
+        // Pack: "{" Comma<ExpField> "}"
         Tok::LBrace => {
             let fs = parse_comma_list(
                 tokens,
@@ -759,13 +741,13 @@ fn parse_pack_or_call_or_generic_name<'input>(tokens: &mut Lexer<'input>) -> Res
             Ok(Exp_::Pack(n, tys, fs))
         }
 
-        // <ModuleAccess> ("<" Comma<Type> ">")? "(" Comma<Exp> ")"
+        // Call: "(" Comma<Exp> ")"
         Tok::LParen => {
             let rhs = parse_call_args(tokens)?;
             Ok(Exp_::Call(n, tys, rhs))
         }
 
-        // <ModuleAccess> ("<" Comma<Type> ">")?
+        // Other name reference...
         _ => Ok(Exp_::Name(n, tys)),
     }
 }
@@ -1035,7 +1017,7 @@ fn parse_unary_exp<'input>(tokens: &mut Lexer<'input>) -> Result<Exp, Error> {
 
 // Parse an expression term optionally followed by a chain of dot or index accesses:
 //      DotOrIndexChain =
-//          <DotOrIndexChain> "." <Name>
+//          <DotOrIndexChain> "." <Identifier>
 //          | <DotOrIndexChain> "[" <Exp> "]"                      spec only
 //          | <Term>
 fn parse_dot_or_index_chain<'input>(tokens: &mut Lexer<'input>) -> Result<Exp, Error> {
@@ -1045,7 +1027,7 @@ fn parse_dot_or_index_chain<'input>(tokens: &mut Lexer<'input>) -> Result<Exp, E
         let exp = match tokens.peek() {
             Tok::Period => {
                 tokens.advance()?;
-                let n = parse_name(tokens)?;
+                let n = parse_identifier(tokens)?;
                 Exp_::Dot(Box::new(lhs), n)
             }
             Tok::LBracket => {
@@ -1139,12 +1121,12 @@ fn parse_optional_type_args<'input>(
 
 // Parse a type parameter:
 //      TypeParameter =
-//          <Name> <Constraint>?
+//          <Identifier> <Constraint>?
 //      Constraint =
 //          ":" "copyable"
 //          | ":" "resource"
 fn parse_type_parameter<'input>(tokens: &mut Lexer<'input>) -> Result<(Name, Kind), Error> {
-    let n = parse_name(tokens)?;
+    let n = parse_identifier(tokens)?;
 
     let kind = if match_token(tokens, Tok::Colon)? {
         let start_loc = tokens.start_loc();
@@ -1204,7 +1186,7 @@ fn parse_optional_type_parameters<'input>(
 //          ("acquires" <ModuleAccess> ("," <ModuleAccess>)*)?
 //          "{" <Sequence>
 //      FunctionDefName =
-//          <Name> <OptionalTypeParameters>
+//          <Identifier> <OptionalTypeParameters>
 //
 // If the "allow_native" parameter is false, this will only accept Move
 // functions.
@@ -1237,7 +1219,7 @@ fn parse_function_decl<'input>(
 
     // "fun" <FunctionDefName>
     consume_token(tokens, Tok::Fun)?;
-    let name = FunctionName(parse_name(tokens)?);
+    let name = FunctionName(parse_identifier(tokens)?);
     let type_parameters = parse_optional_type_parameters(tokens)?;
 
     // "(" Comma<Parameter> ")"
@@ -1326,7 +1308,7 @@ fn parse_parameter<'input>(tokens: &mut Lexer<'input>) -> Result<(Var, Type), Er
 //          "resource"? "struct" <StructDefName> "{" Comma<FieldAnnot> "}"
 //          | "native" "resource"? "struct" <StructDefName> ";"
 //      StructDefName =
-//          <Name> <OptionalTypeParameters>
+//          <Identifier> <OptionalTypeParameters>
 fn parse_struct_definition<'input>(tokens: &mut Lexer<'input>) -> Result<StructDefinition, Error> {
     let start_loc = tokens.start_loc();
 
@@ -1339,7 +1321,7 @@ fn parse_struct_definition<'input>(tokens: &mut Lexer<'input>) -> Result<StructD
     consume_token(tokens, Tok::Struct)?;
 
     // <StructDefName>
-    let name = StructName(parse_name(tokens)?);
+    let name = StructName(parse_identifier(tokens)?);
     let type_parameters = parse_optional_type_parameters(tokens)?;
 
     let fields = match native_opt {
@@ -1376,6 +1358,52 @@ fn parse_field_annot<'input>(tokens: &mut Lexer<'input>) -> Result<(Field, Type)
     consume_token(tokens, Tok::Colon)?;
     let st = parse_type(tokens)?;
     Ok((f, st))
+}
+
+//**************************************************************************************************
+// AddressBlock
+//**************************************************************************************************
+
+// Parse an address block:
+//      AddressBlock =
+//          "address" <Address> "{"
+//              <Module>*
+//          "}"
+//
+// Note that "address" is not a token.
+fn parse_address_block<'input>(
+    tokens: &mut Lexer<'input>,
+) -> Result<(Loc, Address, Vec<ModuleDefinition>), Error> {
+    const UNEXPECTED_TOKEN: &str = "Invalid code unit. Expected 'address', 'module', or 'script'";
+    if tokens.peek() != Tok::IdentifierValue {
+        let start = tokens.start_loc();
+        let end = start + tokens.content().len();
+        let loc = make_loc(tokens.file_name(), start, end);
+        return Err(vec![(
+            loc,
+            format!("{}. Got '{}'", UNEXPECTED_TOKEN, tokens.content()),
+        )]);
+    }
+    let addr_name = parse_identifier(tokens)?;
+    if addr_name.value != "address" {
+        return Err(vec![(
+            addr_name.loc,
+            format!("{}. Got '{}'", UNEXPECTED_TOKEN, addr_name.value),
+        )]);
+    }
+    let start_loc = tokens.start_loc();
+    let addr = parse_address(tokens)?;
+    let end_loc = tokens.previous_end_loc();
+    let loc = make_loc(tokens.file_name(), start_loc, end_loc);
+
+    consume_token(tokens, Tok::LBrace)?;
+    let mut modules = vec![];
+    while tokens.peek() != Tok::RBrace {
+        modules.push(parse_module(tokens)?);
+    }
+    consume_token(tokens, Tok::RBrace)?;
+
+    Ok((loc, addr, modules))
 }
 
 //**************************************************************************************************
@@ -1451,15 +1479,58 @@ fn parse_module<'input>(tokens: &mut Lexer<'input>) -> Result<ModuleDefinition, 
 }
 
 //**************************************************************************************************
+// Scripts
+//**************************************************************************************************
+
+// Parse a script:
+//      Script =
+//          "script" "{"
+//              <UseDecl>*
+//              <MoveFunctionDecl>
+//          "}"
+fn parse_script<'input>(tokens: &mut Lexer<'input>) -> Result<Script, Error> {
+    let start_loc = tokens.start_loc();
+
+    consume_token(tokens, Tok::Script)?;
+    consume_token(tokens, Tok::LBrace)?;
+
+    let mut uses = vec![];
+    while tokens.peek() == Tok::Use {
+        uses.push(parse_use_decl(tokens)?);
+    }
+    let function = parse_function_decl(tokens, /* allow_native */ false)?;
+    let mut specs = vec![];
+    while tokens.peek() == Tok::Spec {
+        specs.push(parse_spec_block(tokens)?)
+    }
+
+    if tokens.peek() != Tok::RBrace {
+        let loc = current_token_loc(tokens);
+        return Err(vec![(
+            loc,
+            "Unexpected characters after end of 'script' function".to_string(),
+        )]);
+    }
+    consume_token(tokens, Tok::RBrace)?;
+
+    let loc = make_loc(tokens.file_name(), start_loc, tokens.previous_end_loc());
+    Ok(Script {
+        loc,
+        uses,
+        function,
+        specs,
+    })
+}
+//**************************************************************************************************
 // Specification Blocks
 //**************************************************************************************************
 
 // Parse an optional specification block:
 //     SpecBlockTarget =
-//          "fun" <Name>
-//        | "struct <Name>
+//          "fun" <Identifier>
+//        | "struct <Identifier>
 //        | "module"
-//        | "schema" <Name> <OptionalTypeParameters>
+//        | "schema" <Identifier> <OptionalTypeParameters>
 //        | <empty>
 //     SpecBlock = "spec" <SpecBlockTarget> "{" SpecBlockMember* "}"
 fn parse_spec_block<'input>(tokens: &mut Lexer<'input>) -> Result<SpecBlock, Error> {
@@ -1469,21 +1540,21 @@ fn parse_spec_block<'input>(tokens: &mut Lexer<'input>) -> Result<SpecBlock, Err
     let target_ = match tokens.peek() {
         Tok::Fun => {
             tokens.advance()?;
-            let name = FunctionName(parse_name(tokens)?);
+            let name = FunctionName(parse_identifier(tokens)?);
             SpecBlockTarget_::Function(name)
         }
         Tok::Struct => {
             tokens.advance()?;
-            let name = StructName(parse_name(tokens)?);
+            let name = StructName(parse_identifier(tokens)?);
             SpecBlockTarget_::Structure(name)
         }
         Tok::Module => {
             tokens.advance()?;
             SpecBlockTarget_::Module
         }
-        Tok::NameValue if tokens.content() == "schema" => {
+        Tok::IdentifierValue if tokens.content() == "schema" => {
             tokens.advance()?;
-            let name = parse_name(tokens)?;
+            let name = parse_identifier(tokens)?;
             let type_parameters = parse_optional_type_parameters(tokens)?;
             SpecBlockTarget_::Schema(name, type_parameters)
         }
@@ -1534,7 +1605,7 @@ fn parse_spec_block_member<'input>(tokens: &mut Lexer<'input>) -> Result<SpecBlo
     match tokens.peek() {
         Tok::Invariant => parse_invariant(tokens),
         Tok::Define | Tok::Native => parse_spec_function(tokens),
-        Tok::NameValue => match tokens.content() {
+        Tok::IdentifierValue => match tokens.content() {
             "assert" | "assume" | "decreases" | "aborts_if" | "ensures" | "requires" => {
                 parse_condition(tokens)
             }
@@ -1589,31 +1660,36 @@ fn parse_condition<'input>(tokens: &mut Lexer<'input>) -> Result<SpecBlockMember
 }
 
 // Parse an invariant:
-//     Invariant = "invariant" ( "update" | "pack" | "unpack" )? <Exp> ";"
+//     Invariant = "invariant" ( "update" | "pack" | "unpack" | "module" )? <Exp> ";"
 fn parse_invariant<'input>(tokens: &mut Lexer<'input>) -> Result<SpecBlockMember, Error> {
     let start_loc = tokens.start_loc();
     consume_token(tokens, Tok::Invariant)?;
-    let kind = if Tok::NameValue == tokens.peek() {
-        // The update/pack/unpack modifiers are 'weak' keywords. They are reserved
-        // only when following an "invariant" token. One can use "invariant (update ...)" to
-        // force interpretation as identifiers in expressions.
-        match tokens.content() {
-            "update" => {
-                tokens.advance()?;
-                InvariantKind::Update
+    let kind = match tokens.peek() {
+        Tok::IdentifierValue => {
+            // The update/pack/unpack modifiers are 'weak' keywords. They are reserved
+            // only when following an "invariant" token. One can use "invariant (update ...)" to
+            // force interpretation as identifiers in expressions.
+            match tokens.content() {
+                "update" => {
+                    tokens.advance()?;
+                    SpecConditionKind::InvariantUpdate
+                }
+                "pack" => {
+                    tokens.advance()?;
+                    SpecConditionKind::InvariantPack
+                }
+                "unpack" => {
+                    tokens.advance()?;
+                    SpecConditionKind::InvariantUnpack
+                }
+                _ => SpecConditionKind::Invariant,
             }
-            "pack" => {
-                tokens.advance()?;
-                InvariantKind::Pack
-            }
-            "unpack" => {
-                tokens.advance()?;
-                InvariantKind::Unpack
-            }
-            _ => InvariantKind::Data,
         }
-    } else {
-        InvariantKind::Data
+        Tok::Module => {
+            tokens.advance()?;
+            SpecConditionKind::InvariantModule
+        }
+        _ => SpecConditionKind::Invariant,
     };
     let exp = parse_exp(tokens)?;
     consume_token(tokens, Tok::Semicolon)?;
@@ -1621,19 +1697,19 @@ fn parse_invariant<'input>(tokens: &mut Lexer<'input>) -> Result<SpecBlockMember
         tokens.file_name(),
         start_loc,
         tokens.previous_end_loc(),
-        SpecBlockMember_::Invariant { kind, exp },
+        SpecBlockMember_::Condition { kind, exp },
     ))
 }
 
 // Parse a specification function.
 //     SpecFunction = "define" <SpecFunctionSignature> "{" <Sequence> "}"
 //                  | "native" "define" <SpecFunctionSignature> ";"
-//     SpecFunctionSignature = <Name> <OptionalTypeParameters> "(" Comma<Parameter> ")" ":" <Type>
+//     SpecFunctionSignature = <Identifier> <OptionalTypeParameters> "(" Comma<Parameter> ")" ":" <Type>
 fn parse_spec_function<'input>(tokens: &mut Lexer<'input>) -> Result<SpecBlockMember, Error> {
     let start_loc = tokens.start_loc();
     let native_opt = consume_optional_token_with_loc(tokens, Tok::Native)?;
     consume_token(tokens, Tok::Define)?;
-    let name = FunctionName(parse_name(tokens)?);
+    let name = FunctionName(parse_identifier(tokens)?);
     let type_parameters = parse_optional_type_parameters(tokens)?;
     // "(" Comma<Parameter> ")"
     let parameters = parse_comma_list(
@@ -1683,21 +1759,21 @@ fn parse_spec_function<'input>(tokens: &mut Lexer<'input>) -> Result<SpecBlockMe
 }
 
 // Parse a specification variable.
-//     SpecVariable = ( "global" | "local" )? <Name> <OptionalTypeParameters> ":" <Type> ";"
+//     SpecVariable = ( "global" | "local" )? <Identifier> <OptionalTypeParameters> ":" <Type> ";"
 fn parse_spec_variable<'input>(tokens: &mut Lexer<'input>) -> Result<SpecBlockMember, Error> {
     let start_loc = tokens.start_loc();
     let is_global = match tokens.content() {
         "global" => {
-            consume_token(tokens, Tok::NameValue)?;
+            consume_token(tokens, Tok::IdentifierValue)?;
             true
         }
         "local" => {
-            consume_token(tokens, Tok::NameValue)?;
+            consume_token(tokens, Tok::IdentifierValue)?;
             false
         }
         _ => false,
     };
-    let name = parse_name(tokens)?;
+    let name = parse_identifier(tokens)?;
     let type_parameters = parse_optional_type_parameters(tokens)?;
     consume_token(tokens, Tok::Colon)?;
     let type_ = parse_type(tokens)?;
@@ -1716,68 +1792,28 @@ fn parse_spec_variable<'input>(tokens: &mut Lexer<'input>) -> Result<SpecBlockMe
 }
 
 // Parse a specification schema include.
-//    SpecInclude = "include" <ModuleAccess> <OptionalTypeArgs>
-//                  ( "{" Comma<Name ":" Name> "}" )? ";"
+//    SpecInclude = "include" <Exp>
 fn parse_spec_include<'input>(tokens: &mut Lexer<'input>) -> Result<SpecBlockMember, Error> {
     let start_loc = tokens.start_loc();
-    consume_name_value(tokens, "include")?;
-    let name = parse_module_access(tokens, || "a schema name".to_string())?;
-    let type_arguments = parse_optional_type_args(tokens)?;
-    let arguments = if tokens.peek() == Tok::LBrace {
-        parse_comma_list(
-            tokens,
-            Tok::LBrace,
-            Tok::RBrace,
-            |tokens| {
-                let left = parse_name(tokens)?;
-                consume_token(tokens, Tok::Colon)?;
-                let right = parse_exp(tokens)?;
-                Ok((left, right))
-            },
-            "a schema argument",
-        )?
-    } else {
-        vec![]
-    };
+    consume_identifier(tokens, "include")?;
+    let exp = parse_exp(tokens)?;
     consume_token(tokens, Tok::Semicolon)?;
     Ok(spanned(
         tokens.file_name(),
         start_loc,
         tokens.previous_end_loc(),
-        SpecBlockMember_::Include {
-            name,
-            type_arguments,
-            arguments,
-        },
+        SpecBlockMember_::Include { exp },
     ))
 }
 
 // Parse a specification schema apply.
-//    SpecApply = "apply" <ModuleAccess> <OptionalTypeArgs>
-//                 "to" Comma<SpecApplyPattern>
-//                 ( "except" Comma<SpecApplyPattern> )? ";"
+//    SpecApply = "apply" <Exp> "to" Comma<SpecApplyPattern>
+//                                   ( "except" Comma<SpecApplyPattern> )? ";"
 fn parse_spec_apply<'input>(tokens: &mut Lexer<'input>) -> Result<SpecBlockMember, Error> {
     let start_loc = tokens.start_loc();
-    consume_name_value(tokens, "apply")?;
-    let name = parse_module_access(tokens, || "a schema name".to_string())?;
-    let type_arguments = parse_optional_type_args(tokens)?;
-    let arguments = if tokens.peek() == Tok::LBrace {
-        parse_comma_list(
-            tokens,
-            Tok::LBrace,
-            Tok::RBrace,
-            |tokens| {
-                let left = parse_name(tokens)?;
-                consume_token(tokens, Tok::Colon)?;
-                let right = parse_exp(tokens)?;
-                Ok((left, right))
-            },
-            "a schema argument",
-        )?
-    } else {
-        vec![]
-    };
-    consume_name_value(tokens, "to")?;
+    consume_identifier(tokens, "apply")?;
+    let exp = parse_exp(tokens)?;
+    consume_identifier(tokens, "to")?;
     let parse_patterns = |tokens: &mut Lexer<'input>| {
         parse_list(
             tokens,
@@ -1793,21 +1829,20 @@ fn parse_spec_apply<'input>(tokens: &mut Lexer<'input>) -> Result<SpecBlockMembe
         )
     };
     let patterns = parse_patterns(tokens)?;
-    let exclusion_patterns = if tokens.peek() == Tok::NameValue && tokens.content() == "except" {
-        tokens.advance()?;
-        parse_patterns(tokens)?
-    } else {
-        vec![]
-    };
+    let exclusion_patterns =
+        if tokens.peek() == Tok::IdentifierValue && tokens.content() == "except" {
+            tokens.advance()?;
+            parse_patterns(tokens)?
+        } else {
+            vec![]
+        };
     consume_token(tokens, Tok::Semicolon)?;
     Ok(spanned(
         tokens.file_name(),
         start_loc,
         tokens.previous_end_loc(),
         SpecBlockMember_::Apply {
-            name,
-            type_arguments,
-            arguments,
+            exp,
             patterns,
             exclusion_patterns,
         },
@@ -1821,7 +1856,7 @@ fn parse_spec_apply_pattern<'input>(tokens: &mut Lexer<'input>) -> Result<SpecAp
     let public_opt = consume_optional_token_with_loc(tokens, Tok::Public)?;
     let visibility = if let Some(loc) = public_opt {
         Some(FunctionVisibility::Public(loc))
-    } else if tokens.peek() == Tok::NameValue && tokens.content() == "internal" {
+    } else if tokens.peek() == Tok::IdentifierValue && tokens.content() == "internal" {
         // Its not ideal right now that we do not have a loc here, but acceptable for what
         // we are doing with this in specs.
         tokens.advance()?;
@@ -1838,11 +1873,11 @@ fn parse_spec_apply_pattern<'input>(tokens: &mut Lexer<'input>) -> Result<SpecAp
             let start_loc = tokens.start_loc();
             let adjacent = last_end == start_loc;
             last_end = start_loc + tokens.content().len();
-            Ok(adjacent && [Tok::NameValue, Tok::Star].contains(&tokens.peek()))
+            Ok(adjacent && [Tok::IdentifierValue, Tok::Star].contains(&tokens.peek()))
         },
         parse_spec_apply_fragment,
     )?;
-    let type_arguments = parse_optional_type_args(tokens)?;
+    let type_parameters = parse_optional_type_parameters(tokens)?;
     Ok(spanned(
         tokens.file_name(),
         start_loc,
@@ -1850,19 +1885,19 @@ fn parse_spec_apply_pattern<'input>(tokens: &mut Lexer<'input>) -> Result<SpecAp
         SpecApplyPattern_ {
             visibility,
             name_pattern,
-            type_arguments,
+            type_parameters,
         },
     ))
 }
 
 // Parse a name pattern fragment
-//     SpecApplyFragment = <Name> | "*"
+//     SpecApplyFragment = <Identifier> | "*"
 fn parse_spec_apply_fragment<'input>(
     tokens: &mut Lexer<'input>,
 ) -> Result<SpecApplyFragment, Error> {
     let start_loc = tokens.start_loc();
     let fragment = match tokens.peek() {
-        Tok::NameValue => SpecApplyFragment_::NamePart(parse_name(tokens)?),
+        Tok::IdentifierValue => SpecApplyFragment_::NamePart(parse_identifier(tokens)?),
         Tok::Star => {
             tokens.advance()?;
             SpecApplyFragment_::Wildcard
@@ -1881,11 +1916,11 @@ fn parse_spec_apply_fragment<'input>(
 //    SpecPragma = "pragma" Comma<SpecPragmaProperty> ";"
 fn parse_spec_pragma<'input>(tokens: &mut Lexer<'input>) -> Result<SpecBlockMember, Error> {
     let start_loc = tokens.start_loc();
-    consume_name_value(tokens, "pragma")?;
+    consume_identifier(tokens, "pragma")?;
     let properties = parse_comma_list_after_start(
         tokens,
         start_loc,
-        Tok::NameValue,
+        Tok::IdentifierValue,
         Tok::Semicolon,
         parse_spec_pragma_property,
         "a pragma property",
@@ -1899,10 +1934,10 @@ fn parse_spec_pragma<'input>(tokens: &mut Lexer<'input>) -> Result<SpecBlockMemb
 }
 
 // Parse a specification pragma property:
-//    SpecPragmaProperty = <Name> ( "=" Value )?
+//    SpecPragmaProperty = <Identifier> ( "=" Value )?
 fn parse_spec_pragma_property<'input>(tokens: &mut Lexer<'input>) -> Result<PragmaProperty, Error> {
     let start_loc = tokens.start_loc();
-    let name = parse_name(tokens)?;
+    let name = parse_identifier(tokens)?;
     let value = if tokens.peek() == Tok::Equal {
         tokens.advance()?;
         match tokens.peek() {
@@ -1941,62 +1976,26 @@ fn parse_spec_pragma_property<'input>(tokens: &mut Lexer<'input>) -> Result<Prag
 
 // Parse a file:
 //      File =
-//          (("address" <Address> ":") | <Module>)*
-//          | <UseDecl>* <MoveFunctionDecl>
-//
-// Note that "address" is not a token.
-fn parse_file<'input>(tokens: &mut Lexer<'input>) -> Result<FileDefinition, Error> {
-    let f = if tokens.peek() == Tok::EOF
-        || tokens.peek() == Tok::Module
-        || tokens.peek() == Tok::NameValue
-    {
-        let mut v = vec![];
-        while tokens.peek() != Tok::EOF {
-            let m = if tokens.peek() == Tok::Module {
-                ModuleOrAddress::Module(parse_module(tokens)?)
-            } else {
-                let addr_name = parse_name(tokens)?;
-                if addr_name.value != "address" {
-                    return Err(vec![(
-                        addr_name.loc,
-                        format!(
-                            "Invalid address directive. Expected 'address' got '{}'",
-                            addr_name.value
-                        ),
-                    )]);
-                }
-                let start_loc = tokens.start_loc();
-                let addr = parse_address(tokens)?;
-                let end_loc = tokens.previous_end_loc();
-                consume_token(tokens, Tok::Colon)?;
-                let loc = make_loc(tokens.file_name(), start_loc, end_loc);
-                ModuleOrAddress::Address(loc, addr)
-            };
-            v.push(m);
-        }
-        FileDefinition::Modules(v)
-    } else {
-        let mut uses = vec![];
-        while tokens.peek() == Tok::Use {
-            uses.push(parse_use_decl(tokens)?);
-        }
-        let function = parse_function_decl(tokens, /* allow_native */ false)?;
-        if tokens.peek() != Tok::EOF {
-            let loc = current_token_loc(tokens);
-            return Err(vec![(
-                loc,
-                "Unexpected characters after end of main function".to_string(),
-            )]);
-        }
-        FileDefinition::Main(Main { uses, function })
-    };
-    Ok(f)
+//          (<AddressBlock> | <Module> | <Script>)*
+fn parse_file<'input>(tokens: &mut Lexer<'input>) -> Result<Vec<Definition>, Error> {
+    let mut defs = vec![];
+    while tokens.peek() != Tok::EOF {
+        defs.push(match tokens.peek() {
+            Tok::Module => Definition::Module(parse_module(tokens)?),
+            Tok::Script => Definition::Script(parse_script(tokens)?),
+            _ => {
+                let (loc, addr, modules) = parse_address_block(tokens)?;
+                Definition::Address(loc, addr, modules)
+            }
+        })
+    }
+    Ok(defs)
 }
 
 /// Parse the `input` string as a file of Move source code and return the
 /// result as either a FileDefinition value or an Error. The `file` name
 /// is used to identify source locations in error messages.
-pub fn parse_file_string(file: &'static str, input: &str) -> Result<FileDefinition, Error> {
+pub fn parse_file_string(file: &'static str, input: &str) -> Result<Vec<Definition>, Error> {
     let mut tokens = Lexer::new(input, file);
     tokens.advance()?;
     parse_file(&mut tokens)

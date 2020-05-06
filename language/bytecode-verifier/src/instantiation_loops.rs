@@ -22,6 +22,7 @@ use petgraph::{
 use std::collections::{hash_map, HashMap, HashSet};
 use vm::{
     access::ModuleAccess,
+    errors::VMResult,
     file_format::{
         Bytecode, CompiledModule, FunctionDefinition, FunctionDefinitionIndex, FunctionHandleIndex,
         SignatureIndex, SignatureToken, TypeParameterIndex,
@@ -169,15 +170,17 @@ impl<'a> InstantiationLoopChecker<'a> {
         caller_idx: FunctionDefinitionIndex,
         caller_def: &FunctionDefinition,
     ) {
-        for instr in &caller_def.code.code {
-            if let Bytecode::CallGeneric(callee_inst_idx) = instr {
-                // Get the id of the definition of the function being called.
-                // Skip if the function is not defined in the current module, as we do not
-                // have mutual recursions across module boundaries.
-                let callee_si = self.module.function_instantiation_at(*callee_inst_idx);
-                if let Some(callee_idx) = self.func_handle_def_map.get(&callee_si.handle) {
-                    let callee_idx = *callee_idx;
-                    self.build_graph_call(caller_idx, callee_idx, callee_si.type_parameters)
+        if let Some(code) = &caller_def.code {
+            for instr in &code.code {
+                if let Bytecode::CallGeneric(callee_inst_idx) = instr {
+                    // Get the id of the definition of the function being called.
+                    // Skip if the function is not defined in the current module, as we do not
+                    // have mutual recursions across module boundaries.
+                    let callee_si = self.module.function_instantiation_at(*callee_inst_idx);
+                    if let Some(callee_idx) = self.func_handle_def_map.get(&callee_si.handle) {
+                        let callee_idx = *callee_idx;
+                        self.build_graph_call(caller_idx, callee_idx, callee_si.type_parameters)
+                    }
                 }
             }
         }
@@ -253,13 +256,13 @@ impl<'a> InstantiationLoopChecker<'a> {
         }
     }
 
-    pub fn verify(mut self) -> Vec<VMStatus> {
+    pub fn verify(mut self) -> VMResult<()> {
         self.build_graph();
-        let components = self.find_non_trivial_components();
+        let mut components = self.find_non_trivial_components();
 
-        components
-            .into_iter()
-            .map(|(nodes, edges)| {
+        match components.pop() {
+            None => Ok(()),
+            Some((nodes, edges)) => {
                 let msg_edges = edges
                     .into_iter()
                     .filter_map(|edge_idx| match self.graph.edge_weight(edge_idx).unwrap() {
@@ -277,8 +280,8 @@ impl<'a> InstantiationLoopChecker<'a> {
                     "edges with constructors: [{}], nodes: [{}]",
                     msg_edges, msg_nodes
                 );
-                VMStatus::new(StatusCode::LOOP_IN_INSTANTIATION_GRAPH).with_message(msg)
-            })
-            .collect()
+                Err(VMStatus::new(StatusCode::LOOP_IN_INSTANTIATION_GRAPH).with_message(msg))
+            }
+        }
     }
 }

@@ -3,13 +3,17 @@
 
 //! Objects used by/related to shared mempool
 
-use crate::{core_mempool::CoreMempool, shared_mempool::network::MempoolNetworkSender};
+use crate::{
+    core_mempool::CoreMempool,
+    shared_mempool::{network::MempoolNetworkSender, peer_manager::PeerManager},
+};
 use anyhow::Result;
 use futures::{
     channel::{mpsc, mpsc::UnboundedSender, oneshot},
-    Stream,
+    future::Future,
+    task::{Context, Poll},
 };
-use libra_config::config::MempoolConfig;
+use libra_config::config::{MempoolConfig, PeerNetworkId};
 use libra_types::{
     account_address::AccountAddress,
     mempool_status::MempoolStatus,
@@ -21,11 +25,15 @@ use libra_types::{
 use std::{
     collections::HashMap,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, RwLock},
+    task::Waker,
+    time::Instant,
 };
-use storage_client::StorageRead;
-use tokio::sync::RwLock;
+use storage_interface::DbReader;
+use tokio::runtime::Handle;
 use vm_validator::vm_validator::TransactionValidation;
+
+pub(crate) const DEFAULT_MIN_BROADCAST_RECIPIENT_COUNT: usize = 0;
 
 /// Struct that owns all dependencies required by shared mempool routines
 #[derive(Clone)]
@@ -36,38 +44,19 @@ where
     pub mempool: Arc<Mutex<CoreMempool>>,
     pub config: MempoolConfig,
     pub network_senders: HashMap<PeerId, MempoolNetworkSender>,
-    pub storage_read_client: Arc<dyn StorageRead>,
+    pub db: Arc<dyn DbReader>,
     pub validator: Arc<RwLock<V>>,
-    pub peer_info: Arc<Mutex<PeerInfo>>,
+    pub peer_manager: Arc<PeerManager>,
     pub subscribers: Vec<UnboundedSender<SharedMempoolNotification>>,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub enum SharedMempoolNotification {
-    Sync,
     PeerStateChange,
     NewTransactions,
     ACK,
+    Broadcast,
 }
-
-/// stores only peers that receive txns from this node
-pub(crate) type PeerInfo = HashMap<PeerId, PeerSyncState>;
-
-/// state of last sync with peer
-/// `timeline_id` is position in log of ready transactions
-/// `is_alive` - is connection healthy
-/// `network_id` - ID of the mempool network that this peer belongs to
-#[derive(Clone)]
-pub(crate) struct PeerSyncState {
-    pub timeline_id: u64,
-    pub is_alive: bool,
-    pub network_id: PeerId,
-}
-
-#[derive(Debug)]
-pub(crate) struct SyncEvent;
-
-pub(crate) type IntervalStream = Pin<Box<dyn Stream<Item = SyncEvent> + Send + 'static>>;
 
 pub(crate) fn notify_subscribers(
     event: SharedMempoolNotification,
@@ -75,6 +64,56 @@ pub(crate) fn notify_subscribers(
 ) {
     for subscriber in subscribers {
         let _ = subscriber.unbounded_send(event);
+    }
+}
+
+/// A future that represents a scheduled mempool txn broadcast
+pub(crate) struct ScheduledBroadcast {
+    /// time of scheduled broadcast
+    deadline: Instant,
+    /// broadcast recipient
+    peer: PeerNetworkId,
+    /// the waker that will be used to notify the executor when the broadcast is ready
+    waker: Arc<Mutex<Option<Waker>>>,
+}
+
+impl ScheduledBroadcast {
+    pub fn new(deadline: Instant, peer: PeerNetworkId, executor: Handle) -> Self {
+        let waker: Arc<Mutex<Option<Waker>>> = Arc::new(Mutex::new(None));
+        let waker_clone = waker.clone();
+
+        if deadline > Instant::now() {
+            let tokio_instant = tokio::time::Instant::from_std(deadline);
+            executor.spawn(async move {
+                tokio::time::delay_until(tokio_instant).await;
+                let mut waker = waker_clone.lock().expect("failed to acquire waker lock");
+                if let Some(waker) = waker.take() {
+                    waker.wake()
+                }
+            });
+        }
+
+        Self {
+            deadline,
+            peer,
+            waker,
+        }
+    }
+}
+
+impl Future for ScheduledBroadcast {
+    type Output = PeerNetworkId;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context) -> Poll<Self::Output> {
+        if Instant::now() < self.deadline {
+            let waker_clone = context.waker().clone();
+            let mut waker = self.waker.lock().expect("failed to acquire waker lock");
+            *waker = Some(waker_clone);
+
+            Poll::Pending
+        } else {
+            Poll::Ready(self.peer)
+        }
     }
 }
 

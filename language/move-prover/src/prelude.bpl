@@ -60,7 +60,7 @@ function {:constructor} AddressType() : TypeValue;
 function {:constructor} ByteArrayType() : TypeValue;
 function {:constructor} StrType() : TypeValue;
 function {:constructor} VectorType(t: TypeValue) : TypeValue;
-function {:constructor} StructType(name: TypeName, ts: TypeValueArray) : TypeValue;
+function {:constructor} StructType(name: TypeName, ps: TypeValueArray, ts: TypeValueArray) : TypeValue;
 function {:constructor} ErrorType() : TypeValue;
 const DefaultTypeValue: TypeValue;
 axiom DefaultTypeValue == ErrorType();
@@ -196,21 +196,22 @@ axiom StratificationDepth == 4;
 function {:inline} IsEqual4(v1: Value, v2: Value): bool {
     v1 == v2
 }
-function {:inline} IsEqual3(v1: Value, v2: Value): bool {
+// Do not inline the next three functions: it complicates things for the SMT solver and we have termination issues.
+function IsEqual3(v1: Value, v2: Value): bool {
     (v1 == v2) ||
     (is#Vector(v1) &&
      is#Vector(v2) &&
      $vlen(v1) == $vlen(v2) &&
      (forall i: int :: 0 <= i && i < $vlen(v1) ==> IsEqual4($vmap(v1)[i], $vmap(v2)[i])))
 }
-function {:inline} IsEqual2(v1: Value, v2: Value): bool {
+function IsEqual2(v1: Value, v2: Value): bool {
     (v1 == v2) ||
     (is#Vector(v1) &&
      is#Vector(v2) &&
      $vlen(v1) == $vlen(v2) &&
      (forall i: int :: 0 <= i && i < $vlen(v1) ==> IsEqual3($vmap(v1)[i], $vmap(v2)[i])))
 }
-function {:inline} IsEqual1(v1: Value, v2: Value): bool {
+function IsEqual1(v1: Value, v2: Value): bool {
     (v1 == v2) ||
     (is#Vector(v1) &&
      is#Vector(v2) &&
@@ -395,8 +396,8 @@ function {:inline} $UpdateLocal(m: Memory, idx: int, v: Value): Memory {
 procedure {:inline 1} $InitVerification() {
   // Set local counter to 0
   $local_counter := 0;
-  // Assume sender account exists.
-  assume $ExistsTxnSenderAccount($m, $txn);
+  // Set abort_flag to false
+  $abort_flag := false;
 }
 
 // ============================================================================================
@@ -931,6 +932,10 @@ procedure {:inline 1} $Vector_contains(ta: TypeValue, v: Value, e: Value) return
     res := Boolean($contains_vector(v, e));
 }
 
+procedure {:inline 1} $Vector_index_of(ta: TypeValue, v: Value, e: Value) returns (res1: Value, res2: Value)  {
+    // TODO: implement me
+    assert false;
+}
 
 
 // ==================================================================================
@@ -992,7 +997,10 @@ ensures $vlen(res) == 32;               // result is 32 bytes.
 // ==================================================================================
 // Native libra_account
 
-procedure {:inline 1} $LibraAccount_save_account(ta: TypeValue, balance: Value, account: Value, addr: Value) {
+// TODO: this function clashes with a similar version in older libraries. This is solved by a hack where the
+// translator appends _OLD to the name when encountering this. The hack shall be removed once old library
+// sources are not longer used.
+procedure {:inline 1} $LibraAccount_save_account_OLD(ta: TypeValue, balance: Value, account: Value, addr: Value) {
     var a: int;
     var t_T: TypeValue;
     var l_T: Location;
@@ -1017,7 +1025,19 @@ procedure {:inline 1} $LibraAccount_save_account(ta: TypeValue, balance: Value, 
     $m := Memory(domain#Memory($m)[l_T := true][l_Balance := true], contents#Memory($m)[l_T := account][l_Balance := balance]);
 }
 
+procedure {:inline 1} $LibraAccount_save_account(
+       t_Token: TypeValue, t_AT: TypeValue, account_type: Value, balance: Value,
+       account: Value, event_generator: Value, addr: Value) {
+    // TODO: implement this
+    assert false;
+}
+
 procedure {:inline 1} $LibraAccount_write_to_event_store(ta: TypeValue, guid: Value, count: Value, msg: Value) {
+    // TODO: this is used in old library sources, remove it once those sources are not longer used in tests.
+    // This function is modeled as a no-op because the actual side effect of this native function is not observable from the Move side.
+}
+
+procedure {:inline 1} $Event_write_to_event_store(ta: TypeValue, guid: Value, count: Value, msg: Value) {
     // This function is modeled as a no-op because the actual side effect of this native function is not observable from the Move side.
 }
 

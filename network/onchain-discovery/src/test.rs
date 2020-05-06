@@ -2,22 +2,25 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{
-    network_interface::{OnchainDiscoveryNetworkEvents, OnchainDiscoveryNetworkSender},
+    client::OnchainDiscovery,
+    network_interface::OnchainDiscoveryNetworkSender,
+    service::OnchainDiscoveryService,
     types::{
         DiscoveryInfoInternal, DiscoverySetInternal, OnchainDiscoveryMsg, QueryDiscoverySetRequest,
-        QueryDiscoverySetResponseWithEvent,
+        QueryDiscoverySetResponse,
     },
-    OnchainDiscovery,
 };
 use channel::{libra_channel, message_queues::QueueStyle};
 use executor::{db_bootstrapper::bootstrap_db_if_empty, Executor};
 use futures::{channel::oneshot, sink::SinkExt, stream::StreamExt};
-use libra_config::{
-    config::{NodeConfig, RoleType},
-    generator::{self, ValidatorSwarm},
-};
+use libra_config::config::{NodeConfig, RoleType};
+use libra_network_address::NetworkAddress;
 use libra_types::{
-    discovery_set::DiscoverySet, on_chain_config::ValidatorSet, trusted_state::TrustedState, PeerId,
+    account_config,
+    discovery_set::{DiscoverySet, DiscoverySetResource},
+    trusted_state::{TrustedState, TrustedStateChange},
+    waypoint::Waypoint,
+    PeerId,
 };
 use libra_vm::LibraVM;
 use network::{
@@ -29,18 +32,16 @@ use network::{
     protocols::rpc::{InboundRpcRequest, OutboundRpcRequest},
     ProtocolId,
 };
-use parity_multiaddr::Multiaddr;
 use std::{
     collections::HashMap, convert::TryFrom, num::NonZeroUsize, str::FromStr, sync::Arc,
     time::Duration,
 };
-use storage_client::{StorageRead, StorageReadServiceClient, SyncStorageClient};
-use storage_service::{init_libra_db, start_storage_service_with_db};
+use storage_interface::DbReader;
+use storage_service::init_libra_db;
 use tokio::{
     runtime::{Handle, Runtime},
     task::JoinHandle,
 };
-use vm_genesis::{encode_genesis_transaction_with_validator, GENESIS_KEYPAIR};
 
 struct MockOnchainDiscoveryNetworkSender {
     peer_mgr_notifs_tx: libra_channel::Sender<(PeerId, ProtocolId), PeerManagerNotification>,
@@ -62,7 +63,7 @@ impl MockOnchainDiscoveryNetworkSender {
         &mut self,
         recipient: PeerId,
         req_msg: QueryDiscoverySetRequest,
-    ) -> QueryDiscoverySetResponseWithEvent {
+    ) -> Box<QueryDiscoverySetResponse> {
         let req_msg = OnchainDiscoveryMsg::QueryDiscoverySetRequest(req_msg);
         let req_bytes = lcs::to_bytes(&req_msg).unwrap();
         let (res_tx, res_rx) = oneshot::channel();
@@ -84,17 +85,16 @@ impl MockOnchainDiscoveryNetworkSender {
 
         let res_bytes = res_rx.await.unwrap().unwrap();
         let res_msg: OnchainDiscoveryMsg = lcs::from_bytes(&res_bytes).unwrap();
-        let res_msg = match res_msg {
+        match res_msg {
             OnchainDiscoveryMsg::QueryDiscoverySetResponse(res_msg) => res_msg,
             OnchainDiscoveryMsg::QueryDiscoverySetRequest(_) => {
                 panic!("Unexpected request msg, expected response msg")
             }
-        };
-        QueryDiscoverySetResponseWithEvent::try_from(res_msg).unwrap()
+        }
     }
 
     async fn new_peer(&mut self, peer_id: PeerId) {
-        let addr = Multiaddr::from_str("/ip4/127.0.0.1/tcp/1234").unwrap();
+        let addr = NetworkAddress::from_str("/ip4/127.0.0.1/tcp/1234").unwrap();
         let notif = ConnectionStatusNotification::NewPeer(peer_id, addr);
         self.send_connection_notif(peer_id, notif).await;
     }
@@ -152,68 +152,45 @@ impl MockOnchainDiscoveryNetworkSender {
     }
 }
 
-fn gen_configs(count: usize) -> (Vec<NodeConfig>, ValidatorSet, DiscoverySet) {
-    let config_template = NodeConfig::default();
-    let config_seed = [42; 32];
-    let randomize_service_ports = true;
-    let randomize_libranet_ports = false;
-
-    let ValidatorSwarm {
-        mut nodes,
-        validator_set,
-        discovery_set,
-    } = generator::validator_swarm(
-        &config_template,
-        count,
-        config_seed,
-        randomize_service_ports,
-        randomize_libranet_ports,
-    );
-
-    let vm_publishing_option = None;
-    let genesis = encode_genesis_transaction_with_validator(
-        &GENESIS_KEYPAIR.0,
-        GENESIS_KEYPAIR.1.clone(),
-        &nodes[..],
-        validator_set.clone(),
-        discovery_set.clone(),
-        vm_publishing_option,
-    );
-
-    for node in &mut nodes {
-        node.execution.genesis = Some(genesis.clone());
-    }
-
-    (nodes, validator_set, discovery_set)
+fn read_discovery_set(libra_db: &Arc<dyn DbReader>) -> DiscoverySet {
+    let account_state_blob = libra_db
+        .get_latest_account_state(account_config::discovery_set_address())
+        .unwrap()
+        .unwrap();
+    let discovery_set_resource = DiscoverySetResource::try_from(&account_state_blob).unwrap();
+    DiscoverySet::from(discovery_set_resource)
 }
 
-fn gen_single_config(count: usize) -> (NodeConfig, ValidatorSet, DiscoverySet) {
-    let (mut nodes, validator_set, discovery_set) = gen_configs(count);
-    let node = nodes.swap_remove(0);
-    (node, validator_set, discovery_set)
+fn gen_configs(count: usize) -> Vec<NodeConfig> {
+    config_builder::ValidatorConfig::new()
+        .nodes(count)
+        .build_common(true, false)
+        .unwrap()
+        .0
 }
 
 fn setup_storage_service_and_executor(
     config: &NodeConfig,
-) -> (Runtime, Arc<dyn StorageRead>, Executor<LibraVM>) {
-    let (arc_db, db_reader_writer) = init_libra_db(config);
+) -> (Arc<dyn DbReader>, Executor<LibraVM>, Waypoint) {
+    let (db_r, db_rw) = init_libra_db(config);
     let genesis_tx = config.execution.genesis.as_ref().unwrap();
-    bootstrap_db_if_empty::<LibraVM>(&db_reader_writer, genesis_tx)
-        .expect("Db-bootstrapper should not fail.");
-    let storage_runtime = start_storage_service_with_db(config, arc_db);
+    let waypoint = bootstrap_db_if_empty::<LibraVM>(&db_rw, genesis_tx)
+        .expect("Db-bootstrapper should not fail.")
+        .unwrap();
 
-    let storage_read_client = Arc::new(StorageReadServiceClient::new(&config.storage.address));
-    let executor = Executor::new(SyncStorageClient::new(&config.storage.address).into());
+    let executor = Executor::new(db_rw);
 
-    (storage_runtime, storage_read_client, executor)
+    (db_r, executor, waypoint)
 }
 
 fn setup_onchain_discovery(
     executor: Handle,
     peer_id: PeerId,
     role: RoleType,
-    storage_read_client: Arc<dyn StorageRead>,
+    libra_db: Arc<dyn DbReader>,
+    waypoint: Waypoint,
 ) -> (
+    JoinHandle<()>,
     JoinHandle<()>,
     MockOnchainDiscoveryNetworkSender,
     channel::Sender<()>,
@@ -234,35 +211,40 @@ fn setup_onchain_discovery(
     let conn_reqs_tx = ConnectionRequestSender::new(conn_reqs_tx);
     let network_reqs_tx =
         OnchainDiscoveryNetworkSender::new(peer_mgr_reqs_tx, conn_reqs_tx, conn_mgr_reqs_tx);
-    let network_notifs_rx = OnchainDiscoveryNetworkEvents::new(peer_mgr_notifs_rx, conn_notifs_rx);
+    // let network_notifs_rx = OnchainDiscoveryNetworkEvents::new(peer_mgr_notifs_rx, conn_notifs_rx);
     let (peer_query_ticker_tx, peer_query_ticker_rx) = channel::new_test::<()>(1);
     let (storage_query_ticker_tx, storage_query_ticker_rx) = channel::new_test::<()>(1);
 
-    let waypoint = None;
     let outbound_rpc_timeout = Duration::from_secs(30);
     let max_concurrent_inbound_rpcs = 8;
 
     let onchain_discovery = OnchainDiscovery::new(
-        executor.clone(),
         peer_id,
         role,
         waypoint,
         network_reqs_tx,
-        network_notifs_rx,
-        storage_read_client,
+        conn_notifs_rx,
+        Arc::clone(&libra_db),
         peer_query_ticker_rx,
         storage_query_ticker_rx,
         outbound_rpc_timeout,
+    );
+    let f_onchain_discovery = executor.spawn(onchain_discovery.start());
+
+    let service = OnchainDiscoveryService::new(
+        executor.clone(),
+        peer_mgr_notifs_rx,
+        libra_db,
         max_concurrent_inbound_rpcs,
     );
-
-    let f_onchain_discovery = executor.spawn(onchain_discovery.start());
+    let f_service = executor.spawn(service.start());
 
     let mock_network_sender =
         MockOnchainDiscoveryNetworkSender::new(peer_mgr_notifs_tx, conn_notifs_tx);
 
     (
         f_onchain_discovery,
+        f_service,
         mock_network_sender,
         peer_query_ticker_tx,
         storage_query_ticker_tx,
@@ -272,50 +254,51 @@ fn setup_onchain_discovery(
 }
 
 #[test]
-fn handles_remote_query() {
+fn service_handles_remote_query() {
     ::libra_logger::Logger::new().environment_only(true).init();
     let mut rt = Runtime::new().unwrap();
-    let (config, _, discovery_set) = gen_single_config(5);
+    let config = gen_configs(1).swap_remove(0);
     let self_peer_id = config.validator_network.as_ref().unwrap().peer_id;
     let role = config.base.role;
 
-    let (_storage_runtime, storage_read_client, _executor) =
-        setup_storage_service_and_executor(&config);
+    let (libra_db, _executor, waypoint) = setup_storage_service_and_executor(&config);
+    let discovery_set = read_discovery_set(&libra_db);
+    let expected_discovery_set = DiscoverySetInternal::from_discovery_set(role, discovery_set);
 
     let (
         f_onchain_discovery,
+        f_service,
         mut mock_network_tx,
         peer_query_ticker_tx,
         storage_query_ticker_tx,
         _peer_mgr_reqs_rx,
         _conn_mgr_reqs_rx,
-    ) = setup_onchain_discovery(rt.handle().clone(), self_peer_id, role, storage_read_client);
+    ) = setup_onchain_discovery(rt.handle().clone(), self_peer_id, role, libra_db, waypoint);
 
-    // query the onchain discovery actor
+    let trusted_state = TrustedState::from(waypoint);
+
+    // query the onchain discovery storage service
     let query_req = QueryDiscoverySetRequest {
-        client_known_version: 0,
-        client_known_seq_num: 0,
+        known_version: trusted_state.latest_version(),
     };
-
     let other_peer_id = PeerId::random();
     let query_res =
         rt.block_on(mock_network_tx.query_discovery_set(other_peer_id, query_req.clone()));
 
     // verify response and ratchet epoch_info
-    let trusted_state = TrustedState::new_trust_any_genesis_WARNING_UNSAFE();
-    query_res
-        .query_res
-        .update_to_latest_ledger_response
-        .verify(&trusted_state, &query_req.into())
+    let (trusted_state_change, opt_discovery_set) = query_res
+        .verify_and_ratchet(&query_req, &trusted_state)
         .unwrap();
 
-    // verify discovery set is the same as genesis discovery set
-    let discovery_set_event = query_res.event.unwrap();
-    assert_eq!(0, discovery_set_event.event_seq_num);
+    assert!(
+        matches!(trusted_state_change, TrustedStateChange::Epoch { .. }),
+        "Unexpected trusted_state_change, expected epoch change: actual change: {:?}",
+        trusted_state_change
+    );
 
-    let expected_discovery_set = DiscoverySetInternal::from_discovery_set(role, discovery_set);
+    // verify discovery set is the same as genesis discovery set
     let actual_discovery_set =
-        DiscoverySetInternal::from_discovery_set(role, discovery_set_event.discovery_set);
+        DiscoverySetInternal::from_discovery_set(role, opt_discovery_set.unwrap());
     assert_eq!(expected_discovery_set, actual_discovery_set);
 
     // shutdown
@@ -324,27 +307,29 @@ fn handles_remote_query() {
     drop(storage_query_ticker_tx);
 
     rt.block_on(f_onchain_discovery).unwrap();
+    rt.block_on(f_service).unwrap();
 }
 
 #[test]
 fn queries_storage_on_tick() {
     ::libra_logger::Logger::new().environment_only(true).init();
     let mut rt = Runtime::new().unwrap();
-    let (config, _, discovery_set) = gen_single_config(5);
+    let config = gen_configs(1).swap_remove(0);
     let self_peer_id = config.validator_network.as_ref().unwrap().peer_id;
     let role = config.base.role;
 
-    let (_storage_runtime, storage_read_client, _executor) =
-        setup_storage_service_and_executor(&config);
+    let (libra_db, _executor, waypoint) = setup_storage_service_and_executor(&config);
+    let discovery_set = read_discovery_set(&libra_db);
 
     let (
         f_onchain_discovery,
+        f_service,
         mock_network_tx,
         peer_query_ticker_tx,
         mut storage_query_ticker_tx,
         _peer_mgr_reqs_rx,
         conn_mgr_reqs_rx,
-    ) = setup_onchain_discovery(rt.handle().clone(), self_peer_id, role, storage_read_client);
+    ) = setup_onchain_discovery(rt.handle().clone(), self_peer_id, role, libra_db, waypoint);
 
     // trigger storage tick so onchain discovery queries its own storage
     rt.block_on(storage_query_ticker_tx.send(())).unwrap();
@@ -381,13 +366,14 @@ fn queries_storage_on_tick() {
 
     // onchain discovery actor should terminate
     rt.block_on(f_onchain_discovery).unwrap();
+    rt.block_on(f_service).unwrap();
 }
 
 #[test]
 fn queries_peers_on_tick() {
     ::libra_logger::Logger::new().environment_only(true).init();
     let mut rt = Runtime::new().unwrap();
-    let (mut configs, _, discovery_set) = gen_configs(5);
+    let mut configs = gen_configs(5);
 
     // server setup
 
@@ -395,11 +381,12 @@ fn queries_peers_on_tick() {
     let server_peer_id = server_config.validator_network.as_ref().unwrap().peer_id;
     let server_role = server_config.base.role;
 
-    let (_server_storage_runtime, server_storage_read_client, _server_executor) =
+    let (server_libra_db, _server_executor, waypoint) =
         setup_storage_service_and_executor(&server_config);
 
     let (
         f_server_onchain_discovery,
+        f_server_service,
         mut server_network_tx,
         server_peer_query_ticker_tx,
         server_storage_query_ticker_tx,
@@ -409,7 +396,8 @@ fn queries_peers_on_tick() {
         rt.handle().clone(),
         server_peer_id,
         server_role,
-        server_storage_read_client,
+        server_libra_db,
+        waypoint,
     );
 
     // client setup
@@ -418,11 +406,12 @@ fn queries_peers_on_tick() {
     let client_peer_id = client_config.validator_network.as_ref().unwrap().peer_id;
     let client_role = client_config.base.role;
 
-    let (_storage_runtime, storage_read_client, _executor) =
-        setup_storage_service_and_executor(&client_config);
+    let (libra_db, _executor, waypoint) = setup_storage_service_and_executor(&client_config);
+    let discovery_set = read_discovery_set(&libra_db);
 
     let (
         f_client_onchain_discovery,
+        f_client_service,
         mut client_network_tx,
         mut client_peer_query_ticker_tx,
         client_storage_query_ticker_tx,
@@ -432,7 +421,8 @@ fn queries_peers_on_tick() {
         rt.handle().clone(),
         client_peer_id,
         client_role,
-        storage_read_client,
+        libra_db,
+        waypoint,
     );
 
     // notify client of new connection to server
@@ -479,6 +469,7 @@ fn queries_peers_on_tick() {
 
     // client should shutdown completely
     rt.block_on(f_client_onchain_discovery).unwrap();
+    rt.block_on(f_client_service).unwrap();
 
     // server shutdown
     drop(server_network_tx);
@@ -486,4 +477,5 @@ fn queries_peers_on_tick() {
     drop(server_storage_query_ticker_tx);
 
     rt.block_on(f_server_onchain_discovery).unwrap();
+    rt.block_on(f_server_service).unwrap();
 }

@@ -1,14 +1,4 @@
-// dep: tests/sources/stdlib/modules/hash.move
-// dep: tests/sources/stdlib/modules/lbr.move
-// dep: tests/sources/stdlib/modules/lcs.move
-// dep: tests/sources/stdlib/modules/libra.move
-// dep: tests/sources/stdlib/modules/libra_transaction_timeout.move
-// dep: tests/sources/stdlib/modules/transaction.move
-// dep: tests/sources/stdlib/modules/vector.move
-// dep: tests/sources/stdlib/modules/libra_time.move
-// no-verify
-
-address 0x0:
+address 0x0 {
 
 // The module for the account resource that governs every Libra account
 module LibraAccount {
@@ -19,6 +9,10 @@ module LibraAccount {
     use 0x0::LibraTransactionTimeout;
     use 0x0::Transaction;
     use 0x0::Vector;
+
+    spec module {
+        pragma verify = false;
+    }
 
     // Every Libra account has a LibraAccount::T resource
     resource struct T {
@@ -198,7 +192,6 @@ module LibraAccount {
         );
     }
     spec fun deposit_with_sender_and_metadata {
-        //aborts_if to_deposit.value >= 0; // FIXME: uncommenting this line is verified, but should not be.
         aborts_if to_deposit.value == 0;
         aborts_if !exists<T>(sender);
         aborts_if global<T>(sender).sent_events.counter + 1 > max_u64();
@@ -498,14 +491,24 @@ module LibraAccount {
             fresh_address,
         );
     }
-    spec fun create_account { // FIXME: This should pass, but Z3 does not terminate on this.
-//        aborts_if len(LCS::serialize(fresh_address)) + len(auth_key_prefix) != 32;
-//        aborts_if exists<Balance<LBR::T>>(fresh_address);
-//        aborts_if exists<T>(fresh_address);
-        ensures !(len(LCS::serialize(fresh_address)) + len(auth_key_prefix) != 32); // TODO: Remove this line once the "aborts_if" clauses are verified.
-        ensures !old(exists<Balance<LBR::T>>(fresh_address)); // TODO: Remove this line once the "aborts_if" clauses are verified.
-        ensures !old(exists<T>(fresh_address)); // TODO: Remove this line once the "aborts_if" clauses are verified.
-        // TODO: Add ensures
+    spec fun create_account {
+        aborts_if len(LCS::serialize(fresh_address)) + len(auth_key_prefix) != 32;
+        aborts_if exists<Balance<LBR::T>>(fresh_address);
+        aborts_if exists<T>(fresh_address);
+        aborts_if !exists<Libra::Info<LBR::T>>(0xA550C18);
+        ensures exists<Balance<LBR::T>>(fresh_address);
+        ensures global<Balance<LBR::T>>(fresh_address).coin.value == 0;
+        ensures exists<T>(fresh_address);
+        ensures Vector::eq_append(global<T>(fresh_address).authentication_key, auth_key_prefix, LCS::serialize(fresh_address));
+        ensures global<T>(fresh_address).delegated_key_rotation_capability == false;
+        ensures global<T>(fresh_address).delegated_withdrawal_capability == false;
+        ensures global<T>(fresh_address).sequence_number == 0;
+        ensures global<T>(fresh_address).event_generator.counter == 2;
+        ensures global<T>(fresh_address).event_generator == EventHandleGenerator {counter: 2}; // redundant to the previous line
+        ensures global<T>(fresh_address).received_events.counter == 0;
+        //ensures Vector::eq_append(global<T>(fresh_address).received_events.guid, LCS::serialize(EventHandleGenerator {counter: 0}), LCS::serialize(fresh_address)); // FIXME: Z3 will hang
+        ensures global<T>(fresh_address).sent_events.counter == 0;
+        //ensures Vector::eq_append(global<T>(fresh_address).sent_events.guid, LCS::serialize(EventHandleGenerator {counter: 1}), LCS::serialize(fresh_address)); // FIXME: Z3 will hang
     }
 
     // Creates a new account at `fresh_address` with the `initial_balance` deducted from the
@@ -889,4 +892,5 @@ module LibraAccount {
     spec fun destroy_handle {
         aborts_if false;
     }
+}
 }

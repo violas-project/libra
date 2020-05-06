@@ -15,9 +15,8 @@ use libra_types::{
     access_path::AccessPath,
     account_config::{AccountResource, BalanceResource},
     block_metadata::{new_block_event_key, BlockMetadata, NewBlockEvent},
-    discovery_set::mock::mock_discovery_set,
     language_storage::ModuleId,
-    on_chain_config::{VMPublishingOption, ValidatorSet},
+    on_chain_config::{OnChainConfig, VMPublishingOption, ValidatorSet},
     transaction::{
         SignedTransaction, Transaction, TransactionOutput, TransactionStatus, VMValidatorResult,
     },
@@ -94,19 +93,16 @@ impl FakeExecutor {
     /// Creates fresh genesis from the stdlib modules passed in.
     pub fn custom_genesis(
         genesis_modules: Vec<VerifiedModule>,
-        validator_set: Option<ValidatorSet>,
+        validator_accounts: Option<usize>,
         publishing_options: VMPublishingOption,
     ) -> Self {
         let genesis_change_set = {
-            let validator_set_len: usize = validator_set.as_ref().map_or(10, |s| s.payload().len());
-            let swarm = generator::validator_swarm_for_testing(validator_set_len);
-            let validator_set = validator_set.unwrap_or(swarm.validator_set);
-            let discovery_set = mock_discovery_set(&validator_set);
+            let validator_count = validator_accounts.map_or(10, |s| s);
+            let swarm = generator::validator_swarm_for_testing(validator_count);
+
             vm_genesis::encode_genesis_change_set(
                 &GENESIS_KEYPAIR.1,
-                &swarm.nodes,
-                validator_set,
-                discovery_set,
+                &vm_genesis::validator_registrations(&swarm.nodes),
                 &genesis_modules,
                 publishing_options,
             )
@@ -257,17 +253,15 @@ impl FakeExecutor {
     }
 
     pub fn new_block(&mut self) {
-        let validator_address = *generator::validator_swarm_for_testing(10)
-            .validator_set
-            .payload()[0]
-            .account_address();
+        let validator_set = ValidatorSet::fetch_config(&self.data_store)
+            .expect("Unable to retrieve the validator set from storage");
         self.block_time += 1;
         let new_block = BlockMetadata::new(
             HashValue::zero(),
             0,
             self.block_time,
             vec![],
-            validator_address,
+            *validator_set.payload()[0].account_address(),
         );
         let output = self
             .execute_transaction_block(vec![Transaction::BlockMetadata(new_block)])

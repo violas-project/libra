@@ -40,7 +40,7 @@ use futures::{
     stream::select,
     Stream, StreamExt, TryStreamExt,
 };
-use libra_crypto::HashValue;
+use libra_crypto::{hash::CryptoHash, HashValue};
 use libra_types::{
     epoch_info::EpochInfo,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
@@ -63,7 +63,7 @@ pub struct NodeSetup {
     storage: Arc<MockStorage<TestPayload>>,
     signer: ValidatorSigner,
     proposer_author: Author,
-    validators: Arc<ValidatorVerifier>,
+    validators: ValidatorVerifier,
     safety_rules_manager: SafetyRulesManager<TestPayload>,
     all_events:
         Box<dyn Stream<Item = anyhow::Result<Event<ConsensusMsg<TestPayload>>>> + Send + Unpin>,
@@ -91,7 +91,8 @@ impl NodeSetup {
         let (signers, validators) = random_validator_verifier(num_nodes, None, false);
         let proposer_author = signers[0].author();
         let validator_set = (&validators).into();
-        let waypoint = Waypoint::new(&LedgerInfo::mock_genesis(Some(validator_set))).unwrap();
+        let waypoint =
+            Waypoint::new_epoch_boundary(&LedgerInfo::mock_genesis(Some(validator_set))).unwrap();
         let mut nodes = vec![];
         for signer in signers.iter().take(num_nodes) {
             let (initial_data, storage) =
@@ -129,7 +130,7 @@ impl NodeSetup {
     ) -> Self {
         let epoch_info = EpochInfo {
             epoch: 1,
-            verifier: Arc::new(storage.get_validator_set().into()),
+            verifier: storage.get_validator_set().into(),
         };
         let validators = epoch_info.verifier.clone();
         let (network_reqs_tx, network_reqs_rx) =
@@ -185,7 +186,7 @@ impl NodeSetup {
         let pacemaker = Self::create_pacemaker(time_service.clone());
         let proposer_election = Self::create_proposer_election(proposer_author);
         let mut safety_rules = safety_rules_manager.client();
-        let proof = storage.retrieve_validator_change_proof(0).unwrap();
+        let proof = storage.retrieve_epoch_change_proof(0).unwrap();
         safety_rules.initialize(&proof).unwrap();
 
         let mut event_processor = EventProcessor::new(
@@ -412,7 +413,7 @@ fn sync_info_carried_on_timeout_vote() {
             block_0.gen_block_info(
                 parent_block_info.executed_state_id(),
                 parent_block_info.version(),
-                parent_block_info.next_validator_set().cloned(),
+                parent_block_info.next_epoch_info().cloned(),
             ),
             parent_block_info.clone(),
             None,
@@ -527,15 +528,13 @@ fn response_on_block_retrieval() {
         .unwrap();
 
     let genesis_qc = certificate_for_genesis();
-    let block = Block::new_proposal(vec![1], 1, 1, genesis_qc, &node.signer);
+    let block = Block::new_proposal(vec![1], 1, 1, genesis_qc.clone(), &node.signer);
     let block_id = block.id();
+    let proposal =
+        ProposalMsg::<TestPayload>::new(block, SyncInfo::new(genesis_qc.clone(), genesis_qc, None));
 
     timed_block_on(&mut runtime, async {
-        node.event_processor
-            .process_certificates(block.quorum_cert(), None)
-            .await
-            .expect("Failed to process certificates");
-        node.event_processor.process_proposed_block(block).await;
+        node.event_processor.process_proposal_msg(proposal).await;
 
         // first verify that we can retrieve the block if it's in the tree
         let (tx1, rx1) = oneshot::channel();
@@ -615,28 +614,35 @@ fn recover_on_restart() {
     let mut node = NodeSetup::create_nodes(&mut playground, runtime.handle().clone(), 1)
         .pop()
         .unwrap();
-    let mut inserter = TreeInserter::new_with_store(node.signer.clone(), node.block_store.clone());
+    let inserter = TreeInserter::new_with_store(node.signer.clone(), node.block_store.clone());
 
-    let genesis = node.block_store.root();
-    let mut proposals = Vec::new();
+    let genesis_qc = certificate_for_genesis();
+    let mut data = Vec::new();
     let num_proposals = 100;
     // insert a few successful proposals
-    let a1 = inserter.insert_block_with_qc(certificate_for_genesis(), &genesis, 1);
-    proposals.push(a1);
-    for i in 2..=num_proposals {
-        let parent = proposals.last().unwrap();
-        let proposal = inserter.insert_block(&parent, i, None);
-        proposals.push(proposal);
+    for i in 1..=num_proposals {
+        let proposal = inserter.create_block_with_qc(genesis_qc.clone(), i, i, vec![]);
+        let timeout = Timeout::new(1, i - 1);
+        let mut tc = TimeoutCertificate::new(timeout.clone());
+        tc.add_signature(
+            inserter.signer().author(),
+            inserter.signer().sign_message(timeout.hash()),
+        );
+        data.push((proposal, tc));
     }
 
     timed_block_on(&mut runtime, async {
-        for proposal in &proposals {
+        for (proposal, tc) in &data {
+            let proposal_msg = ProposalMsg::<TestPayload>::new(
+                proposal.clone(),
+                SyncInfo::new(
+                    proposal.quorum_cert().clone(),
+                    genesis_qc.clone(),
+                    Some(tc.clone()),
+                ),
+            );
             node.event_processor
-                .process_certificates(proposal.quorum_cert(), None)
-                .await
-                .expect("Failed to process certificates");
-            node.event_processor
-                .process_proposed_block(proposal.block().clone())
+                .process_proposal_msg(proposal_msg)
                 .await;
         }
     });
@@ -647,9 +653,9 @@ fn recover_on_restart() {
     let waypoint = consensus_state.waypoint();
     assert_eq!(
         consensus_state,
-        ConsensusState::new(1, num_proposals, num_proposals - 2, waypoint)
+        ConsensusState::new(1, num_proposals, 0, waypoint)
     );
-    for block in proposals {
+    for (block, _) in data {
         assert_eq!(node.block_store.block_exists(block.id()), true);
     }
 }
@@ -725,7 +731,7 @@ fn sync_info_sent_on_stale_sync_info() {
         block_0.gen_block_info(
             parent_block_info.executed_state_id(),
             parent_block_info.version(),
-            parent_block_info.next_validator_set().cloned(),
+            parent_block_info.next_epoch_info().cloned(),
         ),
         parent_block_info.clone(),
         None,

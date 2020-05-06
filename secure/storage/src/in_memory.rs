@@ -69,9 +69,11 @@ impl<T: Send + Sync + TimeService> KVStorage for InMemoryStorageInternal<T> {
                 let key = lcs::from_bytes(&bytes)?;
                 Value::Ed25519PrivateKey(key)
             }
+            Value::Ed25519PublicKey(value) => Value::Ed25519PublicKey(value.clone()),
             Value::HashValue(value) => Value::HashValue(*value),
             Value::String(value) => Value::String(value.clone()),
             Value::U64(value) => Value::U64(*value),
+            Value::Transaction(value) => Value::Transaction(value.clone()),
         };
 
         let last_update = response.last_update;

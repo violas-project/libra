@@ -122,7 +122,7 @@ impl TestEnvironment {
             false,
             /* faucet server */ None,
             Some(mnemonic_file_path),
-            waypoint,
+            waypoint.unwrap_or_else(|| self.validator_swarm.config.waypoint),
         )
         .unwrap()
     }
@@ -253,7 +253,12 @@ fn test_execute_custom_module_and_script() {
 
     // Compile and publish that module.
     let module_params = &["compile", "0", unwrapped_module_path, unwrapped_stdlib_dir];
-    let module_compiled_path = client_proxy.compile_program(module_params).unwrap();
+    let mut module_compiled_paths = client_proxy.compile_program(module_params).unwrap();
+    let module_compiled_path = if module_compiled_paths.len() != 1 {
+        panic!("compiler output has more than one file")
+    } else {
+        module_compiled_paths.pop().unwrap()
+    };
     client_proxy
         .publish_module(&["publish", "0", &module_compiled_path[..]])
         .unwrap();
@@ -272,7 +277,12 @@ fn test_execute_custom_module_and_script() {
         unwrapped_module_path,
         unwrapped_stdlib_dir,
     ];
-    let script_compiled_path = client_proxy.compile_program(script_params).unwrap();
+    let mut script_compiled_paths = client_proxy.compile_program(script_params).unwrap();
+    let script_compiled_path = if script_compiled_paths.len() != 1 {
+        panic!("compiler output has more than one file")
+    } else {
+        script_compiled_paths.pop().unwrap()
+    };
     let formatted_recipient_address = format!("0x{}", recipient_address);
     client_proxy
         .execute_script(&[
@@ -753,6 +763,7 @@ fn test_external_transaction_signer() {
                     amount: p_amount,
                     auth_key_prefix,
                     metadata,
+                    metadata_signature,
                 } => {
                     assert_eq!(p_receiver, receiver_address.to_string());
                     assert_eq!(p_amount, amount);
@@ -766,6 +777,12 @@ fn test_external_transaction_signer() {
                         metadata
                             .into_bytes()
                             .expect("failed to turn metadata to bytes"),
+                        Vec::<u8>::new()
+                    );
+                    assert_eq!(
+                        metadata_signature
+                            .into_bytes()
+                            .expect("failed to turn metadata_signature to bytes"),
                         Vec::<u8>::new()
                     );
                 }
@@ -974,7 +991,12 @@ fn test_e2e_modify_publishing_option() {
     let stdlib_source_dir = workspace_builder::workspace_root().join("language/stdlib/modules");
     let unwrapped_stdlib_dir = stdlib_source_dir.to_str().unwrap();
     let script_params = &["compile", "0", unwrapped_script_path, unwrapped_stdlib_dir];
-    let script_compiled_path = client_proxy.compile_program(script_params).unwrap();
+    let mut script_compiled_paths = client_proxy.compile_program(script_params).unwrap();
+    let script_compiled_path = if script_compiled_paths.len() != 1 {
+        panic!("compiler output has more than one file")
+    } else {
+        script_compiled_paths.pop().unwrap()
+    };
 
     // Initially publishing option was set to CustomScript, this transaction should be executed.
     client_proxy
@@ -1034,7 +1056,7 @@ fn test_client_waypoints() {
         .latest_epoch_change_li()
         .expect("Failed to retrieve genesis LedgerInfo");
     assert_eq!(genesis_li.ledger_info().epoch(), 0);
-    let genesis_waypoint = Waypoint::new(genesis_li.ledger_info())
+    let genesis_waypoint = Waypoint::new_epoch_boundary(genesis_li.ledger_info())
         .expect("Failed to generate waypoint from genesis LI");
 
     // Start another client with the genesis waypoint and make sure it successfully connects
@@ -1067,7 +1089,7 @@ fn test_client_waypoints() {
         .expect("Failed to retrieve end of epoch 1 LedgerInfo");
 
     assert_eq!(epoch_1_li.ledger_info().epoch(), 1);
-    let epoch_1_waypoint = Waypoint::new(epoch_1_li.ledger_info())
+    let epoch_1_waypoint = Waypoint::new_epoch_boundary(epoch_1_li.ledger_info())
         .expect("Failed to generate waypoint from end of epoch 1");
 
     // Start a client with the waypoint for end of epoch 1 and make sure it successfully connects
@@ -1080,7 +1102,7 @@ fn test_client_waypoints() {
 
     // Verify that a client with the wrong waypoint is not going to be able to connect to the chain.
     let bad_li = LedgerInfo::mock_genesis(None);
-    let bad_waypoint = Waypoint::new(&bad_li).unwrap();
+    let bad_waypoint = Waypoint::new_epoch_boundary(&bad_li).unwrap();
     let mut client_with_bad_waypoint = env.get_validator_ac_client(1, Some(bad_waypoint));
     assert!(client_with_bad_waypoint.test_trusted_connection().is_err());
 }
@@ -1099,7 +1121,12 @@ fn test_malformed_script() {
     let stdlib_source_dir = workspace_builder::workspace_root().join("language/stdlib/modules");
     let unwrapped_stdlib_dir = stdlib_source_dir.to_str().unwrap();
     let script_params = &["compile", "0", unwrapped_script_path, unwrapped_stdlib_dir];
-    let script_compiled_path = client_proxy.compile_program(script_params).unwrap();
+    let mut script_compiled_paths = client_proxy.compile_program(script_params).unwrap();
+    let script_compiled_path = if script_compiled_paths.len() != 1 {
+        panic!("compiler output has more than one file")
+    } else {
+        script_compiled_paths.pop().unwrap()
+    };
 
     // the script expects two arguments. Passing only one in the test, which will cause a failure.
     client_proxy

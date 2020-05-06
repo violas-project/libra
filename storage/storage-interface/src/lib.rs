@@ -10,13 +10,14 @@ use libra_types::{
     account_state::AccountState,
     account_state_blob::{AccountStateBlob, AccountStateWithProof},
     contract_event::ContractEvent,
+    epoch_change::EpochChangeProof,
+    epoch_info::EpochInfo,
     event::EventKey,
+    get_with_proof::{RequestItem, ResponseItem},
     ledger_info::LedgerInfoWithSignatures,
     move_resource::MoveStorage,
-    on_chain_config::ValidatorSet,
     proof::{definition::LeafCount, AccumulatorConsistencyProof, SparseMerkleProof},
     transaction::{TransactionListWithProof, TransactionToCommit, TransactionWithProof, Version},
-    validator_change::ValidatorChangeProof,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -26,6 +27,8 @@ use std::{
 };
 use thiserror::Error;
 
+#[cfg(any(feature = "testing", feature = "fuzzing"))]
+pub mod mock;
 pub mod state_view;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -34,7 +37,7 @@ pub struct StartupInfo {
     pub latest_ledger_info: LedgerInfoWithSignatures,
     /// If the above ledger info doesn't carry a validator set, the latest validator set. Otherwise
     /// `None`.
-    pub latest_validator_set: Option<ValidatorSet>,
+    pub latest_epoch_info: Option<EpochInfo>,
     pub committed_tree_state: TreeState,
     pub synced_tree_state: Option<TreeState>,
 }
@@ -42,26 +45,27 @@ pub struct StartupInfo {
 impl StartupInfo {
     pub fn new(
         latest_ledger_info: LedgerInfoWithSignatures,
-        latest_validator_set: Option<ValidatorSet>,
+        latest_epoch_info: Option<EpochInfo>,
         committed_tree_state: TreeState,
         synced_tree_state: Option<TreeState>,
     ) -> Self {
         Self {
             latest_ledger_info,
-            latest_validator_set,
+            latest_epoch_info,
             committed_tree_state,
             synced_tree_state,
         }
     }
 
-    pub fn get_validator_set(&self) -> &ValidatorSet {
-        match self.latest_ledger_info.ledger_info().next_validator_set() {
-            Some(x) => x,
-            None => self
-                .latest_validator_set
-                .as_ref()
-                .expect("Validator set must exist."),
-        }
+    pub fn get_epoch_info(&self) -> &EpochInfo {
+        self.latest_ledger_info
+            .ledger_info()
+            .next_epoch_info()
+            .unwrap_or_else(|| {
+                self.latest_epoch_info
+                    .as_ref()
+                    .expect("EpochInfo must exist")
+            })
     }
 }
 
@@ -125,6 +129,20 @@ impl From<libra_secure_net::Error> for Error {
 /// Trait that is implemented by a DB that supports certain public (to client) read APIs
 /// expected of a Libra DB
 pub trait DbReader: Send + Sync {
+    // TODO: Remove this API after deprecating AC.
+    fn update_to_latest_ledger(
+        &self,
+        _client_known_version: Version,
+        _request_items: Vec<RequestItem>,
+    ) -> Result<(
+        Vec<ResponseItem>,
+        LedgerInfoWithSignatures,
+        EpochChangeProof,
+        AccumulatorConsistencyProof,
+    )> {
+        unimplemented!()
+    }
+
     /// See [`LibraDB::get_epoch_change_ledger_infos`].
     ///
     /// [`LibraDB::get_epoch_change_ledger_infos`]:
@@ -133,7 +151,7 @@ pub trait DbReader: Send + Sync {
         &self,
         start_epoch: u64,
         end_epoch: u64,
-    ) -> Result<ValidatorChangeProof>;
+    ) -> Result<EpochChangeProof>;
 
     /// See [`LibraDB::get_transactions`].
     ///
@@ -198,7 +216,7 @@ pub trait DbReader: Send + Sync {
         &self,
         known_version: u64,
         ledger_info: LedgerInfoWithSignatures,
-    ) -> Result<(ValidatorChangeProof, AccumulatorConsistencyProof)>;
+    ) -> Result<(EpochChangeProof, AccumulatorConsistencyProof)>;
 
     /// Returns proof of new state relative to version known to client
     fn get_state_proof(
@@ -206,7 +224,7 @@ pub trait DbReader: Send + Sync {
         known_version: u64,
     ) -> Result<(
         LedgerInfoWithSignatures,
-        ValidatorChangeProof,
+        EpochChangeProof,
         AccumulatorConsistencyProof,
     )>;
 

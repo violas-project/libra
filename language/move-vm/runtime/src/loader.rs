@@ -1,7 +1,7 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::interpreter_context::InterpreterContext;
+use crate::native_functions::NativeFunction;
 use bytecode_verifier::{
     verifier::{verify_dependencies, verify_script_dependency_map},
     VerifiedModule, VerifiedScript,
@@ -14,9 +14,12 @@ use libra_types::{
     vm_error::{StatusCode, VMStatus},
 };
 use move_core_types::identifier::{IdentStr, Identifier};
-use move_vm_types::loaded_data::{
-    runtime_types::{StructType, Type, TypeConverter},
-    types::{FatStructType, FatType},
+use move_vm_types::{
+    interpreter_context::InterpreterContext,
+    loaded_data::{
+        runtime_types::{StructType, Type, TypeConverter},
+        types::{FatStructType, FatType},
+    },
 };
 use std::{
     collections::{BTreeMap, HashMap},
@@ -26,14 +29,14 @@ use std::{
 };
 use vm::{
     access::{ModuleAccess, ScriptAccess},
-    errors::{vm_error, Location, VMResult},
+    errors::{verification_error, vm_error, Location, VMResult},
     file_format::{
         Bytecode, CompiledScript, Constant, ConstantPoolIndex, FieldHandleIndex,
         FieldInstantiationIndex, FunctionDefinition, FunctionHandleIndex,
         FunctionInstantiationIndex, Kind, Signature, SignatureToken, StructDefInstantiationIndex,
         StructDefinition, StructDefinitionIndex, StructFieldInformation,
     },
-    CompiledModule,
+    CompiledModule, IndexKind,
 };
 
 // A simple cache that offers both a HashMap and a Vector lookup.
@@ -387,12 +390,26 @@ impl Loader {
         context: &mut dyn InterpreterContext,
     ) -> VMResult<()> {
         self.check_dependencies(&module, context)?;
+        Self::check_natives(&module)?;
         let module_id = module.self_id();
         self.module_cache
             .lock()
             .unwrap()
             .insert(module_id, module)
             .and_then(|_| Ok(()))
+    }
+
+    fn load_module(
+        &self,
+        id: &ModuleId,
+        context: &dyn InterpreterContext,
+    ) -> VMResult<Arc<Module>> {
+        if let Some(module) = self.module_cache.lock().unwrap().get(id) {
+            return Ok(module);
+        }
+        let module = self.deserialize_and_verify_module(id, context)?;
+        Self::check_natives(&module)?;
+        self.module_cache.lock().unwrap().insert(id.clone(), module)
     }
 
     pub(crate) fn verify_ty_args(&self, constraints: &[Kind], ty_args: &[Type]) -> VMResult<()> {
@@ -412,16 +429,40 @@ impl Loader {
         Ok(())
     }
 
-    fn load_module(
-        &self,
-        id: &ModuleId,
-        context: &dyn InterpreterContext,
-    ) -> VMResult<Arc<Module>> {
-        if let Some(module) = self.module_cache.lock().unwrap().get(id) {
-            return Ok(module);
+    pub(crate) fn check_natives(module: &VerifiedModule) -> VMResult<()> {
+        for (idx, native_function) in module
+            .function_defs()
+            .iter()
+            .filter(|fdv| fdv.is_native())
+            .enumerate()
+        {
+            let fh = module.function_handle_at(native_function.function);
+            let mh = module.module_handle_at(fh.module);
+            NativeFunction::resolve(
+                module.address_identifier_at(mh.address),
+                module.identifier_at(mh.name).as_str(),
+                module.identifier_at(fh.name).as_str(),
+            )
+            .ok_or_else(|| {
+                verification_error(
+                    IndexKind::FunctionHandle,
+                    idx,
+                    StatusCode::MISSING_DEPENDENCY,
+                )
+            })?;
         }
-        let module = self.deserialize_and_verify_module(id, context)?;
-        self.module_cache.lock().unwrap().insert(id.clone(), module)
+        // TODO: fix check and error code if we leave something around for native structs.
+        // For now this generates the only error test cases care about...
+        for (idx, struct_def) in module.struct_defs().iter().enumerate() {
+            if struct_def.field_information == StructFieldInformation::Native {
+                return Err(verification_error(
+                    IndexKind::FunctionHandle,
+                    idx,
+                    StatusCode::MISSING_DEPENDENCY,
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn get_module(&self, idx: &ModuleId) -> Arc<Module> {
@@ -496,7 +537,7 @@ impl Loader {
             }
         };
 
-        let mut errs = match VerifiedScript::new(script) {
+        let err = match VerifiedScript::new(script) {
             Ok(script) => {
                 // verify dependencies
                 let deps = load_script_dependencies(&script);
@@ -508,24 +549,21 @@ impl Loader {
                 for dependency in &dependencies {
                     dependency_map.insert(dependency.module_id().clone(), dependency.module());
                 }
-                let errs = verify_script_dependency_map(&script, &dependency_map);
-                if errs.is_empty() {
-                    return Ok(script);
+                match verify_script_dependency_map(&script, &dependency_map) {
+                    Ok(()) => return Ok(script),
+                    Err(e) => e,
                 }
-                errs
             }
             Err((_, errs)) => errs,
         };
         error!(
             "[VM] bytecode verifier returned errors for script: {:?}",
-            errs
+            err
         );
         // If there are errors there should be at least one otherwise there's an internal
         // error in the verifier. We only give back the first error. If the user wants to
         // debug things, they can do that offline.
-        Err(errs
-            .pop()
-            .unwrap_or_else(|| VMStatus::new(StatusCode::VERIFIER_INVARIANT_VIOLATION)))
+        Err(err)
     }
 
     fn deserialize_and_verify_module(
@@ -551,9 +589,7 @@ impl Loader {
                 self.check_dependencies(&module, context)?;
                 Ok(module)
             }
-            Err((_, mut errors)) => Err(errors
-                .pop()
-                .unwrap_or_else(|| VMStatus::new(StatusCode::VERIFIER_INVARIANT_VIOLATION))),
+            Err((_, err)) => Err(err),
         }
     }
 
@@ -571,13 +607,7 @@ impl Loader {
         for dependency in &dependencies {
             dependency_map.insert(dependency.module_id().clone(), dependency.module());
         }
-        let mut errs = verify_dependencies(module, &dependency_map);
-        if errs.is_empty() {
-            return Ok(());
-        }
-        Err(errs
-            .pop()
-            .unwrap_or_else(|| VMStatus::new(StatusCode::VERIFIER_INVARIANT_VIOLATION)))
+        verify_dependencies(module, &dependency_map)
     }
 }
 
@@ -904,8 +934,6 @@ struct Script {
 
 impl Script {
     fn new(script: VerifiedScript, script_hash: &HashValue, cache: &ModuleCache) -> VMResult<Self> {
-        let main_def = script.main();
-
         let mut struct_refs = vec![];
         for struct_handle in script.struct_handles() {
             let struct_name = script.identifier_at(struct_handle.name);
@@ -918,13 +946,7 @@ impl Script {
         }
 
         let mut function_refs = vec![];
-        for (idx, func_handle) in script.function_handles().iter().enumerate() {
-            if idx == main_def.function.0 as usize {
-                // TODO: this is wrong it assumes it's never called for the main which is true
-                // but... it will not be a problem once we split Module and Script
-                function_refs.push(0);
-                continue;
-            }
+        for func_handle in script.function_handles().iter() {
             let func_name = script.identifier_at(func_handle.name);
             let module_handle = script.module_handle_at(func_handle.module);
             let module_id = ModuleId::new(
@@ -936,12 +958,12 @@ impl Script {
         }
 
         let mut function_instantiations = vec![];
-        let module = script.clone().into_module();
+        let (_, module) = script.clone().into_module();
         for func_inst in script.function_instantiations() {
             let handle = function_refs[func_inst.handle.0 as usize];
             let mut instantiation = vec![];
             for ty in &script.signature_at(func_inst.type_parameters).0 {
-                instantiation.push(cache.make_type(module.as_inner(), ty)?);
+                instantiation.push(cache.make_type(&module, ty)?);
             }
             function_instantiations.push(FunctionInstantiation {
                 handle,
@@ -952,21 +974,21 @@ impl Script {
         let scope = Scope::Script(*script_hash);
 
         let compiled_script = script.as_inner().as_inner();
-        let code: Vec<Bytecode> = compiled_script.main.code.code.clone();
-        let main_handle = script.function_handle_at(main_def.function);
-        let parameters = script.signature_at(main_handle.parameters).clone();
-        let return_ = script.signature_at(main_handle.return_).clone();
-        let locals = script.signature_at(main_def.code.locals).clone();
-        let type_parameters = main_handle.type_parameters.clone();
-        let name = script.identifier_at(main_handle.name).to_owned();
-        let is_native = false;
+        let code: Vec<Bytecode> = compiled_script.code.code.clone();
+        let parameters = script.signature_at(compiled_script.parameters).clone();
+        let return_ = Signature(vec![]);
+        let locals = script.signature_at(compiled_script.code.locals).clone();
+        let type_parameters = compiled_script.type_parameters.clone();
+        // TODO: main does not have a name. Revisit.
+        let name = Identifier::new("main").unwrap();
+        let native = None; // Script entries cannot be native
         let main: Arc<Function> = Arc::new(Function {
             code,
             parameters,
             return_,
             locals,
             type_parameters,
-            is_native,
+            native,
             scope,
             name,
         });
@@ -1008,7 +1030,7 @@ pub struct Function {
     return_: Signature,
     locals: Signature,
     type_parameters: Vec<Kind>,
-    is_native: bool,
+    native: Option<NativeFunction>,
     scope: Scope,
     name: Identifier,
 }
@@ -1017,20 +1039,32 @@ impl Function {
     fn new(def: &FunctionDefinition, module: &VerifiedModule) -> Self {
         let handle = module.function_handle_at(def.function);
         let name = module.identifier_at(handle.name).to_owned();
-        let scope = Scope::Module(module.self_id());
-        let code = def.code.code.clone();
+        let module_id = module.self_id();
+        let native = if def.is_native() {
+            NativeFunction::resolve(
+                module_id.address(),
+                module_id.name().as_str(),
+                name.as_str(),
+            )
+        } else {
+            None
+        };
+        let scope = Scope::Module(module_id);
+        // Native functions do not have a code unit
+        let (code, locals) = match &def.code {
+            Some(code) => (code.code.clone(), module.signature_at(code.locals).clone()),
+            None => (vec![], Signature(vec![])),
+        };
         let parameters = module.signature_at(handle.parameters).clone();
         let return_ = module.signature_at(handle.return_).clone();
-        let locals = module.signature_at(def.code.locals).clone();
         let type_parameters = handle.type_parameters.clone();
-        let is_native = def.is_native();
         Self {
             code,
             parameters,
             return_,
             locals,
             type_parameters,
-            is_native,
+            native,
             scope,
             name,
         }
@@ -1087,12 +1121,24 @@ impl Function {
     pub(crate) fn pretty_string(&self) -> String {
         match &self.scope {
             Scope::Script(_) => "Script::main".into(),
-            Scope::Module(id) => format!("{}::{}", id.name().as_str(), self.name.as_str()),
+            Scope::Module(id) => format!(
+                "0x{}::{}::{}",
+                id.address(),
+                id.name().as_str(),
+                self.name.as_str()
+            ),
         }
     }
 
     pub(crate) fn is_native(&self) -> bool {
-        self.is_native
+        self.native.is_some()
+    }
+
+    pub(crate) fn get_native(&self) -> VMResult<NativeFunction> {
+        self.native.ok_or_else(|| {
+            VMStatus::new(StatusCode::UNREACHABLE)
+                .with_message("Missing Native Function".to_string())
+        })
     }
 }
 

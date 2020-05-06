@@ -10,7 +10,7 @@ use crate::{
         network::{Event, NetworkEvents, NetworkSender},
         rpc::error::RpcError,
     },
-    validator_network::network_builder::{NetworkBuilder, TransportType},
+    validator_network::network_builder::{NetworkBuilder, TransportType, NETWORK_CHANNEL_SIZE},
     NetworkPublicKeys, ProtocolId,
 };
 use channel::message_queues::QueueStyle;
@@ -19,8 +19,8 @@ use libra_config::config::RoleType;
 use libra_crypto::{
     ed25519::Ed25519PrivateKey, test_utils::TEST_SEED, x25519, PrivateKey, Uniform,
 };
+use libra_network_address::NetworkAddress;
 use libra_types::PeerId;
-use parity_multiaddr::Multiaddr;
 use rand::{rngs::StdRng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, time::Duration};
@@ -38,6 +38,7 @@ fn add_to_network(network: &mut NetworkBuilder) -> (DummyNetworkSender, DummyNet
             vec![TEST_RPC_PROTOCOL],
             vec![TEST_DIRECT_SEND_PROTOCOL],
             QueueStyle::LIFO,
+            NETWORK_CHANNEL_SIZE,
             None,
         );
     (
@@ -97,7 +98,7 @@ pub struct DummyNetwork {
 
 /// The following sets up a 2 peer network and verifies connectivity.
 pub fn setup_network() -> DummyNetwork {
-    let any: Multiaddr = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
+    let any: NetworkAddress = "/ip4/127.0.0.1/tcp/0".parse().unwrap();
     let runtime = Runtime::new().unwrap();
     let (dialer_peer_id, dialer_addr) = (PeerId::random(), any.clone());
     let (listener_peer_id, listener_addr) = (PeerId::random(), any);

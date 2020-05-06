@@ -8,6 +8,7 @@ use crate::{
         PersistentLivenessStorage, RecoveryData, RootInfo, RootMetadata,
     },
     state_replication::StateComputer,
+    util::time_service::duration_since_epoch,
 };
 use anyhow::{bail, ensure, format_err, Context};
 use consensus_types::{
@@ -18,12 +19,13 @@ use debug_interface::prelude::*;
 use executor_types::StateComputeResult;
 use libra_crypto::HashValue;
 use libra_logger::prelude::*;
-use libra_types::ledger_info::LedgerInfoWithSignatures;
 #[cfg(any(test, feature = "fuzzing"))]
-use libra_types::on_chain_config::ValidatorSet;
+use libra_types::epoch_info::EpochInfo;
+use libra_types::{ledger_info::LedgerInfoWithSignatures, transaction::TransactionStatus};
 use std::{
     collections::{vec_deque::VecDeque, HashMap},
     sync::{Arc, RwLock},
+    time::Duration,
 };
 use termion::color::*;
 
@@ -33,6 +35,37 @@ mod block_store_test;
 
 #[path = "sync_manager.rs"]
 pub mod sync_manager;
+
+fn update_counters_for_committed_blocks<T>(blocks_to_commit: &[Arc<ExecutedBlock<T>>]) {
+    for block in blocks_to_commit {
+        if let Some(time_to_commit) =
+            duration_since_epoch().checked_sub(Duration::from_micros(block.timestamp_usecs()))
+        {
+            counters::CREATION_TO_COMMIT_S.observe_duration(time_to_commit);
+        }
+        let txn_status = block.compute_result().compute_status();
+        counters::NUM_TXNS_PER_BLOCK.observe(txn_status.len() as f64);
+        counters::COMMITTED_BLOCKS_COUNT.inc();
+        counters::LAST_COMMITTED_ROUND.set(block.round() as i64);
+
+        for status in txn_status.iter() {
+            match status {
+                TransactionStatus::Keep(_) => {
+                    counters::COMMITTED_TXNS_COUNT
+                        .with_label_values(&["success"])
+                        .inc();
+                }
+                TransactionStatus::Discard(_) => {
+                    counters::COMMITTED_TXNS_COUNT
+                        .with_label_values(&["failed"])
+                        .inc();
+                }
+                // TODO(zekunli): add counter
+                TransactionStatus::Retry => (),
+            }
+        }
+    }
+}
 
 /// Responsible for maintaining all the blocks of payload and the dependencies of those blocks
 /// (parent and previous QC links).  It is expected to be accessed concurrently by multiple threads
@@ -137,9 +170,7 @@ impl<T: Payload> BlockStore<T> {
             assert!(!block.is_genesis_block());
             let output = state_computer
                 .compute(&block, block.parent_id())
-                .unwrap_or_else(|_| {
-                    panic!("fail to compute state result for block {}", block.id())
-                });
+                .unwrap_or_else(|e| panic!("Execute block {} emits error: {}", block.id(), e));
             // if this block is certified, ensure we agree with the certified state.
             if let Some(qc) = quorum_certs.get(&block.id()) {
                 assert_eq!(
@@ -161,11 +192,8 @@ impl<T: Payload> BlockStore<T> {
         tree
     }
 
-    /// Commit the given block id with the proof, returns the path from current root or error
-    pub async fn commit(
-        &self,
-        finality_proof: LedgerInfoWithSignatures,
-    ) -> anyhow::Result<Vec<Arc<ExecutedBlock<T>>>> {
+    /// Commit the given block id with the proof, returns () on success or error
+    pub async fn commit(&self, finality_proof: LedgerInfoWithSignatures) -> anyhow::Result<()> {
         let block_id_to_commit = finality_proof.ledger_info().consensus_block_id();
         let block_to_commit = self
             .get_block(block_id_to_commit)
@@ -180,6 +208,9 @@ impl<T: Payload> BlockStore<T> {
         let blocks_to_commit = self
             .path_from_root(block_id_to_commit)
             .unwrap_or_else(Vec::new);
+        for block in &blocks_to_commit {
+            end_trace!("commit", {"block", block.id()});
+        }
 
         self.state_computer
             .commit(
@@ -188,7 +219,7 @@ impl<T: Payload> BlockStore<T> {
             )
             .await
             .expect("Failed to persist commit");
-        counters::LAST_COMMITTED_ROUND.set(block_to_commit.round() as i64);
+        update_counters_for_committed_blocks(&blocks_to_commit);
         debug!("{}Committed{} {}", Fg(Blue), Fg(Reset), *block_to_commit);
         event!("committed",
             "block_id": block_to_commit.id().short_str(),
@@ -196,7 +227,7 @@ impl<T: Payload> BlockStore<T> {
             "parent_id": block_to_commit.parent_id().short_str(),
         );
         self.prune_tree(block_to_commit.id());
-        Ok(blocks_to_commit)
+        Ok(())
     }
 
     pub async fn rebuild(
@@ -277,7 +308,7 @@ impl<T: Payload> BlockStore<T> {
                 parent_block.compute_result().root_hash(),
                 parent_block.compute_result().frozen_subtree_roots().clone(),
                 parent_block.compute_result().num_leaves(),
-                parent_block.compute_result().validators().clone(),
+                parent_block.compute_result().epoch_info().clone(),
                 vec![], /* compute_status */
                 vec![], /* transaction_info_hashes */
             )
@@ -449,7 +480,7 @@ impl<T: Payload> BlockStore<T> {
                     compute_result.root_hash(),
                     compute_result.frozen_subtree_roots().clone(),
                     compute_result.num_leaves(),
-                    Some(ValidatorSet::new(vec![])),
+                    Some(EpochInfo::empty()),
                     compute_result.compute_status().clone(),
                     compute_result.transaction_info_hashes().clone(),
                 ),

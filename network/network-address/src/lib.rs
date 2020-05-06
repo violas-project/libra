@@ -1,9 +1,8 @@
 // Copyright (c) The Libra Core Contributors
 // SPDX-License-Identifier: Apache-2.0
 
-use lcs;
 use libra_crypto::{
-    traits::{CryptoMaterialError, ValidKeyStringExt},
+    traits::{CryptoMaterialError, ValidCryptoMaterialStringExt},
     x25519,
 };
 #[cfg(any(test, feature = "fuzzing"))]
@@ -14,7 +13,7 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::{
     convert::{Into, TryFrom},
     fmt,
-    net::{self, Ipv4Addr, Ipv6Addr},
+    net::{self, IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     num,
     str::FromStr,
     string::ToString,
@@ -159,8 +158,7 @@ pub enum Protocol {
 /// is a valid unicode string. We do this because '/' characters are already our
 /// protocol delimiter and Rust's [`::std::net::ToSocketAddr`] API requires a
 /// `&str`.
-#[derive(Clone, Debug, Eq, PartialEq, Deserialize, Serialize)]
-#[serde(try_from = "String", into = "String")]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct DnsName(String);
 
 /// Possible errors when parsing a human-readable [`NetworkAddress`].
@@ -244,6 +242,18 @@ impl TryFrom<&NetworkAddress> for RawNetworkAddress {
     }
 }
 
+#[cfg(any(test, feature = "fuzzing"))]
+impl Arbitrary for RawNetworkAddress {
+    type Parameters = ();
+    type Strategy = BoxedStrategy<Self>;
+
+    fn arbitrary_with(_args: Self::Parameters) -> Self::Strategy {
+        any::<NetworkAddress>()
+            .prop_map(|addr| RawNetworkAddress::try_from(&addr).unwrap())
+            .boxed()
+    }
+}
+
 ////////////////////
 // NetworkAddress //
 ////////////////////
@@ -251,6 +261,19 @@ impl TryFrom<&NetworkAddress> for RawNetworkAddress {
 impl NetworkAddress {
     fn new(protocols: Vec<Protocol>) -> Self {
         Self(protocols)
+    }
+
+    pub fn as_slice(&self) -> &[Protocol] {
+        self.0.as_slice()
+    }
+
+    pub fn push(&mut self, proto: Protocol) {
+        self.0.push(proto)
+    }
+
+    #[cfg(any(test, feature = "fuzzing"))]
+    pub fn mock() -> Self {
+        NetworkAddress::new(vec![Protocol::Memory(1234)])
     }
 }
 
@@ -291,12 +314,26 @@ impl TryFrom<Vec<Protocol>> for NetworkAddress {
     }
 }
 
+impl From<Protocol> for NetworkAddress {
+    fn from(proto: Protocol) -> NetworkAddress {
+        NetworkAddress::new(vec![proto])
+    }
+}
+
 impl TryFrom<&RawNetworkAddress> for NetworkAddress {
     type Error = lcs::Error;
 
     fn try_from(value: &RawNetworkAddress) -> Result<Self, lcs::Error> {
         let addr: NetworkAddress = lcs::from_bytes(value.as_ref())?;
         Ok(addr)
+    }
+}
+
+impl From<SocketAddr> for NetworkAddress {
+    fn from(sockaddr: SocketAddr) -> NetworkAddress {
+        let ip_proto = Protocol::from(sockaddr.ip());
+        let tcp_proto = Protocol::Tcp(sockaddr.port());
+        NetworkAddress::new(vec![ip_proto, tcp_proto])
     }
 }
 
@@ -343,8 +380,8 @@ impl<'de> Deserialize<'de> for NetworkAddress {
         struct DeserializeWrapper(Vec<Protocol>);
 
         if deserializer.is_human_readable() {
-            let s = <&str>::deserialize(deserializer)?;
-            NetworkAddress::from_str(s).map_err(de::Error::custom)
+            let s = <String>::deserialize(deserializer)?;
+            NetworkAddress::from_str(s.as_str()).map_err(de::Error::custom)
         } else {
             let wrapper = DeserializeWrapper::deserialize(deserializer)?;
             let addr = NetworkAddress::try_from(wrapper.0).map_err(de::Error::custom)?;
@@ -385,7 +422,7 @@ impl fmt::Display for Protocol {
                 "/ln-noise-ik/{}",
                 pubkey
                     .to_encoded_string()
-                    .expect("ValidKeyStringExt::to_encoded_string is infallible")
+                    .expect("ValidCryptoMaterialStringExt::to_encoded_string is infallible")
             ),
             Handshake(version) => write!(f, "/ln-handshake/{}", version),
         }
@@ -421,6 +458,15 @@ impl Protocol {
             unknown => return Err(ParseError::UnknownProtocolType(unknown.to_string())),
         };
         Ok(protocol)
+    }
+}
+
+impl From<IpAddr> for Protocol {
+    fn from(addr: IpAddr) -> Protocol {
+        match addr {
+            IpAddr::V4(addr) => Protocol::Ip4(addr),
+            IpAddr::V6(addr) => Protocol::Ip6(addr),
+        }
     }
 }
 
@@ -473,6 +519,21 @@ impl FromStr for DnsName {
 impl fmt::Display for DnsName {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(f)
+    }
+}
+
+impl<'de> Deserialize<'de> for DnsName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(rename = "DnsName")]
+        struct DeserializeWrapper(String);
+
+        let wrapper = DeserializeWrapper::deserialize(deserializer)?;
+        let name = DnsName::try_from(wrapper.0).map_err(de::Error::custom)?;
+        Ok(name)
     }
 }
 

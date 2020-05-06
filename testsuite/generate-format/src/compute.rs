@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use generate_format::Corpus;
-use serde_yaml;
 use std::{fs::File, io::Write};
 use structopt::StructOpt;
 
@@ -16,16 +15,13 @@ struct Options {
     corpus: Corpus,
 
     #[structopt(long)]
-    skip_deserialize: bool,
-
-    #[structopt(long)]
     record: bool,
 }
 
 fn main() {
     let options = Options::from_args();
 
-    let registry = options.corpus.get_registry(options.skip_deserialize);
+    let registry = options.corpus.get_registry();
     let output_file = options.corpus.output_file();
 
     let content = serde_yaml::to_string(&registry).unwrap();

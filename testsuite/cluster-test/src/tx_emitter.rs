@@ -35,11 +35,12 @@ use rand::{
 use tokio::runtime::{Handle, Runtime};
 
 use futures::{executor::block_on, future::FutureExt};
-use libra_json_rpc::JsonRpcAsyncClient;
+use libra_json_rpc_client::JsonRpcAsyncClient;
 use libra_types::transaction::SignedTransaction;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use std::{
     cmp::{max, min},
+    str::FromStr,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::{task::JoinHandle, time};
@@ -305,10 +306,10 @@ impl TxEmitter {
     }
 
     fn make_client(&self, instance: &Instance) -> JsonRpcAsyncClient {
-        JsonRpcAsyncClient::new(
+        JsonRpcAsyncClient::new_with_client(
             self.http_client.clone(),
-            instance.ip(),
-            instance.ac_port() as u16,
+            Url::from_str(format!("http://{}:{}", instance.ip(), instance.ac_port()).as_str())
+                .expect("Invalid URL."),
         )
     }
 
@@ -530,6 +531,7 @@ fn gen_transfer_txn_request(
             receiver,
             receiver_auth_key_prefix,
             num_coins,
+            vec![],
             vec![],
         ),
         sender,

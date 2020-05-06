@@ -30,13 +30,14 @@
 //! making the discovery protocol itself tolerant to byzantine faults.
 //!
 //! [`ConnectivityManager`]: ../../connectivity_manager
+
 use crate::{
     connectivity_manager::{ConnectivityRequest, DiscoverySource},
     counters,
     error::{NetworkError, NetworkErrorKind},
     peer_manager::{ConnectionRequestSender, PeerManagerRequestSender},
     protocols::network::{Event, NetworkEvents, NetworkSender},
-    validator_network::network_builder::NetworkBuilder,
+    validator_network::network_builder::{NetworkBuilder, NETWORK_CHANNEL_SIZE},
     NetworkPublicKeys, ProtocolId,
 };
 use bytes::Bytes;
@@ -52,9 +53,9 @@ use libra_crypto::{
     HashValue, Signature, SigningKey,
 };
 use libra_logger::prelude::*;
+use libra_network_address::NetworkAddress;
 use libra_security_logger::{security_log, SecurityEvent};
 use libra_types::PeerId;
-use parity_multiaddr::Multiaddr;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -99,6 +100,7 @@ pub fn add_to_network(
             vec![],
             vec![ProtocolId::DiscoveryDirectSend],
             QueueStyle::LIFO,
+            NETWORK_CHANNEL_SIZE,
             Some(&counters::PENDING_DISCOVERY_NETWORK_EVENTS),
         );
     (
@@ -165,7 +167,7 @@ where
     pub fn new(
         self_peer_id: PeerId,
         role: RoleType,
-        self_addrs: Vec<Multiaddr>,
+        self_addrs: Vec<NetworkAddress>,
         signer: Ed25519PrivateKey,
         trusted_peers: Arc<RwLock<HashMap<PeerId, NetworkPublicKeys>>>,
         ticker: TTicker,
@@ -371,7 +373,7 @@ where
                         self.note = VerifiedNote(unverified_note);
                         note = self.note.clone();
                     } else {
-                        // The multiaddrs in the peer's discovery Note.
+                        // The network addresses in the peer's discovery Note.
                         let peer_addrs = note.as_note().addrs().clone();
 
                         self.conn_mgr_reqs_tx
@@ -440,7 +442,7 @@ impl Note {
     fn new(
         signer: &Ed25519PrivateKey,
         peer_id: PeerId,
-        addrs: Vec<Multiaddr>,
+        addrs: Vec<NetworkAddress>,
         dns_seed_addr: &[u8],
         epoch: u64,
     ) -> Self {
@@ -469,7 +471,7 @@ impl Note {
     }
 
     /// Shortcut to the addrs embedded within the Note
-    fn addrs(&self) -> &Vec<Multiaddr> {
+    fn addrs(&self) -> &Vec<NetworkAddress> {
         &self.signed_peer_info.peer_info.addrs
     }
 
@@ -504,7 +506,7 @@ impl SignedPeerInfo {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PeerInfo {
     /// Network addresses this peer can be reached at.
-    addrs: Vec<Multiaddr>,
+    addrs: Vec<NetworkAddress>,
     /// Monotonically increasing incarnation number used to allow peers to issue
     /// updates to their `PeerInfo` and prevent attackers from propagating old
     /// `PeerInfo`s. This is usually a timestamp.
