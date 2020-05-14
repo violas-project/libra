@@ -3,10 +3,13 @@
 
 use cli::client_proxy::ClientProxy;
 use debug_interface::{libra_trace, node_debug_service::parse_events, NodeDebugClient};
-use libra_config::config::{NodeConfig, RoleType, TestConfig};
+use libra_config::config::{NodeConfig, OnDiskStorageConfig, RoleType, SecureBackend, TestConfig};
 use libra_crypto::{ed25519::Ed25519PrivateKey, hash::CryptoHash, PrivateKey, SigningKey, Uniform};
+use libra_global_constants::{CONSENSUS_KEY, OPERATOR_KEY};
 use libra_json_rpc::views::{ScriptView, TransactionDataView};
+use libra_key_manager::libra_interface::{JsonRpcLibraInterface, LibraInterface};
 use libra_logger::prelude::*;
+use libra_secure_storage::{Policy, Storage, Value};
 use libra_swarm::swarm::{LibraNode, LibraSwarm};
 use libra_temppath::TempPath;
 use libra_types::{
@@ -16,11 +19,18 @@ use libra_types::{
 use num_traits::cast::FromPrimitive;
 use rust_decimal::Decimal;
 use std::{
+    collections::BTreeMap,
+    convert::TryInto,
     fs,
     io::{Result, Write},
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     str::FromStr,
+    thread::sleep,
+    time::Duration,
 };
+
+const KEY_MANAGER_BIN: &str = "libra-key-manager";
 
 struct TestEnvironment {
     validator_swarm: LibraSwarm,
@@ -35,6 +45,8 @@ impl TestEnvironment {
         let mut template = NodeConfig::default();
         template.test = Some(TestConfig::open_module());
         template.state_sync.chunk_limit = 2;
+        template.consensus.safety_rules.backend =
+            SecureBackend::OnDiskStorage(OnDiskStorageConfig::default());
 
         let validator_swarm = LibraSwarm::configure_swarm(
             num_validators,
@@ -180,6 +192,41 @@ fn copy_file_with_sender_address(file_path: &Path, sender: AccountAddress) -> Re
     Ok(tmp_source_path)
 }
 
+fn compare_balances(
+    expected_balances: Vec<(f64, String)>,
+    extracted_balances: Vec<String>,
+) -> bool {
+    if extracted_balances.len() != extracted_balances.len() {
+        return false;
+    }
+
+    let extracted_balances_dec: BTreeMap<_, _> = extracted_balances
+        .into_iter()
+        .map(|balance_str| {
+            let (currency_code, stripped_str) = if balance_str.ends_with("Coin1") {
+                ("Coin1", balance_str.trim_end_matches("Coin1"))
+            } else if balance_str.ends_with("Coin2") {
+                ("Coin2", balance_str.trim_end_matches("Coin2"))
+            } else if balance_str.ends_with("LBR") {
+                ("LBR", balance_str.trim_end_matches("LBR"))
+            } else {
+                panic!("Unexpected currency type returned for balance")
+            };
+            (currency_code, Decimal::from_str(stripped_str).ok())
+        })
+        .collect();
+
+    expected_balances
+        .into_iter()
+        .all(|(balance, currency_code)| {
+            if let Some(extracted_balance) = extracted_balances_dec.get(currency_code.as_str()) {
+                Decimal::from_f64(balance) == *extracted_balance
+            } else {
+                false
+            }
+        })
+}
+
 fn setup_swarm_and_client_proxy(
     num_nodes: usize,
     client_port_index: usize,
@@ -195,31 +242,31 @@ fn test_smoke_script(mut client_proxy: ClientProxy) {
     client_proxy
         .mint_coins(&["mintb", "0", "10"], true)
         .unwrap();
-    assert_eq!(
-        Decimal::from_f64(10.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "0"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(10.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "0"]).unwrap()
+    ));
     client_proxy.create_next_account(false).unwrap();
     client_proxy.mint_coins(&["mintb", "1", "1"], true).unwrap();
     client_proxy
         .transfer_coins(&["tb", "0", "1", "3"], true)
         .unwrap();
-    assert_eq!(
-        Decimal::from_f64(7.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "0"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(4.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "1"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(7.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "0"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(4.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "1"]).unwrap()
+    ));
     client_proxy.create_next_account(false).unwrap();
     client_proxy
         .mint_coins(&["mintb", "2", "15"], true)
         .unwrap();
-    assert_eq!(
-        Decimal::from_f64(15.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "2"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(15.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "2"]).unwrap()
+    ));
 }
 
 #[test]
@@ -229,10 +276,10 @@ fn test_execute_custom_module_and_script() {
     client_proxy
         .mint_coins(&["mintb", "0", "50"], true)
         .unwrap();
-    assert_eq!(
-        Decimal::from_f64(50.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "0"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(50.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "0"]).unwrap()
+    ));
 
     let recipient_address = client_proxy.create_next_account(false).unwrap().address;
     client_proxy.mint_coins(&["mintb", "1", "1"], true).unwrap();
@@ -294,14 +341,14 @@ fn test_execute_custom_module_and_script() {
         ])
         .unwrap();
 
-    assert_eq!(
-        Decimal::from_f64(49.999_990),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "0"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(1.000_010),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "1"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(49.999_990, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "0"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(1.000_010, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "1"]).unwrap()
+    ));
 }
 
 #[test]
@@ -351,14 +398,14 @@ fn test_concurrent_transfers_single_node() {
     client_proxy
         .transfer_coins(&["tb", "0", "1", "1"], true)
         .unwrap();
-    assert_eq!(
-        Decimal::from_f64(79.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "0"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(21.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "1"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(79.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "0"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(21.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "1"]).unwrap()
+    ));
 }
 
 #[test]
@@ -403,14 +450,14 @@ fn test_basic_restartability() {
     client_proxy
         .transfer_coins(&["tb", "0", "1", "10"], true)
         .unwrap();
-    assert_eq!(
-        Decimal::from_f64(90.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "0"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(10.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "1"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(90.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "0"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(10.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "1"]).unwrap()
+    ));
     let peer_to_restart = 0;
     // restart node
     env.validator_swarm.kill_node(peer_to_restart);
@@ -418,25 +465,25 @@ fn test_basic_restartability() {
         .validator_swarm
         .add_node(peer_to_restart, RoleType::Validator, false)
         .is_ok());
-    assert_eq!(
-        Decimal::from_f64(90.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "0"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(10.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "1"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(90.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "0"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(10.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "1"]).unwrap()
+    ));
     client_proxy
         .transfer_coins(&["tb", "0", "1", "10"], true)
         .unwrap();
-    assert_eq!(
-        Decimal::from_f64(80.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "0"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(20.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "1"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(80.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "0"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(20.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "1"]).unwrap()
+    ));
 }
 
 #[test]
@@ -450,14 +497,14 @@ fn test_startup_sync_state() {
     client_proxy_1
         .transfer_coins(&["tb", "0", "1", "10"], true)
         .unwrap();
-    assert_eq!(
-        Decimal::from_f64(90.0),
-        Decimal::from_str(&client_proxy_1.get_balance(&["b", "0"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(10.0),
-        Decimal::from_str(&client_proxy_1.get_balance(&["b", "1"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(90.0, "LBR".to_string())],
+        client_proxy_1.get_balances(&["b", "0"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(10.0, "LBR".to_string())],
+        client_proxy_1.get_balances(&["b", "1"]).unwrap()
+    ));
     let peer_to_stop = 0;
     env.validator_swarm.kill_node(peer_to_stop);
     let node_config = NodeConfig::load(
@@ -487,26 +534,26 @@ fn test_startup_sync_state() {
     let sender_address = accounts[0].address;
     client_proxy_0.set_accounts(accounts);
     client_proxy_0.wait_for_transaction(sender_address, 1);
-    assert_eq!(
-        Decimal::from_f64(90.0),
-        Decimal::from_str(&client_proxy_0.get_balance(&["b", "0"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(10.0),
-        Decimal::from_str(&client_proxy_0.get_balance(&["b", "1"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(90.0, "LBR".to_string())],
+        client_proxy_0.get_balances(&["b", "0"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(10.0, "LBR".to_string())],
+        client_proxy_0.get_balances(&["b", "1"]).unwrap()
+    ));
     client_proxy_1
         .transfer_coins(&["tb", "0", "1", "10"], true)
         .unwrap();
     client_proxy_0.wait_for_transaction(sender_address, 2);
-    assert_eq!(
-        Decimal::from_f64(80.0),
-        Decimal::from_str(&client_proxy_0.get_balance(&["b", "0"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(20.0),
-        Decimal::from_str(&client_proxy_0.get_balance(&["b", "1"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(80.0, "LBR".to_string())],
+        client_proxy_0.get_balances(&["b", "0"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(20.0, "LBR".to_string())],
+        client_proxy_0.get_balances(&["b", "1"]).unwrap()
+    ));
 }
 
 #[test]
@@ -520,14 +567,14 @@ fn test_startup_sync_state_with_empty_consensus_db() {
     client_proxy_1
         .transfer_coins(&["tb", "0", "1", "10"], true)
         .unwrap();
-    assert_eq!(
-        Decimal::from_f64(90.0),
-        Decimal::from_str(&client_proxy_1.get_balance(&["b", "0"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(10.0),
-        Decimal::from_str(&client_proxy_1.get_balance(&["b", "1"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(90.0, "LBR".to_string())],
+        client_proxy_1.get_balances(&["b", "0"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(10.0, "LBR".to_string())],
+        client_proxy_1.get_balances(&["b", "1"]).unwrap()
+    ));
     let peer_to_stop = 0;
     env.validator_swarm.kill_node(peer_to_stop);
     let node_config = NodeConfig::load(
@@ -554,26 +601,26 @@ fn test_startup_sync_state_with_empty_consensus_db() {
     let sender_address = accounts[0].address;
     client_proxy_0.set_accounts(accounts);
     client_proxy_0.wait_for_transaction(sender_address, 1);
-    assert_eq!(
-        Decimal::from_f64(90.0),
-        Decimal::from_str(&client_proxy_0.get_balance(&["b", "0"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(10.0),
-        Decimal::from_str(&client_proxy_0.get_balance(&["b", "1"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(90.0, "LBR".to_string())],
+        client_proxy_0.get_balances(&["b", "0"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(10.0, "LBR".to_string())],
+        client_proxy_0.get_balances(&["b", "1"]).unwrap()
+    ));
     client_proxy_1
         .transfer_coins(&["tb", "0", "1", "10"], true)
         .unwrap();
     client_proxy_0.wait_for_transaction(sender_address, 2);
-    assert_eq!(
-        Decimal::from_f64(80.0),
-        Decimal::from_str(&client_proxy_0.get_balance(&["b", "0"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(20.0),
-        Decimal::from_str(&client_proxy_0.get_balance(&["b", "1"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(80.0, "LBR".to_string())],
+        client_proxy_0.get_balances(&["b", "0"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(20.0, "LBR".to_string())],
+        client_proxy_0.get_balances(&["b", "1"]).unwrap()
+    ));
 }
 
 #[test]
@@ -590,27 +637,27 @@ fn test_basic_state_synchronization() {
     client_proxy
         .transfer_coins(&["tb", "0", "1", "10"], true)
         .unwrap();
-    assert_eq!(
-        Decimal::from_f64(90.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "0"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(10.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "1"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(90.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "0"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(10.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "1"]).unwrap()
+    ));
 
     // Test single chunk sync, chunk_size = 2
     let node_to_restart = 0;
     env.validator_swarm.kill_node(node_to_restart);
     // All these are executed while one node is down
-    assert_eq!(
-        Decimal::from_f64(90.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "0"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(10.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "1"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(90.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "0"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(10.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "1"]).unwrap()
+    ));
     client_proxy
         .transfer_coins(&["tb", "0", "1", "1"], true)
         .unwrap();
@@ -627,26 +674,26 @@ fn test_basic_state_synchronization() {
     // Connect to the newly recovered node and verify its state
     let mut client_proxy2 = env.get_validator_ac_client(node_to_restart, None);
     client_proxy2.set_accounts(client_proxy.copy_all_accounts());
-    assert_eq!(
-        Decimal::from_f64(89.0),
-        Decimal::from_str(&client_proxy2.get_balance(&["b", "0"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(11.0),
-        Decimal::from_str(&client_proxy2.get_balance(&["b", "1"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(89.0, "LBR".to_string())],
+        client_proxy2.get_balances(&["b", "0"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(11.0, "LBR".to_string())],
+        client_proxy2.get_balances(&["b", "1"]).unwrap()
+    ));
 
     // Test multiple chunk sync
     env.validator_swarm.kill_node(node_to_restart);
     // All these are executed while one node is down
-    assert_eq!(
-        Decimal::from_f64(89.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "0"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(11.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "1"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(89.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "0"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(11.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "1"]).unwrap()
+    ));
     for _ in 0..10 {
         client_proxy
             .transfer_coins(&["tb", "0", "1", "1"], true)
@@ -665,14 +712,14 @@ fn test_basic_state_synchronization() {
     // Connect to the newly recovered node and verify its state
     let mut client_proxy2 = env.get_validator_ac_client(node_to_restart, None);
     client_proxy2.set_accounts(client_proxy.copy_all_accounts());
-    assert_eq!(
-        Decimal::from_f64(79.0),
-        Decimal::from_str(&client_proxy2.get_balance(&["b", "0"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(21.0),
-        Decimal::from_str(&client_proxy2.get_balance(&["b", "1"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(79.0, "LBR".to_string())],
+        client_proxy2.get_balances(&["b", "0"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(21.0, "LBR".to_string())],
+        client_proxy2.get_balances(&["b", "1"]).unwrap()
+    ));
 }
 
 #[test]
@@ -818,10 +865,10 @@ fn test_full_node_basic_flow() {
         full_node_client_2.create_next_account(false).unwrap();
         assert_eq!(
             validator_ac_client
-                .get_balance(&["b", &idx.to_string()])
+                .get_balances(&["b", &idx.to_string()])
                 .unwrap(),
             full_node_client
-                .get_balance(&["b", &idx.to_string()])
+                .get_balances(&["b", &idx.to_string()])
                 .unwrap(),
         );
     }
@@ -843,18 +890,18 @@ fn test_full_node_basic_flow() {
         .mint_coins(&["mintb", "3", "10"], true)
         .expect("Fail to mint!");
 
-    assert_eq!(
-        Decimal::from_f64(10.0),
-        Decimal::from_str(&full_node_client.get_balance(&["b", "3"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(10.0, "LBR".to_string())],
+        full_node_client.get_balances(&["b", "3"]).unwrap()
+    ));
     let sequence = full_node_client
         .get_sequence_number(&sequence_reset_command)
         .unwrap();
     validator_ac_client.wait_for_transaction(sender_account, sequence);
-    assert_eq!(
-        Decimal::from_f64(10.0),
-        Decimal::from_str(&validator_ac_client.get_balance(&["b", "3"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(10.0, "LBR".to_string())],
+        validator_ac_client.get_balances(&["b", "3"]).unwrap()
+    ));
 
     // reset sequence number for sender account
     validator_ac_client
@@ -877,14 +924,14 @@ fn test_full_node_basic_flow() {
         .unwrap();
     full_node_client.wait_for_transaction(sender_account, sequence);
 
-    assert_eq!(
-        Decimal::from_f64(10.0),
-        Decimal::from_str(&validator_ac_client.get_balance(&["b", "4"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(10.0),
-        Decimal::from_str(&full_node_client.get_balance(&["b", "4"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(10.0, "LBR".to_string())],
+        validator_ac_client.get_balances(&["b", "4"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(10.0, "LBR".to_string())],
+        full_node_client.get_balances(&["b", "4"]).unwrap()
+    ));
 
     // minting again on validator doesn't cause error since client sequence has been updated
     validator_ac_client
@@ -896,27 +943,27 @@ fn test_full_node_basic_flow() {
         .transfer_coins(&["tb", "3", "4", "10"], true)
         .unwrap();
 
-    assert_eq!(
-        Decimal::from_f64(0.0),
-        Decimal::from_str(&full_node_client.get_balance(&["b", "3"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(30.0),
-        Decimal::from_str(&validator_ac_client.get_balance(&["b", "4"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(0.0, "LBR".to_string())],
+        full_node_client.get_balances(&["b", "3"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(30.0, "LBR".to_string())],
+        validator_ac_client.get_balances(&["b", "4"]).unwrap()
+    ));
 
     let sequence = validator_ac_client
         .get_sequence_number(&["sequence", &format!("{}", account3), "true"])
         .unwrap();
     full_node_client_2.wait_for_transaction(account3, sequence);
-    assert_eq!(
-        Decimal::from_f64(0.0),
-        Decimal::from_str(&full_node_client_2.get_balance(&["b", "3"]).unwrap()).ok()
-    );
-    assert_eq!(
-        Decimal::from_f64(30.0),
-        Decimal::from_str(&full_node_client_2.get_balance(&["b", "4"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(0.0, "LBR".to_string())],
+        full_node_client_2.get_balances(&["b", "3"]).unwrap()
+    ));
+    assert!(compare_balances(
+        vec![(30.0, "LBR".to_string())],
+        full_node_client_2.get_balances(&["b", "4"]).unwrap()
+    ));
 }
 
 #[test]
@@ -929,16 +976,16 @@ fn test_e2e_reconfiguration() {
     client_proxy_1
         .mint_coins(&["mintb", "0", "10"], true)
         .unwrap();
-    assert_eq!(
-        Decimal::from_f64(10.0),
-        Decimal::from_str(&client_proxy_1.get_balance(&["b", "0"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(10.0, "LBR".to_string())],
+        client_proxy_1.get_balances(&["b", "0"]).unwrap()
+    ));
     // wait for the mint txn in node 0
     client_proxy_0.wait_for_transaction(association_address(), 2);
-    assert_eq!(
-        Decimal::from_f64(10.0),
-        Decimal::from_str(&client_proxy_0.get_balance(&["b", "0"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(10.0, "LBR".to_string())],
+        client_proxy_0.get_balances(&["b", "0"]).unwrap()
+    ));
     let peer_id = env
         .get_validator(0)
         .unwrap()
@@ -952,25 +999,25 @@ fn test_e2e_reconfiguration() {
     client_proxy_1
         .mint_coins(&["mintb", "0", "10"], true)
         .unwrap();
-    assert_eq!(
-        Decimal::from_f64(20.0),
-        Decimal::from_str(&client_proxy_1.get_balance(&["b", "0"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(20.0, "LBR".to_string())],
+        client_proxy_1.get_balances(&["b", "0"]).unwrap()
+    ));
     // client connected to removed validator can not see the update
-    assert_eq!(
-        Decimal::from_f64(10.0),
-        Decimal::from_str(&client_proxy_0.get_balance(&["b", "0"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(10.0, "LBR".to_string())],
+        client_proxy_0.get_balances(&["b", "0"]).unwrap()
+    ));
     // Add the node back
     client_proxy_1
         .add_validator(&["add_validator", &peer_id], true)
         .unwrap();
     // Wait for it catches up, mint1 + remove + mint2 + add => seq == 5
     client_proxy_0.wait_for_transaction(association_address(), 5);
-    assert_eq!(
-        Decimal::from_f64(20.0),
-        Decimal::from_str(&client_proxy_0.get_balance(&["b", "0"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(20.0, "LBR".to_string())],
+        client_proxy_0.get_balances(&["b", "0"]).unwrap()
+    ));
 }
 
 #[test]
@@ -981,10 +1028,10 @@ fn test_e2e_modify_publishing_option() {
     client_proxy
         .mint_coins(&["mintb", "0", "10"], true)
         .unwrap();
-    assert_eq!(
-        Decimal::from_f64(10.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "0"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(10.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "0"]).unwrap()
+    ));
     let script_path = workspace_builder::workspace_root()
         .join("testsuite/tests/libratest/dev_modules/test_script.move");
     let unwrapped_script_path = script_path.to_str().unwrap();
@@ -1019,10 +1066,10 @@ fn test_e2e_modify_publishing_option() {
     client_proxy
         .mint_coins(&["mintb", "0", "10"], true)
         .unwrap();
-    assert_eq!(
-        Decimal::from_f64(20.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "0"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(20.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "0"]).unwrap()
+    ));
 
     // Now that publishing option was changed to locked, this transaction will be rejected.
     assert!(format!(
@@ -1080,10 +1127,10 @@ fn test_client_waypoints() {
     client_proxy
         .mint_coins(&["mintb", "0", "10"], true)
         .unwrap();
-    assert_eq!(
-        Decimal::from_f64(20.0),
-        Decimal::from_str(&client_proxy.get_balance(&["b", "0"]).unwrap()).ok()
-    );
+    assert!(compare_balances(
+        vec![(20.0, "LBR".to_string())],
+        client_proxy.get_balances(&["b", "0"]).unwrap()
+    ));
     let epoch_1_li = client_proxy
         .latest_epoch_change_li()
         .expect("Failed to retrieve end of epoch 1 LedgerInfo");
@@ -1137,4 +1184,75 @@ fn test_malformed_script() {
     client_proxy
         .mint_coins(&["mintb", "0", "10"], true)
         .unwrap();
+}
+
+#[test]
+fn test_key_manager_consensus_rotation() {
+    // Create and launch a local validator swarm of 2 nodes.
+    let mut swarm = TestEnvironment::new(2);
+    swarm.launch_swarm(RoleType::Validator);
+
+    // Create a node config for the key manager by modifying the first node config in the swarm.
+    // TODO(joshlind): see if we can refactor TestEnvironment to clean this up.
+    let config_path = swarm.validator_swarm.config.config_files.get(0).unwrap();
+    let mut config = NodeConfig::load(&config_path).unwrap();
+    let backend = config.consensus.safety_rules.backend.clone();
+    let json_rpc_endpoint = format!("http://127.0.0.1:{}", config.rpc.address.port());
+    config.secure.key_manager.secure_backend = backend.clone();
+    config.secure.key_manager.json_rpc_endpoint = json_rpc_endpoint.clone();
+    config.secure.key_manager.rotation_period_secs = 10;
+    config.secure.key_manager.sleep_period_secs = 10;
+    config.save(config_path).unwrap();
+
+    // Bootstrap secure storage by initializing the keys required by the key manager.
+    // TODO(joshlind): set these keys using config manager when initialization is supported.
+    let mut storage: Box<dyn Storage> = (&backend).try_into().unwrap();
+    storage
+        .create_key("consensus_previous", &Policy::default())
+        .unwrap();
+    let operator_private = config
+        .test
+        .unwrap()
+        .operator_keypair
+        .unwrap()
+        .take_private()
+        .unwrap();
+    storage
+        .set(OPERATOR_KEY, Value::Ed25519PrivateKey(operator_private))
+        .unwrap();
+
+    // Create a json-rpc connection to the blockchain and verify storage matches the on-chain state.
+    let libra_interface = JsonRpcLibraInterface::new(json_rpc_endpoint);
+    let account = config.validator_network.clone().unwrap().peer_id;
+    let current_consensus = storage.get_public_key(CONSENSUS_KEY).unwrap().public_key;
+    let validator_info = libra_interface.retrieve_validator_info(account).unwrap();
+    assert_eq!(&current_consensus, validator_info.consensus_public_key());
+
+    // Spawn the key manager and sleep until a rotation occurs.
+    // TODO(joshlind): support a dedicated key manager log (instead of just printing on failure).
+    let mut command = Command::new(workspace_builder::get_bin(KEY_MANAGER_BIN));
+    command
+        .current_dir(workspace_builder::workspace_root())
+        .arg(config_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let key_manager = command.spawn().unwrap();
+    sleep(Duration::from_secs(20));
+
+    // Verify the consensus key has been rotated in secure storage and on-chain.
+    let rotated_consensus = storage.get_public_key(CONSENSUS_KEY).unwrap().public_key;
+    let validator_info = libra_interface.retrieve_validator_info(account).unwrap();
+    assert_eq!(&rotated_consensus, validator_info.consensus_public_key());
+    assert_ne!(current_consensus, rotated_consensus);
+
+    // Cause a failure (e.g., wipe storage) and verify the key manager exits with an error status.
+    storage.reset_and_clear().unwrap();
+    let output = key_manager.wait_with_output().unwrap();
+    if output.status.success() {
+        panic!(
+            "Key manager did not return an error as expected! Printing key manager output: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 }

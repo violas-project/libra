@@ -4,20 +4,21 @@
 
 use libra_types::{
     account_address::AccountAddress,
-    language_storage::{StructTag, TypeTag},
     vm_error::{StatusCode, VMStatus},
 };
-use move_core_types::identifier::Identifier;
+use move_core_types::{
+    identifier::Identifier,
+    language_storage::{StructTag, TypeTag},
+};
 use std::fmt::Write;
 use vm::errors::VMResult;
 
-use libra_types::access_path::{AccessPath, Accesses};
-#[cfg(feature = "fuzzing")]
+use libra_types::access_path::AccessPath;
 use serde::{Deserialize, Serialize};
 
 /// VM representation of a struct type in Move.
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "fuzzing", derive(Serialize, Deserialize, Eq, PartialEq))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(Eq, PartialEq))]
 pub struct FatStructType {
     pub address: AccountAddress,
     pub module: Identifier,
@@ -34,14 +35,15 @@ pub struct FatStructType {
 /// should NOT be serialized in any form. Currently we still derive `Serialize` and
 /// `Deserialize`, but this is a hack for fuzzing and should be guarded behind the
 /// "fuzzing" feature flag. We should look into ways to get rid of this.
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "fuzzing", derive(Serialize, Deserialize, Eq, PartialEq))]
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "fuzzing", derive(Eq, PartialEq))]
 pub enum FatType {
     Bool,
     U8,
     U64,
     U128,
     Address,
+    Signer,
     Vector(Box<FatType>),
     Struct(Box<FatStructType>),
     Reference(Box<FatType>),
@@ -51,10 +53,7 @@ pub enum FatType {
 
 impl FatStructType {
     pub fn resource_path(&self) -> VMResult<Vec<u8>> {
-        Ok(AccessPath::resource_access_vec(
-            &self.struct_tag()?,
-            &Accesses::empty(),
-        ))
+        Ok(AccessPath::resource_access_vec(&self.struct_tag()?))
     }
 
     pub fn subst(&self, ty_args: &[FatType]) -> VMResult<FatStructType> {
@@ -128,6 +127,7 @@ impl FatType {
             U64 => U64,
             U128 => U128,
             Address => Address,
+            Signer => Signer,
             Vector(ty) => Vector(Box::new(ty.subst(ty_args)?)),
             Reference(ty) => Reference(Box::new(ty.subst(ty_args)?)),
             MutableReference(ty) => MutableReference(Box::new(ty.subst(ty_args)?)),
@@ -147,6 +147,7 @@ impl FatType {
             U64 => TypeTag::U64,
             U128 => TypeTag::U128,
             Address => TypeTag::Address,
+            Signer => TypeTag::Signer,
             Vector(ty) => TypeTag::Vector(Box::new(ty.type_tag()?)),
             Struct(struct_ty) => TypeTag::Struct(struct_ty.struct_tag()?),
 
@@ -164,6 +165,7 @@ impl FatType {
 
         match self {
             Bool | U8 | U64 | U128 | Address | Reference(_) | MutableReference(_) => Ok(false),
+            Signer => Ok(true),
             Vector(ty) => ty.is_resource(),
             Struct(struct_ty) => Ok(struct_ty.is_resource),
             // In the VM, concrete type arguments are required for type resolution and the only place
@@ -185,6 +187,7 @@ impl FatType {
             U64 => debug_write!(buf, "u64"),
             U128 => debug_write!(buf, "u128"),
             Address => debug_write!(buf, "address"),
+            Signer => debug_write!(buf, "signer"),
             Vector(elem_ty) => {
                 debug_write!(buf, "vector<")?;
                 elem_ty.debug_print(buf)?;
@@ -215,7 +218,14 @@ pub mod prop {
         pub fn single_value_strategy() -> impl Strategy<Value = Self> {
             use FatType::*;
 
-            prop_oneof![Just(Bool), Just(U8), Just(U64), Just(U128), Just(Address),]
+            prop_oneof![
+                Just(Bool),
+                Just(U8),
+                Just(U64),
+                Just(U128),
+                Just(Address),
+                Just(Signer)
+            ]
         }
 
         /// Generate a primitive Value, a Struct or a Vector.

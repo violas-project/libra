@@ -17,14 +17,14 @@ use futures::{
 use libra_config::config::RoleType;
 use libra_logger::prelude::*;
 use libra_types::{
-    discovery_set::DiscoverySet,
+    on_chain_config::ValidatorSet,
     trusted_state::{TrustedState, TrustedStateChange},
     waypoint::Waypoint,
     PeerId,
 };
 use network::{
     connectivity_manager::{ConnectivityRequest, DiscoverySource},
-    peer_manager::{conn_status_channel, ConnectionStatusNotification},
+    peer_manager::{conn_notifs_channel, ConnectionNotification},
 };
 use option_future::OptionFuture;
 use rand::{rngs::SmallRng, Rng, SeedableRng};
@@ -50,7 +50,7 @@ pub struct OnchainDiscovery<TTicker> {
     /// A channel to send requests to the network instance.
     network_tx: OnchainDiscoveryNetworkSender,
     /// A channel to receive connection updates from the network.
-    conn_notifs_rx: conn_status_channel::Receiver,
+    conn_notifs_rx: conn_notifs_channel::Receiver,
     /// internal gRPC client to send read requests to Libra Storage.
     libra_db: Arc<dyn DbReader>,
     /// Ticker to periodically query our peers for the latest discovery set.
@@ -80,7 +80,7 @@ where
         role: RoleType,
         waypoint: Waypoint,
         network_tx: OnchainDiscoveryNetworkSender,
-        conn_notifs_rx: conn_status_channel::Receiver,
+        conn_notifs_rx: conn_notifs_channel::Receiver,
         libra_db: Arc<dyn DbReader>,
         peer_query_ticker: TTicker,
         storage_query_ticker: TTicker,
@@ -120,7 +120,7 @@ where
             self.event_id = self.event_id.wrapping_add(1);
             futures::select! {
                 notif = self.conn_notifs_rx.select_next_some() => {
-                    trace!("event id: {}, type: ConnectionStatusNotification", self.event_id);
+                    trace!("event id: {}, type: ConnectionNotification", self.event_id);
                     self.handle_connection_notif(notif);
                 },
                 _ = self.peer_query_ticker.select_next_some() => {
@@ -152,14 +152,14 @@ where
         }
     }
 
-    fn handle_connection_notif(&mut self, notif: ConnectionStatusNotification) {
+    fn handle_connection_notif(&mut self, notif: ConnectionNotification) {
         match notif {
-            ConnectionStatusNotification::NewPeer(peer_id, _addr) => {
+            ConnectionNotification::NewPeer(peer_id, _addr) => {
                 trace!("connected to new peer: {}", peer_id.short_str());
                 // Add peer to connected peer list.
                 self.connected_peers.insert(peer_id);
             }
-            ConnectionStatusNotification::LostPeer(peer_id, _addr, _reason) => {
+            ConnectionNotification::LostPeer(peer_id, _addr, _reason) => {
                 trace!("disconnected from peer: {}", peer_id.short_str());
                 // Remove peer from connected peer list.
                 self.connected_peers.remove(&peer_id);
@@ -298,9 +298,9 @@ where
         };
     }
 
-    async fn handle_new_discovery_set_event(&mut self, discovery_set: DiscoverySet) {
+    async fn handle_new_discovery_set_event(&mut self, validator_set: ValidatorSet) {
         let latest_discovery_set =
-            DiscoverySetInternal::from_discovery_set(self.role, discovery_set);
+            DiscoverySetInternal::from_validator_set(self.role, validator_set);
 
         let mut prev_discovery_set =
             mem::replace(&mut self.latest_discovery_set, latest_discovery_set.clone());

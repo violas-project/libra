@@ -5,6 +5,10 @@ executors:
     docker:
       - image: circleci/rust:buster
     resource_class: 2xlarge
+  unittest-executor:
+    docker:
+      - image: circleci/rust:buster
+    resource_class: 2xlarge+
   test-executor:
     docker:
       - image: circleci/rust:buster
@@ -50,7 +54,7 @@ commands:
           name: Install Dependencies
           command: |
             sudo apt-get update
-            sudo apt-get install -y cmake curl clang llvm
+            sudo apt-get install -y cmake curl clang llvm gcc-powerpc-linux-gnu
             rustup component add clippy rustfmt
   install_code_coverage_deps:
     steps:
@@ -122,7 +126,6 @@ commands:
       - run:
           name: Send job status
           command: |
-            set -x
             if [ -e <<parameters.payload_file>> ]; then
               jq -n \
                 --arg msg "$(cat <<parameters.payload_file>>)" \
@@ -147,8 +150,8 @@ commands:
                 <<parameters.webhook>>
               else
                 echo "Not sending messages as no webhook url is set."
-                echo "Chances are you are not building on master or circle is misconfigured."
-                echo "webhook is <<parameters.webhook>>"
+                echo "Chances are you are not building on master, or circle is misconfigured."
+                echo "webhook is empty"
                 exit 0
               fi
             fi
@@ -198,14 +201,6 @@ jobs:
       - run:
           name: cargo fmt
           command: cargo xfmt --check
-      - run:
-          name: cargo guppy
-          command: |
-            cargo install cargo-guppy \
-              --git http://github.com/calibra/cargo-guppy \
-              --rev 8b2bc45c0cd6323a7a2b8170ddad6d2a5b79047b
-            [[ -z $(cargo guppy dups --target x86_64-unknown-linux-gnu \
-              --kind directthirdparty) ]]
   build-dev:
     executor: build-executor
     description: Development Build
@@ -224,6 +219,10 @@ jobs:
           command: RUST_BACKTRACE=1 cargo build -j 16 -p language-benchmarks
       - run:
           command: RUST_BACKTRACE=1 cargo build -j 16 -p test-generation
+      - run:
+          command: |
+            rustup target add powerpc-unknown-linux-gnu
+            RUST_BACKTRACE=1 cargo build -j 16 -p transaction-builder --target powerpc-unknown-linux-gnu
       - build_teardown
   build-release:
     executor: test-executor
@@ -318,7 +317,7 @@ jobs:
           build_url: "${CIRCLE_BUILD_URL}#tests/containers/${CIRCLE_NODE_INDEX}"
           webhook: "${WEBHOOK_FLAKY_TESTS}"
   run-unit-test:
-    executor: build-executor
+    executor: unittest-executor
     description: Run all unit tests, excluding E2E and flaky tests that are
       explicitly ignored.
     steps:
@@ -493,10 +492,22 @@ jobs:
 workflows:
   commit-workflow:
     jobs:
-      - build-docker
-      - validate-cluster-test-dockerfile
-      - terraform
-      - prefetch-crates
+      - build-docker:
+        filters:
+          branches:
+            ignore: gh-pages
+      - validate-cluster-test-dockerfile:
+        filters:
+          branches:
+            ignore: gh-pages
+      - terraform:
+        filters:
+          branches:
+            ignore: gh-pages
+      - prefetch-crates:
+        filters:
+          branches:
+            ignore: gh-pages
       - lint:
           requires:
             - prefetch-crates
@@ -518,15 +529,9 @@ workflows:
       - run-crypto-unit-test:
           requires:
             - prefetch-crates
-      #- run-flaky-unit-test:
-      #    requires:
-      #      - prefetch-crates
       - build-docs:
           requires:
             - lint
-          filters:
-            branches:
-              only: master
       - deploy-docs:
           requires:
             - build-docs

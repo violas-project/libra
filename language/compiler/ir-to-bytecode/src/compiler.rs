@@ -38,6 +38,12 @@ macro_rules! record_src_loc {
             .source_map
             .add_local_mapping($context.current_function_definition_index(), source_name)?;
     }};
+    (parameter: $context:expr, $var:expr) => {{
+        let source_name = ($var.value.clone().into_inner(), $var.loc);
+        $context
+            .source_map
+            .add_parameter_mapping($context.current_function_definition_index(), source_name)?;
+    }};
     (field: $context:expr, $idx: expr, $field:expr) => {{
         $context
             .source_map
@@ -155,6 +161,7 @@ enum InferredType {
     U64,
     U128,
     Address,
+    Signer,
     Vector(Box<InferredType>),
     Struct(StructHandleIndex, Vec<InferredType>),
     Reference(Box<InferredType>),
@@ -175,6 +182,7 @@ impl InferredType {
             S::U64 => I::U64,
             S::U128 => I::U128,
             S::Address => I::Address,
+            S::Signer => I::Signer,
             S::Vector(s_inner) => I::Vector(Box::new(Self::from_signature_token_with_subst(
                 subst, s_inner,
             ))),
@@ -227,6 +235,7 @@ impl InferredType {
             InferredType::U64 => bail!("no struct type for U64"),
             InferredType::U128 => bail!("no struct type for U128"),
             InferredType::Address => bail!("no struct type for Address"),
+            InferredType::Signer => bail!("no struct type for Signer"),
             InferredType::Vector(_) => bail!("no struct type for vector"),
             InferredType::Reference(inner) | InferredType::MutableReference(inner) => {
                 inner.get_struct_handle()
@@ -245,6 +254,7 @@ impl InferredType {
             I::U64 => S::U64,
             I::U128 => S::U128,
             I::Address => S::Address,
+            I::Signer => S::Signer,
             I::Vector(inner) => S::Vector(Box::new(Self::to_signature_token(inner)?)),
             I::Struct(si, tys) if tys.is_empty() => S::Struct(*si),
             I::Struct(si, tys) => S::StructInstantiation(*si, Self::build_signature_tokens(tys)?),
@@ -456,8 +466,9 @@ pub fn compile_module<'a, T: 'a + ModuleAccess>(
         address,
         name: module.name,
     };
-    let mut context = Context::new(dependencies, Some(current_module))?;
+    let mut context = Context::new(dependencies, Some(current_module.clone()))?;
     let self_name = ModuleName::new(ModuleName::self_name().into());
+    let self_module_handle_idx = context.declare_import(current_module, self_name.clone())?;
     // Explicitly declare all imports as they will be included even if not used
     compile_imports(&mut context, Some(address), module.imports)?;
 
@@ -506,6 +517,7 @@ pub fn compile_module<'a, T: 'a + ModuleAccess>(
     ) = context.materialize_pools();
     let compiled_module = CompiledModuleMut {
         module_handles,
+        self_module_handle_idx,
         struct_handles,
         function_handles,
         field_handles,
@@ -633,6 +645,7 @@ fn compile_type(
 ) -> Result<SignatureToken> {
     Ok(match ty {
         Type::Address => SignatureToken::Address,
+        Type::Signer => SignatureToken::Signer,
         Type::U8 => SignatureToken::U8,
         Type::U64 => SignatureToken::U64,
         Type::U128 => SignatureToken::U128,
@@ -782,7 +795,7 @@ fn compile_function_body_impl(
 
         FunctionBody::Native => {
             for (var, _) in ast_function.signature.formals.into_iter() {
-                record_src_loc!(local: context, var)
+                record_src_loc!(parameter: context, var)
             }
             None
         }
@@ -837,9 +850,9 @@ fn compile_function_body(
     for (var, t) in formals {
         let sig = compile_type(context, function_frame.type_parameters(), &t)?;
         function_frame.define_local(&var.value, sig.clone())?;
-        locals_signature.0.push(sig);
-        record_src_loc!(local: context, var);
+        record_src_loc!(parameter: context, var);
     }
+
     for (var_, t) in locals {
         let sig = compile_type(context, function_frame.type_parameters(), &t)?;
         function_frame.define_local(&var_.value, sig.clone())?;
@@ -1631,8 +1644,7 @@ fn compile_function_body_bytecode(
     for (var, t) in formals {
         let sig = compile_type(context, function_frame.type_parameters(), &t)?;
         function_frame.define_local(&var.value, sig.clone())?;
-        locals_signature.0.push(sig);
-        record_src_loc!(local: context, var);
+        record_src_loc!(parameter: context, var);
     }
     for (var_, t) in locals {
         let sig = compile_type(context, function_frame.type_parameters(), &t)?;

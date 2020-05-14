@@ -9,11 +9,13 @@ use bytecode_verifier::{
 use libra_crypto::HashValue;
 use libra_logger::prelude::*;
 use libra_types::{
-    access_path::{AccessPath, Accesses},
-    language_storage::{ModuleId, StructTag, TypeTag},
+    access_path::AccessPath,
     vm_error::{StatusCode, VMStatus},
 };
-use move_core_types::identifier::{IdentStr, Identifier};
+use move_core_types::{
+    identifier::{IdentStr, Identifier},
+    language_storage::{ModuleId, StructTag, TypeTag},
+};
 use move_vm_types::{
     interpreter_context::InterpreterContext,
     loaded_data::{
@@ -215,6 +217,7 @@ impl ModuleCache {
             SignatureToken::U64 => Type::U64,
             SignatureToken::U128 => Type::U128,
             SignatureToken::Address => Type::Address,
+            SignatureToken::Signer => Type::Signer,
             SignatureToken::TypeParameter(idx) => Type::TyParam(*idx as usize),
             SignatureToken::Vector(inner_tok) => {
                 let inner_type = self.make_type(binary, inner_tok)?;
@@ -361,6 +364,7 @@ impl Loader {
             TypeTag::U64 => Type::U64,
             TypeTag::U128 => Type::U128,
             TypeTag::Address => Type::Address,
+            TypeTag::Signer => Type::Signer,
             TypeTag::Vector(tt) => Type::Vector(Box::new(self.load_type(tt, context)?)),
             TypeTag::Struct(struct_tag) => {
                 let module_id = ModuleId::new(struct_tag.address, struct_tag.module.clone());
@@ -977,7 +981,14 @@ impl Script {
         let code: Vec<Bytecode> = compiled_script.code.code.clone();
         let parameters = script.signature_at(compiled_script.parameters).clone();
         let return_ = Signature(vec![]);
-        let locals = script.signature_at(compiled_script.code.locals).clone();
+        let locals = Signature(
+            parameters
+                .0
+                .iter()
+                .chain(script.signature_at(compiled_script.code.locals).0.iter())
+                .cloned()
+                .collect(),
+        );
         let type_parameters = compiled_script.type_parameters.clone();
         // TODO: main does not have a name. Revisit.
         let name = Identifier::new("main").unwrap();
@@ -1050,12 +1061,22 @@ impl Function {
             None
         };
         let scope = Scope::Module(module_id);
+        let parameters = module.signature_at(handle.parameters).clone();
         // Native functions do not have a code unit
         let (code, locals) = match &def.code {
-            Some(code) => (code.code.clone(), module.signature_at(code.locals).clone()),
+            Some(code) => (
+                code.code.clone(),
+                Signature(
+                    parameters
+                        .0
+                        .iter()
+                        .chain(module.signature_at(code.locals).0.iter())
+                        .cloned()
+                        .collect(),
+                ),
+            ),
             None => (vec![], Signature(vec![])),
         };
-        let parameters = module.signature_at(handle.parameters).clone();
         let return_ = module.signature_at(handle.return_).clone();
         let type_parameters = handle.type_parameters.clone();
         Self {
@@ -1212,12 +1233,8 @@ pub struct FieldInstantiation {
 //
 
 fn load_script_dependencies(binary: &dyn ScriptAccess) -> Vec<ModuleId> {
-    let self_module = binary.self_handle();
     let mut deps = vec![];
     for module in binary.module_handles() {
-        if module == self_module {
-            continue;
-        }
         deps.push(ModuleId::new(
             *binary.address_identifier_at(module.address),
             binary.identifier_at(module.name).to_owned(),
@@ -1275,7 +1292,7 @@ impl LibraType {
             name: fat_type.name.clone(),
             type_params,
         };
-        let resource_key = AccessPath::resource_access_vec(&tag, &Accesses::empty());
+        let resource_key = AccessPath::resource_access_vec(&tag);
         Ok(Self {
             fat_type,
             resource_key,
@@ -1359,6 +1376,7 @@ impl Loader {
             U64 => FatType::U64,
             U128 => FatType::U128,
             Address => FatType::Address,
+            Signer => FatType::Signer,
             Vector(ty) => FatType::Vector(Box::new(self.type_to_fat_type(ty)?)),
             Struct(idx) => FatType::Struct(Box::new(self.struct_to_fat_struct(*idx, vec![])?)),
             StructInstantiation(idx, instantiation) => {

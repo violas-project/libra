@@ -7,7 +7,9 @@ use bytecode_source_map::{
     source_map::{FunctionSourceMap, SourceName},
 };
 use bytecode_verifier::control_flow_graph::{ControlFlowGraph, VMControlFlowGraph};
+use colored::*;
 use move_core_types::identifier::IdentStr;
+use move_coverage::coverage_map::{CoverageMap, FunctionCoverage};
 use vm::{
     access::ModuleAccess,
     file_format::{
@@ -48,6 +50,8 @@ pub struct Disassembler<Location: Clone + Eq> {
     source_mapper: SourceMapping<Location>,
     // The various options that we can set for disassembly.
     options: DisassemblerOptions,
+    // Optional coverage map for use in displaying code coverage
+    coverage_map: Option<CoverageMap>,
 }
 
 impl<Location: Clone + Eq> Disassembler<Location> {
@@ -55,7 +59,12 @@ impl<Location: Clone + Eq> Disassembler<Location> {
         Self {
             source_mapper,
             options,
+            coverage_map: None,
         }
+    }
+
+    pub fn add_coverage_map(&mut self, coverage_map: CoverageMap) {
+        self.coverage_map = Some(coverage_map);
     }
 
     //***************************************************************************
@@ -87,6 +96,51 @@ impl<Location: Clone + Eq> Disassembler<Location> {
             .source_mapper
             .bytecode
             .struct_def_at(struct_definition_index))
+    }
+
+    //***************************************************************************
+    // Code Coverage Helpers
+    //***************************************************************************
+
+    fn get_function_coverage(&self, function_name: &IdentStr) -> Option<&FunctionCoverage> {
+        self.source_mapper
+            .source_map
+            .module_name_opt
+            .as_ref()
+            .and_then(|module| {
+                self.coverage_map.as_ref().and_then(|coverage_map| {
+                    coverage_map
+                        .module_maps
+                        .get(&module)
+                        .and_then(|module_map| module_map.get_function_coverage(function_name))
+                })
+            })
+    }
+
+    fn is_function_called(&self, function_name: &IdentStr) -> bool {
+        self.get_function_coverage(function_name).is_some()
+    }
+
+    fn format_function_coverage(&self, name: &IdentStr, function_body: String) -> String {
+        if self.is_function_called(name) {
+            function_body.green()
+        } else {
+            function_body.red()
+        }
+        .to_string()
+    }
+
+    fn format_with_instruction_coverage(
+        pc: usize,
+        function_coverage_map: Option<&FunctionCoverage>,
+        instruction: String,
+    ) -> String {
+        let coverage = function_coverage_map.and_then(|map| map.get(&(pc as u64)));
+        match coverage {
+            Some(coverage) => format!("[{}]\t{}: {}", coverage, pc, instruction).green(),
+            None => format!("\t{}: {}", pc, instruction).red(),
+        }
+        .to_string()
     }
 
     //***************************************************************************
@@ -177,13 +231,13 @@ impl<Location: Clone + Eq> Disassembler<Location> {
         Ok((name, Self::format_type_params(&type_arguments)))
     }
 
-    fn name_for_local(
+    fn name_for_parameter_or_local(
         &self,
-        local_idx: u64,
+        local_idx: usize,
         function_source_map: &FunctionSourceMap<Location>,
     ) -> Result<String> {
         let name = function_source_map
-                .get_local_name(local_idx)
+                .get_parameter_or_local_name(local_idx as u64)
                 .ok_or_else(|| {
                     format_err!(
                         "Unable to get local name at index {} while disassembling location-based instruction", local_idx
@@ -193,13 +247,30 @@ impl<Location: Clone + Eq> Disassembler<Location> {
         Ok(name)
     }
 
-    fn type_for_local(
+    fn type_for_parameter_or_local(
         &self,
-        local_idx: u64,
-        locals_sigs: &Signature,
+        idx: usize,
+        parameters: &Signature,
+        locals: &Signature,
         function_source_map: &FunctionSourceMap<Location>,
     ) -> Result<String> {
-        let sig_tok = locals_sigs
+        let sig_tok = if idx < parameters.len() {
+            &parameters.0[idx]
+        } else if idx < parameters.len() + locals.len() {
+            &locals.0[idx - parameters.len()]
+        } else {
+            bail!("Unable to get type for parameter or local at index {}", idx)
+        };
+        self.disassemble_sig_tok(sig_tok.clone(), &function_source_map.type_parameters)
+    }
+
+    fn type_for_local(
+        &self,
+        local_idx: usize,
+        locals: &Signature,
+        function_source_map: &FunctionSourceMap<Location>,
+    ) -> Result<String> {
+        let sig_tok = locals
             .0
             .get(local_idx as usize)
             .ok_or_else(|| format_err!("Unable to get type for local at index {}", local_idx))?;
@@ -253,6 +324,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
             SignatureToken::U64 => "u64".to_string(),
             SignatureToken::U128 => "u128".to_string(),
             SignatureToken::Address => "address".to_string(),
+            SignatureToken::Signer => "signer".to_string(),
             SignatureToken::Struct(struct_handle_idx) => self
                 .source_mapper
                 .bytecode
@@ -308,6 +380,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
 
     fn disassemble_instruction(
         &self,
+        parameters: &Signature,
         instruction: &Bytecode,
         locals_sigs: &Signature,
         function_source_map: &FunctionSourceMap<Location>,
@@ -322,33 +395,58 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                 ))
             }
             Bytecode::CopyLoc(local_idx) => {
-                let name = self.name_for_local(u64::from(*local_idx), function_source_map)?;
-                let ty =
-                    self.type_for_local(u64::from(*local_idx), locals_sigs, function_source_map)?;
+                let name =
+                    self.name_for_parameter_or_local(usize::from(*local_idx), function_source_map)?;
+                let ty = self.type_for_parameter_or_local(
+                    usize::from(*local_idx),
+                    parameters,
+                    locals_sigs,
+                    function_source_map,
+                )?;
                 Ok(format!("CopyLoc[{}]({}: {})", local_idx, name, ty))
             }
             Bytecode::MoveLoc(local_idx) => {
-                let name = self.name_for_local(u64::from(*local_idx), function_source_map)?;
-                let ty =
-                    self.type_for_local(u64::from(*local_idx), locals_sigs, function_source_map)?;
+                let name =
+                    self.name_for_parameter_or_local(usize::from(*local_idx), function_source_map)?;
+                let ty = self.type_for_parameter_or_local(
+                    usize::from(*local_idx),
+                    parameters,
+                    locals_sigs,
+                    function_source_map,
+                )?;
                 Ok(format!("MoveLoc[{}]({}: {})", local_idx, name, ty))
             }
             Bytecode::StLoc(local_idx) => {
-                let name = self.name_for_local(u64::from(*local_idx), function_source_map)?;
-                let ty =
-                    self.type_for_local(u64::from(*local_idx), locals_sigs, function_source_map)?;
+                let name =
+                    self.name_for_parameter_or_local(usize::from(*local_idx), function_source_map)?;
+                let ty = self.type_for_parameter_or_local(
+                    usize::from(*local_idx),
+                    parameters,
+                    locals_sigs,
+                    function_source_map,
+                )?;
                 Ok(format!("StLoc[{}]({}: {})", local_idx, name, ty))
             }
             Bytecode::MutBorrowLoc(local_idx) => {
-                let name = self.name_for_local(u64::from(*local_idx), function_source_map)?;
-                let ty =
-                    self.type_for_local(u64::from(*local_idx), locals_sigs, function_source_map)?;
+                let name =
+                    self.name_for_parameter_or_local(usize::from(*local_idx), function_source_map)?;
+                let ty = self.type_for_parameter_or_local(
+                    usize::from(*local_idx),
+                    parameters,
+                    locals_sigs,
+                    function_source_map,
+                )?;
                 Ok(format!("MutBorrowLoc[{}]({}: {})", local_idx, name, ty))
             }
             Bytecode::ImmBorrowLoc(local_idx) => {
-                let name = self.name_for_local(u64::from(*local_idx), function_source_map)?;
-                let ty =
-                    self.type_for_local(u64::from(*local_idx), locals_sigs, function_source_map)?;
+                let name =
+                    self.name_for_parameter_or_local(usize::from(*local_idx), function_source_map)?;
+                let ty = self.type_for_parameter_or_local(
+                    usize::from(*local_idx),
+                    parameters,
+                    locals_sigs,
+                    function_source_map,
+                )?;
                 Ok(format!("ImmBorrowLoc[{}]({}: {})", local_idx, name, ty))
             }
             Bytecode::MutBorrowField(field_idx) => {
@@ -631,16 +729,30 @@ impl<Location: Clone + Eq> Disassembler<Location> {
         }
 
         let function_def = self.get_function_def(function_definition_index)?;
+        let function_handle = self
+            .source_mapper
+            .bytecode
+            .function_handle_at(function_def.function);
         let code = match &function_def.code {
             Some(code) => code,
             None => return Ok(vec!["".to_string()]),
         };
 
+        let parameters = self
+            .source_mapper
+            .bytecode
+            .signature_at(function_handle.parameters);
         let locals_sigs = self.source_mapper.bytecode.signature_at(code.locals);
         let function_source_map = self
             .source_mapper
             .source_map
             .get_function_source_map(function_definition_index)?;
+
+        let function_name = self
+            .source_mapper
+            .bytecode
+            .identifier_at(function_handle.name);
+        let function_code_coverage_map = self.get_function_coverage(function_name);
 
         let decl_location = &function_source_map.decl_location;
         let instrs: Vec<String> = code
@@ -648,6 +760,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
             .iter()
             .map(|instruction| {
                 self.disassemble_instruction(
+                    parameters,
                     instruction,
                     locals_sigs,
                     function_source_map,
@@ -659,7 +772,13 @@ impl<Location: Clone + Eq> Disassembler<Location> {
         let mut instrs: Vec<String> = instrs
             .into_iter()
             .enumerate()
-            .map(|(instr_index, dis_instr)| format!("\t{}: {}", instr_index, dis_instr))
+            .map(|(instr_index, dis_instr)| {
+                Self::format_with_instruction_coverage(
+                    instr_index,
+                    function_code_coverage_map,
+                    dis_instr,
+                )
+            })
             .collect();
 
         if self.options.print_basic_blocks {
@@ -691,7 +810,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
         &self,
         function_source_map: &FunctionSourceMap<Location>,
         locals_idx: SignatureIndex,
-        parameters_len: usize,
+        parameter_len: usize,
     ) -> Result<Vec<String>> {
         if !self.options.print_locals {
             return Ok(vec![]);
@@ -701,10 +820,11 @@ impl<Location: Clone + Eq> Disassembler<Location> {
         let locals_names_tys = function_source_map
             .locals
             .iter()
-            .skip(parameters_len)
+            .skip(parameter_len)
             .enumerate()
             .map(|(local_idx, (name, _))| {
-                let ty = self.type_for_local(local_idx as u64, signature, function_source_map)?;
+                let ty =
+                    self.type_for_local(parameter_len + local_idx, signature, function_source_map)?;
                 Ok(format!("{}: {}", name.to_string(), ty))
             })
             .collect::<Result<Vec<String>>>()?;
@@ -745,8 +865,7 @@ impl<Location: Clone + Eq> Disassembler<Location> {
         let name = self
             .source_mapper
             .bytecode
-            .identifier_at(function_handle.name)
-            .to_string();
+            .identifier_at(function_handle.name);
         let return_ = self
             .source_mapper
             .bytecode
@@ -761,10 +880,11 @@ impl<Location: Clone + Eq> Disassembler<Location> {
                 Ok(sig_tok_str)
             })
             .collect::<Result<Vec<String>>>()?;
-        let parameters = self
+        let parameters_sig = &self
             .source_mapper
             .bytecode
-            .signature_at(function_handle.parameters)
+            .signature_at(function_handle.parameters);
+        let parameters = parameters_sig
             .0
             .iter()
             .zip(function_source_map.locals.iter())
@@ -786,14 +906,17 @@ impl<Location: Clone + Eq> Disassembler<Location> {
             }
             None => "".to_string(),
         };
-        Ok(format!(
-            "{visibility_modifier}{name}{ty_params}({params}){ret_type}{body}",
-            visibility_modifier = visibility_modifier,
-            name = name,
-            ty_params = ty_params,
-            params = &parameters.join(", "),
-            ret_type = Self::format_ret_type(&ret_type),
-            body = body,
+        Ok(self.format_function_coverage(
+            name,
+            format!(
+                "{visibility_modifier}{name}{ty_params}({params}){ret_type}{body}",
+                visibility_modifier = visibility_modifier,
+                name = name,
+                ty_params = ty_params,
+                params = &parameters.join(", "),
+                ret_type = Self::format_ret_type(&ret_type),
+                body = body,
+            ),
         ))
     }
 
