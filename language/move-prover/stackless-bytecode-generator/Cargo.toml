@@ -10,7 +10,7 @@ publish = false
 edition = "2018"
 
 [dependencies]
-spec-lang = { path = "../spec-lang", version = "0.0.1" }
+spec-lang = { path = "../spec-lang", version = "0.1.0" }
 vm = { path = "../../vm", version = "0.1.0" }
 bytecode-verifier = { path = "../../bytecode-verifier", version = "0.1.0" }
 borrow-graph = { path = "../../borrow-graph", version = "0.0.1" }
@@ -19,7 +19,7 @@ libra-workspace-hack = { path = "../../../common/workspace-hack", version = "0.1
 num = "0.2.0"
 itertools = "0.9.0"
 libra-types = { path = "../../../types", version = "0.1.0" }
-move-vm-types = { path = "../../move-vm/types", version = "0.1.0" }
+move-core-types = { path = "../../move-core/types", version = "0.1.0" }
 
 [dev-dependencies]
 datatest-stable = { path = "../../../common/datatest-stable", version = "0.1.0" }

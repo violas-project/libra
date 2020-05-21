@@ -60,10 +60,8 @@ function $DebugTrackAbort(file_id: int, byte_index: int) : bool {
 // Path type
 // ---------
 
-type Edge = int; // both FieldName and vector index are mapped to int
-
 type {:datatype} Path;
-function {:constructor} Path(p: [int]Edge, size: int): Path;
+function {:constructor} Path(p: [int]int, size: int): Path;
 const EmptyPath: Path;
 axiom size#Path(EmptyPath) == 0;
 
@@ -84,7 +82,7 @@ function {:constructor} AddressType() : TypeValue;
 function {:constructor} StrType() : TypeValue;
 function {:constructor} VectorType(t: TypeValue) : TypeValue;
 function {:constructor} StructType(name: TypeName, ps: TypeValueArray, ts: TypeValueArray) : TypeValue;
-function {:constructor} AbstractType(num: int): TypeValue;
+function {:constructor} $TypeType(): TypeValue;
 function {:constructor} ErrorType() : TypeValue;
 const DefaultTypeValue: TypeValue;
 axiom DefaultTypeValue == ErrorType();
@@ -114,6 +112,7 @@ function {:constructor} Integer(i: int): Value;
 function {:constructor} Address(a: int): Value;
 function {:constructor} Vector(v: ValueArray): Value; // used to both represent move Struct and Vector
 function {:constructor} $Range(lb: Value, ub: Value): Value;
+function {:constructor} $Type(t: TypeValue): Value;
 function {:constructor} Error(): Value;
 const DefaultValue: Value;
 axiom DefaultValue == Error();
@@ -275,21 +274,62 @@ function {:inline} $ReadValue(p: Path, v: Value): Value {
 // Generate stratified $UpdateValue for the depth of {{stratification_depth}}.
 
 {{#stratified}}
-function {{aggressive_func_inline}} $UpdateValue_{{@this_suffix}}(p: Path, v: Value, new_v: Value): Value {
-    if ({{@this_level}} == size#Path(p)) then
+function {{aggressive_func_inline}} $UpdateValue_{{@this_suffix}}(p: Path, offset: int, v: Value, new_v: Value): Value {
+    (var poffset := offset + {{@this_level}};
+    if (poffset == size#Path(p)) then
         new_v
     else
-        $update_vector(v, path_index_at(p, {{@this_level}}),
-                       $UpdateValue_{{@next_suffix}}(p, $vmap(v)[path_index_at(p, {{@this_level}})], new_v))
+        $update_vector(v, path_index_at(p, poffset),
+                       $UpdateValue_{{@next_suffix}}(p, offset, $vmap(v)[path_index_at(p, poffset)], new_v)))
 }
 {{else}}
-function {:inline} $UpdateValue_{{@this_suffix}}(p: Path, v: Value, new_v: Value): Value {
+function {:inline} $UpdateValue_{{@this_suffix}}(p: Path, offset: int, v: Value, new_v: Value): Value {
     new_v
 }
 {{/stratified}}
 
-function {:inline} $UpdateValue(p: Path, v: Value, new_v: Value): Value {
-    $UpdateValue_stratified(p, v, new_v)
+function {:inline} $UpdateValue(p: Path, offset: int, v: Value, new_v: Value): Value {
+    $UpdateValue_stratified(p, offset, v, new_v)
+}
+
+// Generate stratified $IsPathPrefix for the depth of {{stratification_depth}}.
+
+{{#stratified}}
+function {{aggressive_func_inline}} $IsPathPrefix_{{@this_suffix}}(p1: Path, p2: Path): bool {
+    if ({{@this_level}} == size#Path(p1)) then
+        true
+    else if (p#Path(p1)[{{@this_level}}] == p#Path(p2)[{{@this_level}}]) then
+        $IsPathPrefix_{{@next_suffix}}(p1, p2)
+    else
+        false
+}
+{{else}}
+function {:inline} $IsPathPrefix_{{@this_suffix}}(p1: Path, p2: Path): bool {
+    true
+}
+{{/stratified}}
+
+function {:inline} $IsPathPrefix(p1: Path, p2: Path): bool {
+    $IsPathPrefix_stratified(p1, p2)
+}
+
+// Generate stratified $ConcatPath for the depth of {{stratification_depth}}.
+
+{{#stratified}}
+function {{aggressive_func_inline}} $ConcatPath_{{@this_suffix}}(p1: Path, p2: Path): Path {
+    if ({{@this_level}} == size#Path(p2)) then
+        p1
+    else
+        $ConcatPath_{{@next_suffix}}(Path(p#Path(p1)[size#Path(p1) := p#Path(p2)[{{@this_level}}]], size#Path(p1) + 1), p2)
+}
+{{else}}
+function {:inline} $ConcatPath_{{@this_suffix}}(p1: Path, p2: Path): Path {
+    p1
+}
+{{/stratified}}
+
+function {:inline} $ConcatPath(p1: Path, p2: Path): Path {
+    $ConcatPath_stratified(p1, p2)
 }
 
 // Vector related functions on values
@@ -376,7 +416,7 @@ function {:constructor} Local(i: int): Location;
 function {:constructor} Param(i: int): Location;
 
 type {:datatype} Reference;
-function {:constructor} Reference(l: Location, p: Path): Reference;
+function {:constructor} Reference(l: Location, p: Path, v: Value): Reference;
 const DefaultReference: Reference;
 
 type {:datatype} Memory;
@@ -389,21 +429,10 @@ const EmptyMemory: Memory;
 axiom domain#Memory(EmptyMemory) == ConstMemoryDomain(false);
 axiom contents#Memory(EmptyMemory) == ConstMemoryContent(DefaultValue);
 
-var $m : Memory;
-var $local_counter : int;
+var $m: Memory;
 var $abort_flag: bool;
 
-function {:inline} $GetLocal(m: Memory, idx: int): Value {
-   contents#Memory(m)[Local(idx)]
-}
-
-function {:inline} $UpdateLocal(m: Memory, idx: int, v: Value): Memory {
-    Memory(domain#Memory(m)[Local(idx) := true], contents#Memory(m)[Local(idx) := v])
-}
-
 procedure {:inline 1} $InitVerification() {
-  // Set local counter to 0
-  $local_counter := 0;
   // Set abort_flag to false
   $abort_flag := false;
 }
@@ -421,11 +450,6 @@ function {:inline} $ResourceExists(m: Memory, resource: TypeValue, address: Valu
     Boolean($ResourceExistsRaw(m, resource, a#Address(address)))
 }
 
-// Obtains reference to the given resource.
-function {:inline} $GetResourceReference(resource: TypeValue, addr: int): Reference {
-    Reference(Global(resource, addr), EmptyPath)
-}
-
 // Obtains value of given resource.
 function {:inline} $ResourceValue(m: Memory, resource: TypeValue, address: Value): Value {
   contents#Memory(m)[Global(resource, a#Address(address))]
@@ -437,8 +461,8 @@ function {:inline} $SelectField(val: Value, field: FieldName): Value {
 }
 
 // Dereferences a reference.
-function {:inline} $Dereference(m: Memory, ref: Reference): Value {
-    $ReadValue(p#Reference(ref), contents#Memory(m)[l#Reference(ref)])
+function {:inline} $Dereference(ref: Reference): Value {
+    v#Reference(ref)
 }
 
 // Check whether sender account exists.
@@ -505,12 +529,12 @@ procedure {:inline 1} $BorrowGlobal(address: Value, ta: TypeValue) returns (dst:
         $abort_flag := true;
         return;
     }
-    dst := Reference(l, EmptyPath);
+    dst := Reference(l, EmptyPath, contents#Memory($m)[l]);
 }
 
-procedure {:inline 1} $BorrowLoc(l: int) returns (dst: Reference)
+procedure {:inline 1} $BorrowLoc(l: int, v: Value) returns (dst: Reference)
 {
-    dst := Reference(Local(l), EmptyPath);
+    dst := Reference(Local(l), EmptyPath, v);
 }
 
 procedure {:inline 1} $BorrowField(src: Reference, f: FieldName) returns (dst: Reference)
@@ -521,7 +545,7 @@ procedure {:inline 1} $BorrowField(src: Reference, f: FieldName) returns (dst: R
     p := p#Reference(src);
     size := size#Path(p);
     p := Path(p#Path(p)[size := f], size+1);
-    dst := Reference(l#Reference(src), p);
+    dst := Reference(l#Reference(src), p, $vmap(v#Reference(src))[f]);
 }
 
 procedure {:inline 1} $GetGlobal(address: Value, ta: TypeValue) returns (dst: Value)
@@ -546,20 +570,14 @@ procedure {:inline 1} $GetFieldFromValue(src: Value, f: FieldName) returns (dst:
     dst := $vmap(src)[f];
 }
 
-procedure {:inline 1} $WriteRef(to: Reference, new_v: Value)
+procedure {:inline 1} $WriteRef(to: Reference, new_v: Value) returns (to': Reference)
 {
-    var l: Location;
-    var v: Value;
-
-    l := l#Reference(to);
-    v := contents#Memory($m)[l];
-    v := $UpdateValue(p#Reference(to), v, new_v);
-    $m := Memory(domain#Memory($m), contents#Memory($m)[l := v]);
+    to' := Reference(l#Reference(to), p#Reference(to), new_v);
 }
 
 procedure {:inline 1} $ReadRef(from: Reference) returns (v: Value)
 {
-    v := $ReadValue(p#Reference(from), contents#Memory($m)[l#Reference(from)]);
+    v := v#Reference(from);
 }
 
 procedure {:inline 1} $CopyOrMoveRef(local: Reference) returns (dst: Reference)
@@ -572,9 +590,46 @@ procedure {:inline 1} $CopyOrMoveValue(local: Value) returns (dst: Value)
     dst := local;
 }
 
-procedure {:inline 1} $FreezeRef(src: Reference) returns (dst: Reference)
+procedure {:inline 1} WritebackToGlobal(src: Reference)
 {
-    dst := src;
+    var l: Location;
+    var v: Value;
+
+    l := l#Reference(src);
+    if (is#Global(l)) {
+        v := $UpdateValue(p#Reference(src), 0, contents#Memory($m)[l], v#Reference(src));
+        $m := Memory(domain#Memory($m), contents#Memory($m)[l := v]);
+    }
+}
+
+procedure {:inline 1} WritebackToValue(src: Reference, idx: int, vdst: Value) returns (vdst': Value)
+{
+    if (l#Reference(src) == Local(idx)) {
+        vdst' := $UpdateValue(p#Reference(src), 0, vdst, v#Reference(src));
+    } else {
+        vdst' := vdst;
+    }
+}
+
+procedure {:inline 1} WritebackToReference(src: Reference, dst: Reference) returns (dst': Reference)
+{
+    var srcPath, dstPath: Path;
+
+    srcPath := p#Reference(src);
+    dstPath := p#Reference(dst);
+    if (l#Reference(dst) == l#Reference(src) && size#Path(dstPath) <= size#Path(srcPath) && $IsPathPrefix(dstPath, srcPath)) {
+        dst' := Reference(
+                    l#Reference(dst),
+                    dstPath,
+                    $UpdateValue(srcPath, size#Path(dstPath), v#Reference(dst), v#Reference(src)));
+    } else {
+        dst' := dst;
+    }
+}
+
+procedure {:inline 1} Splice1(idx1: int, src1:Reference, dst: Reference) returns (dst': Reference) {
+    assume l#Reference(dst) == Local(idx1);
+    dst' := Reference(l#Reference(dst), $ConcatPath(p#Reference(src1), p#Reference(dst)), v#Reference(dst));
 }
 
 procedure {:inline 1} $CastU8(src: Value) returns (dst: Value)
@@ -647,18 +702,35 @@ procedure {:inline 1} $Sub(src1: Value, src2: Value) returns (dst: Value)
     dst := Integer(i#Integer(src1) - i#Integer(src2));
 }
 
+// This deals only with narrow special cases. Src2 must be constant
+// 32 or 64, which is what we use now.  Obviously, it could be extended
+// to src2 == any integer value from 0..127.
+// Left them out for brevity
+function power_of_2 (power:Value): int {
+    (var p := i#Integer(power);
+     if p == 32 then 4294967296
+     else if p == 64 then 18446744073709551616
+     // value is undefined, otherwise.
+     else -1
+     )
+}
+
 procedure {:inline 1} $Shl(src1: Value, src2: Value) returns (dst: Value)
-{{type_requires}} is#Integer(src1) && is#Integer(src2);
+requires is#Integer(src1) && is#Integer(src2);
 {
-    // TOOD: implement
-    assert false;
+    var po2: int;
+    po2 := power_of_2(src2);
+    assert po2 >= 1;   // po2 < 0 if src2 not 32 or 63
+    dst := Integer(i#Integer(src2) * po2);
 }
 
 procedure {:inline 1} $Shr(src1: Value, src2: Value) returns (dst: Value)
-{{type_requires}} is#Integer(src1) && is#Integer(src2);
+requires is#Integer(src1) && is#Integer(src2);
 {
-    // TOOD: implement
-    assert false;
+    var po2: int;
+    po2 := power_of_2(src2);
+    assert po2 >= 1;   // po2 < 0 if src2 not 32 or 63
+    dst := Integer(i#Integer(src2) div po2);
 }
 
 procedure {:inline 1} $MulU8(src1: Value, src2: Value) returns (dst: Value)
@@ -796,17 +868,13 @@ procedure {:inline 1} $Vector_is_empty(ta: TypeValue, v: Value) returns (b: Valu
     b := Boolean($vlen(v) == 0);
 }
 
-procedure {:inline 1} $Vector_push_back(ta: TypeValue, r: Reference, val: Value) {
-    var v: Value;
-    v := $Dereference($m, r);
+procedure {:inline 1} $Vector_push_back(ta: TypeValue, v: Value, val: Value) returns (v': Value) {
     assume is#Vector(v);
-    call $WriteRef(r, $push_back_vector(v, val));
+    v' := $push_back_vector(v, val);
 }
 
-procedure {:inline 1} $Vector_pop_back(ta: TypeValue, r: Reference) returns (e: Value) {
-    var v: Value;
+procedure {:inline 1} $Vector_pop_back(ta: TypeValue, v: Value) returns (e: Value, v': Value) {
     var len: int;
-    v := $Dereference($m, r);
     assume is#Vector(v);
     len := $vlen(v);
     if (len == 0) {
@@ -814,22 +882,18 @@ procedure {:inline 1} $Vector_pop_back(ta: TypeValue, r: Reference) returns (e: 
         return;
     }
     e := $vmap(v)[len-1];
-    call $WriteRef(r, $pop_back_vector(v));
+    v' := $pop_back_vector(v);
 }
 
-procedure {:inline 1} $Vector_append(ta: TypeValue, r: Reference, other: Value) {
-    var v: Value;
-    v := $Dereference($m, r);
+procedure {:inline 1} $Vector_append(ta: TypeValue, v: Value, other: Value) returns (v': Value) {
     assume is#Vector(v);
     assume is#Vector(other);
-    call $WriteRef(r, $append_vector(v, other));
+    v' := $append_vector(v, other);
 }
 
-procedure {:inline 1} $Vector_reverse(ta: TypeValue, r: Reference) {
-    var v: Value;
-    v := $Dereference($m, r);
+procedure {:inline 1} $Vector_reverse(ta: TypeValue, v: Value) returns (v': Value) {
     assume is#Vector(v);
-    call $WriteRef(r, $reverse_vector(v));
+    v' := $reverse_vector(v);
 }
 
 procedure {:inline 1} $Vector_length(ta: TypeValue, v: Value) returns (l: Value) {
@@ -850,26 +914,19 @@ procedure {:inline 1} $Vector_borrow(ta: TypeValue, src: Value, i: Value) return
     dst := $vmap(src)[i_ind];
 }
 
-procedure {:inline 1} $Vector_borrow_mut(ta: TypeValue, src: Reference, index: Value) returns (dst: Reference)
+procedure {:inline 1} $Vector_borrow_mut(ta: TypeValue, v: Value, index: Value) returns (dst: Reference, v': Value)
 {{type_requires}} is#Integer(index);
 {
-    var p: Path;
-    var size: int;
     var i_ind: int;
-    var v: Value;
 
     i_ind := i#Integer(index);
-    v := $Dereference($m, src);
     assume is#Vector(v);
     if (i_ind < 0 || i_ind >= $vlen(v)) {
         $abort_flag := true;
         return;
     }
-
-    p := p#Reference(src);
-    size := size#Path(p);
-    p := Path(p#Path(p)[size := i_ind], size+1);
-    dst := Reference(l#Reference(src), p);
+    dst := Reference(Local(0), Path(p#Path(EmptyPath)[0 := i_ind], 1), $vmap(v)[i_ind]);
+    v' := v;
 }
 
 procedure {:inline 1} $Vector_destroy_empty(ta: TypeValue, v: Value) {
@@ -878,60 +935,51 @@ procedure {:inline 1} $Vector_destroy_empty(ta: TypeValue, v: Value) {
     }
 }
 
-procedure {:inline 1} $Vector_swap(ta: TypeValue, src: Reference, i: Value, j: Value)
+procedure {:inline 1} $Vector_swap(ta: TypeValue, v: Value, i: Value, j: Value) returns (v': Value)
 {{type_requires}} is#Integer(i) && is#Integer(j);
 {
     var i_ind: int;
     var j_ind: int;
-    var v: Value;
+    assume is#Vector(v);
     i_ind := i#Integer(i);
     j_ind := i#Integer(j);
-    v := $Dereference($m, src);
-    assume is#Vector(v);
     if (i_ind >= $vlen(v) || j_ind >= $vlen(v) || i_ind < 0 || j_ind < 0) {
         $abort_flag := true;
         return;
     }
-    v := $swap_vector(v, i_ind, j_ind);
-    call $WriteRef(src, v);
+    v' := $swap_vector(v, i_ind, j_ind);
 }
 
-procedure {:inline 1} $Vector_remove(ta: TypeValue, r: Reference, i: Value) returns (e: Value)
+procedure {:inline 1} $Vector_remove(ta: TypeValue, v: Value, i: Value) returns (e: Value, v': Value)
 {{type_requires}} is#Integer(i);
 {
     var i_ind: int;
-    var v: Value;
 
-    i_ind := i#Integer(i);
-
-    v := $Dereference($m, r);
     assume is#Vector(v);
+    i_ind := i#Integer(i);
     if (i_ind < 0 || i_ind >= $vlen(v)) {
         $abort_flag := true;
         return;
     }
     e := $vmap(v)[i_ind];
-    call $WriteRef(r, $remove_vector(v, i_ind));
+    v' := $remove_vector(v, i_ind);
 }
 
-procedure {:inline 1} $Vector_swap_remove(ta: TypeValue, r: Reference, i: Value) returns (e: Value)
+procedure {:inline 1} $Vector_swap_remove(ta: TypeValue, v: Value, i: Value) returns (e: Value, v': Value)
 {{type_requires}} is#Integer(i);
 {
     var i_ind: int;
-    var v: Value;
     var len: int;
 
-    i_ind := i#Integer(i);
-
-    v := $Dereference($m, r);
     assume is#Vector(v);
+    i_ind := i#Integer(i);
     len := $vlen(v);
     if (i_ind < 0 || i_ind >= len) {
         $abort_flag := true;
         return;
     }
     e := $vmap(v)[i_ind];
-    call $WriteRef(r, $pop_back_vector($swap_vector(v, i_ind, len-1)));
+    v' := $pop_back_vector($swap_vector(v, i_ind, len-1));
 }
 
 procedure {:inline 1} $Vector_contains(ta: TypeValue, v: Value, e: Value) returns (res: Value)  {
@@ -939,11 +987,37 @@ procedure {:inline 1} $Vector_contains(ta: TypeValue, v: Value, e: Value) return
     res := Boolean($contains_vector(v, e));
 }
 
-procedure {:inline 1} $Vector_index_of(ta: TypeValue, v: Value, e: Value) returns (res1: Value, res2: Value)  {
-    // TODO: implement me
-    assert false;
-}
+// FIXME: This procedure sometimes (not always) make the test (performance_200511) very slow (> 10 mins) or hang
+// although this is not used in the test script (performance_200511). The test finishes in 20 secs when it works fine.
+procedure {:inline 1} $Vector_index_of(ta: TypeValue, v: Value, e: Value) returns (res1: Value, res2: Value);
+requires is#Vector(v);
+ensures is#Boolean(res1);
+ensures is#Integer(res2);
+ensures 0 <= i#Integer(res2) && i#Integer(res2) < $vlen(v);
+ensures res1 == Boolean($contains_vector(v, e));
+ensures b#Boolean(res1) ==> IsEqual($vmap(v)[i#Integer(res2)], e);
+ensures b#Boolean(res1) ==> (forall i:int :: 0<=i && i<i#Integer(res2) ==> !IsEqual($vmap(v)[i], e));
+ensures !b#Boolean(res1) ==> i#Integer(res2) == 0;
 
+// FIXME: This alternative definition has the same issue as the other one above.
+// TODO: Delete this when unnecessary
+//procedure {:inline 1} $Vector_index_of(ta: TypeValue, v: Value, e: Value) returns (res1: Value, res2: Value) {
+//    var b: bool;
+//    var i: int;
+//    assume is#Vector(v);
+//    b := $contains_vector(v, e);
+//    if (b) {
+//        havoc i;
+//        assume 0 <= i && i < $vlen(v);
+//        assume IsEqual($vmap(v)[i], e);
+//        assume (forall j:int :: 0<=j && j<i ==> !IsEqual($vmap(v)[j], e));
+//    }
+//    else {
+//        i := 0;
+//    }
+//    res1 := Boolean(b);
+//    res2 := Integer(i);
+//}
 
 // ==================================================================================
 // Native hash
@@ -1078,22 +1152,17 @@ function {:inline} $LCS_serialize($m: Memory, $txn: Transaction, ta: TypeValue, 
 }
 
 function $LCS_serialize_core(v: Value): Value;
-
-// This says that $serialize respects isEquals (substitution property)
-// Without this, Boogie will get false positives where v1, v2 differ at invalid
-// indices.
-axiom (forall v1,v2: Value :: IsEqual(v1, v2) ==> IsEqual($LCS_serialize_core(v1), $LCS_serialize_core(v2)));
-
-
-// This says that serialize is an injection
-axiom (forall v1, v2: Value ::  IsEqual($LCS_serialize_core(v1), $LCS_serialize_core(v2))
-           ==> IsEqual(v1, v2));
+function $LCS_serialize_core_inv(v: Value): Value;
+// Needed only because IsEqual(v1, v2) is weaker than v1 == v2 in case there is a vector nested inside v1 or v2.
+axiom (forall v1, v2: Value :: IsEqual(v1, v2) ==> $LCS_serialize_core(v1) == $LCS_serialize_core(v2));
+// Injectivity
+axiom (forall v: Value :: $LCS_serialize_core_inv($LCS_serialize_core(v)) == v);
 
 // This says that serialize returns a non-empty vec<u8>
 {{#if (eq serialize_bound 0)}}
 axiom (forall v: Value :: ( var r := $LCS_serialize_core(v); $IsValidU8Vector(r) && $vlen(r) > 0 ));
 {{else}}
-axiom (forall v: Value :: ( var r := $LCS_serialize_core(v); $IsValidU8Vector(r) && $vlen(r) > 0 && $vlen(r) < {{serialize_bound}} ));
+axiom (forall v: Value :: ( var r := $LCS_serialize_core(v); $IsValidU8Vector(r) && $vlen(r) > 0 && $vlen(r) <= {{serialize_bound}} ));
 {{/if}}
 
 procedure $LCS_to_bytes(ta: TypeValue, v: Value) returns (res: Value);

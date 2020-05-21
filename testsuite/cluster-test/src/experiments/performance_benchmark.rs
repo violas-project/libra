@@ -153,11 +153,16 @@ impl Experiment for PerformanceBenchmark {
         }
         let end = unix_timestamp_now() - buffer;
         let start = end - window + 2 * buffer;
-        let (avg_tps, avg_latency) = stats::txn_stats(&context.prometheus, start, end)?;
         let avg_txns_per_block = stats::avg_txns_per_block(&context.prometheus, start, end)?;
+        let avg_latency_client = stats.latency / stats.committed;
+        let avg_tps = stats.committed / window.as_secs();
         info!(
             "Link to dashboard : {}",
             context.prometheus.link_to_dashboard(start, end)
+        );
+        info!(
+            "Tx status from client side: txn {}, avg latency {}",
+            stats.committed as u64, avg_latency_client
         );
         let instance_configs = instance::instance_configs(&self.down_validators)?;
         let futures: Vec<_> = instance_configs
@@ -176,10 +181,12 @@ impl Experiment for PerformanceBenchmark {
         context
             .report
             .report_metric(&self, "avg_txns_per_block", avg_txns_per_block as f64);
-        context.report.report_metric(&self, "avg_tps", avg_tps);
         context
             .report
-            .report_metric(&self, "avg_latency", avg_latency);
+            .report_metric(&self, "avg_tps", avg_tps as f64);
+        context
+            .report
+            .report_metric(&self, "avg_latency", avg_latency_client as f64);
         info!("avg_txns_per_block: {}", avg_txns_per_block);
         let expired_text = if expired_txn == 0 {
             "no expired txns".to_string()
@@ -188,7 +195,7 @@ impl Experiment for PerformanceBenchmark {
         };
         context.report.report_text(format!(
             "{} : {:.0} TPS, {:.1} ms latency, {}",
-            self, avg_tps, avg_latency, expired_text
+            self, avg_tps, avg_latency_client, expired_text
         ));
         Ok(())
     }

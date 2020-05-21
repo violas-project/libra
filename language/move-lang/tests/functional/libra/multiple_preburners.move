@@ -5,6 +5,7 @@
 //! account: alice, 0Coin1
 //! account: bob, 0Coin1
 //! account: carol, 0Coin1
+//! account: dawn, 0Coin2
 
 // allocate funds to alice, bob and carol
 //! sender: association
@@ -28,6 +29,7 @@ fun main() {
 //! sender: alice
 //! max-gas: 1000000
 //! gas-price: 0
+//! gas-currency: Coin1
 script {
 use 0x0::Coin1;
 use 0x0::Libra;
@@ -43,6 +45,7 @@ fun main() {
 //! sender: alice
 //! max-gas: 1000000
 //! gas-price: 0
+//! gas-currency: Coin1
 script {
 use 0x0::LibraAccount;
 use 0x0::Coin1;
@@ -63,6 +66,7 @@ fun main() {
 //! sender: bob
 //! max-gas: 1000000
 //! gas-price: 0
+//! gas-currency: Coin1
 script {
 use 0x0::Coin1;
 use 0x0::Libra;
@@ -78,6 +82,7 @@ fun main() {
 //! sender: bob
 //! max-gas: 1000000
 //! gas-price: 0
+//! gas-currency: Coin1
 script {
 use 0x0::LibraAccount;
 use 0x0::Coin1;
@@ -99,6 +104,7 @@ fun main() {
 //! sender: carol
 //! max-gas: 1000000
 //! gas-price: 0
+//! gas-currency: Coin1
 script {
 use 0x0::LibraAccount;
 use 0x0::Coin1;
@@ -118,6 +124,7 @@ fun main() {
 //! sender: carol
 //! max-gas: 1000000
 //! gas-price: 0
+//! gas-currency: Coin1
 script {
 use 0x0::Coin1;
 use 0x0::Libra;
@@ -134,6 +141,7 @@ fun main() {
 //! sender: bob
 //! max-gas: 1000000
 //! gas-price: 0
+//! gas-currency: Coin1
 script {
 use 0x0::Coin1;
 use 0x0::Libra;
@@ -170,6 +178,7 @@ fun main() {
 //! sender: alice
 //! max-gas: 1000000
 //! gas-price: 0
+//! gas-currency: Coin1
 script {
 use 0x0::LibraAccount;
 use 0x0::Coin1;
@@ -203,4 +212,78 @@ fun main() {
 }
 
 // check: CancelBurnEvent
+// check: EXECUTED
+
+//! new-transaction
+//! sender: association
+//! max-gas: 1000000
+script {
+use 0x0::Coin2;
+use 0x0::LibraAccount;
+fun main() {
+    LibraAccount::mint_to_address<Coin2::T>({{dawn}}, 200);
+}
+}
+// check: EXECUTED
+
+// publish preburn resource for Coin2 to alice's account
+//! new-transaction
+//! sender: dawn
+//! max-gas: 1000000
+//! gas-currency: Coin2
+script {
+use 0x0::Coin2;
+use 0x0::Libra;
+use 0x0::LibraAccount;
+fun main() {
+    Libra::publish_preburn(Libra::new_preburn<Coin2::T>());
+    let coin = LibraAccount::withdraw_from_sender<Coin2::T>(100);
+    Libra::preburn_to_sender<Coin2::T>(coin);
+}
+}
+
+// Try to destroy the preburn, but it will fail since there is an
+// outstanding preburn request.
+//! new-transaction
+//! sender: dawn
+//! max-gas: 1000000
+//! gas-currency: Coin2
+script {
+use 0x0::Coin2;
+use 0x0::Libra;
+fun main() {
+    Libra::destroy_preburn(
+        Libra::remove_preburn<Coin2::T>()
+    );
+}
+}
+// check: NATIVE_FUNCTION_ERROR
+// check: 3
+
+//! new-transaction
+//! sender: association
+//! max-gas: 1000000
+script {
+use 0x0::Coin2;
+use 0x0::LibraAccount;
+fun main() {
+    LibraAccount::cancel_burn<Coin2::T>({{dawn}});
+}
+}
+// check: EXECUTED
+
+// Now destroy the preburn
+//! new-transaction
+//! sender: dawn
+//! max-gas: 1000000
+//! gas-currency: Coin2
+script {
+use 0x0::Coin2;
+use 0x0::Libra;
+fun main() {
+    Libra::destroy_preburn(
+        Libra::remove_preburn<Coin2::T>()
+    );
+}
+}
 // check: EXECUTED

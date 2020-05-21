@@ -180,6 +180,7 @@ impl<'env> fmt::Display for BorrowNodeDisplay<'env> {
                 let ty = Type::Struct(s.module_id, s.struct_id, vec![]);
                 let tctx = TypeDisplayContext::WithEnv {
                     env: self.func_target.global_env(),
+                    type_param_names: None,
                 };
                 write!(f, "{}", ty.display(&tctx))?;
             }
@@ -223,11 +224,10 @@ pub enum Bytecode {
     Nop(AttrId),
 
     WriteBack(AttrId, BorrowNode, TempIndex),
+    Splice(AttrId, TempIndex, BTreeMap<usize, TempIndex>),
 
     UnpackRef(AttrId, TempIndex),
     PackRef(AttrId, TempIndex),
-
-    Splice(AttrId, TempIndex, BTreeMap<usize, TempIndex>),
 }
 
 impl Bytecode {
@@ -249,6 +249,10 @@ impl Bytecode {
             | PackRef(id, ..)
             | Splice(id, ..) => *id,
         }
+    }
+
+    pub fn is_exit(&self) -> bool {
+        matches!(self, Bytecode::Ret(..) | Bytecode::Abort(..))
     }
 
     pub fn is_return(&self) -> bool {
@@ -588,6 +592,7 @@ impl<'env> OperationDisplay<'env> {
         if !targs.is_empty() {
             let tctx = TypeDisplayContext::WithEnv {
                 env: self.func_target.global_env(),
+                type_param_names: None,
             };
             write!(f, "<")?;
             for (i, ty) in targs.iter().enumerate() {
@@ -605,6 +610,7 @@ impl<'env> OperationDisplay<'env> {
         let ty = Type::Struct(mid, sid, targs.to_vec());
         let tctx = TypeDisplayContext::WithEnv {
             env: self.func_target.global_env(),
+            type_param_names: None,
         };
         format!("{}", ty.display(&tctx))
     }

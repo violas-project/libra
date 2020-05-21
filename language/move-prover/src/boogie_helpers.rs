@@ -100,17 +100,19 @@ pub fn boogie_type_value(env: &GlobalEnv, ty: &Type) -> String {
             // TODO fix this for a real boogie type
             PrimitiveType::Signer => "AddressType()".to_string(),
             PrimitiveType::Range => "RangeType()".to_string(),
+            PrimitiveType::TypeValue => "$TypeType()".to_string(),
         },
         Type::Vector(t) => format!("$Vector_type_value({})", boogie_type_value(env, t)),
         Type::Reference(_, t) => format!("ReferenceType({})", boogie_type_value(env, t)),
         Type::TypeParameter(index) => format!("$tv{}", index),
+        Type::TypeLocal(s) => format!("t#$Type({})", s.display(env.symbol_pool())),
         Type::Struct(module_id, struct_id, args) => {
             boogie_struct_type_value(env, *module_id, *struct_id, args)
         }
         // TODO: function and tuple types?
         Type::Tuple(_args) => "Tuple_type_value()".to_string(),
         Type::Fun(_args, _result) => "Function_type_value()".to_string(),
-        _ => panic!("unexpected transient type"),
+        Type::Error | Type::Var(..) | Type::TypeDomain(..) => panic!("unexpected transient type"),
     }
 }
 
@@ -186,6 +188,7 @@ fn boogie_well_formed_expr_impl(
             // TODO fix this for a real boogie check
             PrimitiveType::Signer => conds.push(format!("is#Address({})", name)),
             PrimitiveType::Range => conds.push(format!("$IsValidRange({})", name)),
+            PrimitiveType::TypeValue => conds.push(format!("is#$Type({})", name)),
         },
         Type::Vector(elem_ty) => {
             conds.push(format!("$Vector_is_well_formed({})", name));
@@ -224,7 +227,7 @@ fn boogie_well_formed_expr_impl(
             };
             conds.push(boogie_well_formed_expr_impl(
                 env,
-                &format!("$Dereference($m, {})", name),
+                &format!("$Dereference({})", name),
                 rtype,
                 mode,
                 nest + 1,
@@ -233,9 +236,9 @@ fn boogie_well_formed_expr_impl(
         // TODO: tuple and functions?
         Type::Fun(_args, _result) => {}
         Type::Tuple(_elems) => {}
-        // A type parameter is opaque, so no type check here.
-        Type::TypeParameter(_) => {}
-        _ => panic!("unexpected transient type"),
+        // A type parameter or type value is opaque, so no type check here.
+        Type::TypeParameter(..) | Type::TypeLocal(..) => {}
+        Type::Error | Type::Var(..) | Type::TypeDomain(..) => panic!("unexpected transient type"),
     }
     conds.iter().filter(|s| !s.is_empty()).join(" && ")
 }
@@ -300,10 +303,6 @@ pub fn boogie_global_declarator(
     } else {
         format!("{} : Value", name)
     }
-}
-
-pub fn boogie_var_before_borrow(idx: usize) -> String {
-    format!("$before_borrow_{}", idx)
 }
 
 pub fn boogie_byte_blob(val: &[u8]) -> String {

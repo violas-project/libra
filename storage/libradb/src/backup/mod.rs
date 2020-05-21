@@ -18,6 +18,7 @@ use libra_types::{
 use std::sync::Arc;
 
 /// `BackupHandler` provides functionalities for LibraDB data backup.
+#[derive(Clone)]
 pub struct BackupHandler {
     ledger_store: Arc<LedgerStore>,
     transaction_store: Arc<TransactionStore>,
@@ -61,7 +62,7 @@ impl BackupHandler {
     pub fn get_account_iter(
         &self,
         version: Version,
-    ) -> Result<Box<dyn Iterator<Item = Result<(HashValue, AccountStateBlob)>> + Send>> {
+    ) -> Result<Box<dyn Iterator<Item = Result<(HashValue, AccountStateBlob)>> + Send + Sync>> {
         let iterator = JellyfishMerkleIterator::new(
             Arc::clone(&self.state_store),
             version,
@@ -78,5 +79,11 @@ impl BackupHandler {
     ) -> Result<SparseMerkleRangeProof> {
         self.state_store
             .get_account_state_range_proof(rightmost_key, version)
+    }
+
+    /// Get the latest version and state root hash.
+    pub fn get_latest_state_root(&self) -> Result<(Version, HashValue)> {
+        let (version, txn_info) = self.ledger_store.get_latest_transaction_info()?;
+        Ok((version, txn_info.state_root_hash()))
     }
 }

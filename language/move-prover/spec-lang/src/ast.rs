@@ -17,6 +17,7 @@ use std::{
 };
 use vm::file_format::CodeOffset;
 
+use crate::env::{FunId, SchemaId, TypeParameter};
 use std::collections::BTreeSet;
 
 // =================================================================================================
@@ -183,6 +184,30 @@ impl Spec {
     }
 }
 
+/// Information about a specification block in the source. This is used for documentation
+/// generation. In the object model, the original locations and documentation of spec blocks
+/// is reduced to conditions on a `Spec`, with expansion of schemas. This data structure
+/// allows us to disover the original spec blocks and their content.
+#[derive(Debug, Clone)]
+pub struct SpecBlockInfo {
+    /// The location of the entire spec block.
+    pub loc: Loc,
+    /// The target of the spec block.
+    pub target: SpecBlockTarget,
+    /// The locations of all members of the spec block.
+    pub member_locs: Vec<Loc>,
+}
+
+/// Describes the target of a spec block.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SpecBlockTarget {
+    Module,
+    Struct(ModuleId, StructId),
+    Function(ModuleId, FunId),
+    FunctionCode(ModuleId, FunId, usize),
+    Schema(ModuleId, SchemaId, Vec<TypeParameter>),
+}
+
 // =================================================================================================
 /// # Expressions
 
@@ -286,6 +311,8 @@ pub enum Operation {
     Len,
     All,
     Any,
+    TypeValue,
+    TypeDomain,
     Global,
     Exists,
     Old,

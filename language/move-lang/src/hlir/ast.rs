@@ -91,7 +91,7 @@ pub type FunctionBody = Spanned<FunctionBody_>;
 pub struct Function {
     pub visibility: FunctionVisibility,
     pub signature: FunctionSignature,
-    pub acquires: BTreeSet<StructName>,
+    pub acquires: BTreeMap<StructName, Loc>,
     pub body: FunctionBody,
 }
 
@@ -210,12 +210,13 @@ pub struct ModuleCall {
     pub name: FunctionName,
     pub type_arguments: Vec<BaseType>,
     pub arguments: Box<Exp>,
-    pub acquires: BTreeSet<StructName>,
+    pub acquires: BTreeMap<StructName, Loc>,
 }
 
 #[derive(Debug, PartialEq)]
 pub enum BuiltinFunction_ {
     MoveToSender(BaseType),
+    MoveTo(BaseType),
     MoveFrom(BaseType),
     BorrowGlobal(bool, BaseType),
     Exists(BaseType),
@@ -354,6 +355,7 @@ impl BaseType_ {
 
         let kind = match b_ {
             U8 | U64 | U128 | Bool | Address => sp(loc, Kind_::Copyable),
+            Signer => sp(loc, Kind_::Resource),
             Vector => {
                 assert!(
                     ty_args.len() == 1,
@@ -586,7 +588,7 @@ impl AstDebug for (FunctionName, &Function) {
         signature.ast_debug(w);
         if !acquires.is_empty() {
             w.write(" acquires ");
-            w.comma(acquires, |w, s| w.write(&format!("{}", s)));
+            w.comma(acquires.keys(), |w, s| w.write(&format!("{}", s)));
             w.write(" ");
         }
         match &body.value {
@@ -931,7 +933,7 @@ impl AstDebug for ModuleCall {
         w.write(&format!("{}::{}", module, name));
         if !acquires.is_empty() {
             w.write("[acquires: [");
-            w.comma(acquires, |w, s| w.write(&format!("{}", s)));
+            w.comma(acquires.keys(), |w, s| w.write(&format!("{}", s)));
             w.write("]], ");
         }
         w.write("<");
@@ -949,6 +951,7 @@ impl AstDebug for BuiltinFunction_ {
         use BuiltinFunction_ as F;
         let (n, bt) = match self {
             F::MoveToSender(bt) => (NF::MOVE_TO_SENDER, bt),
+            F::MoveTo(bt) => (NF::MOVE_TO, bt),
             F::MoveFrom(bt) => (NF::MOVE_FROM, bt),
             F::BorrowGlobal(true, bt) => (NF::BORROW_GLOBAL_MUT, bt),
             F::BorrowGlobal(false, bt) => (NF::BORROW_GLOBAL, bt),

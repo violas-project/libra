@@ -66,12 +66,12 @@ members = [
     "language/move-ir/types",
     "language/move-lang",
     "language/move-prover",
+    "language/move-prover/docgen",
     "language/move-prover/spec-lang",
     "language/move-prover/stackless-bytecode-generator",
     "language/move-prover/test-utils",
     "language/move-vm/natives",
     "language/move-vm/runtime",
-    "language/move-vm/state",
     "language/move-vm/types",
     "language/resource-viewer",
     "language/stdlib",
@@ -104,17 +104,16 @@ members = [
     "secure/transaction-scripts",
     "state-synchronizer",
     "storage/accumulator",
-    "storage/backup-restore",
+    "storage/backup/backup-cli",
+    "storage/backup/backup-service",
     "storage/inspector",
     "storage/jellyfish-merkle",
     "storage/libradb",
     "storage/schemadb",
     "storage/scratchpad",
-    "storage/simple-storage-client",
     "storage/state-view",
     "storage/storage-client",
     "storage/storage-interface",
-    "storage/storage-proto",
     "storage/storage-service",
     "testsuite",
     "testsuite/cli",
@@ -145,3 +144,6 @@ lto = 'thin'
 
 [profile.bench]
 debug = true
+
+[patch.crates-io]
+proptest = { git = "https://github.com/mimoo/proptest.git", branch = "fuzzing" }

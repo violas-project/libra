@@ -60,12 +60,15 @@ impl<T: TimeService> OnDiskStorageInternal<T> {
         let mut file = File::open(&self.file_path)?;
         let mut contents = String::new();
         file.read_to_string(&mut contents)?;
-        let data = toml::from_str(&contents)?;
+        if contents.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let data = serde_json::from_str(&contents)?;
         Ok(data)
     }
 
     fn write(&self, data: &HashMap<String, GetResponse>) -> Result<(), Error> {
-        let contents = toml::to_vec(data)?;
+        let contents = serde_json::to_vec(data)?;
         let mut file = File::create(self.temp_path.path())?;
         file.write_all(&contents)?;
         fs::rename(&self.temp_path, &self.file_path)?;
@@ -74,8 +77,8 @@ impl<T: TimeService> OnDiskStorageInternal<T> {
 }
 
 impl<T: Send + Sync + TimeService> KVStorage for OnDiskStorageInternal<T> {
-    fn available(&self) -> bool {
-        true
+    fn available(&self) -> Result<(), Error> {
+        Ok(())
     }
 
     fn get(&self, key: &str) -> Result<GetResponse, Error> {

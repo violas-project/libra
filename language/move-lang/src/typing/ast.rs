@@ -12,7 +12,7 @@ use crate::{
 };
 use move_ir_types::location::*;
 use std::{
-    collections::{BTreeMap, BTreeSet, VecDeque},
+    collections::{BTreeMap, VecDeque},
     fmt,
 };
 
@@ -65,7 +65,7 @@ pub type FunctionBody = Spanned<FunctionBody_>;
 pub struct Function {
     pub visibility: FunctionVisibility,
     pub signature: FunctionSignature,
-    pub acquires: BTreeSet<StructName>,
+    pub acquires: BTreeMap<StructName, Loc>,
     pub body: FunctionBody,
 }
 
@@ -98,13 +98,14 @@ pub struct ModuleCall {
     pub type_arguments: Vec<Type>,
     pub arguments: Box<Exp>,
     pub parameter_types: Vec<Type>,
-    pub acquires: BTreeSet<StructName>,
+    pub acquires: BTreeMap<StructName, Loc>,
 }
 
 #[derive(Debug, PartialEq)]
 #[allow(clippy::large_enum_variant)]
 pub enum BuiltinFunction_ {
     MoveToSender(Type),
+    MoveTo(Type),
     MoveFrom(Type),
     BorrowGlobal(bool, Type),
     Exists(Type),
@@ -209,6 +210,7 @@ impl fmt::Display for BuiltinFunction_ {
         use BuiltinFunction_::*;
         let s = match self {
             MoveToSender(_) => NB::MOVE_TO_SENDER,
+            MoveTo(_) => NB::MOVE_TO,
             MoveFrom(_) => NB::MOVE_FROM,
             BorrowGlobal(false, _) => NB::BORROW_GLOBAL,
             BorrowGlobal(true, _) => NB::BORROW_GLOBAL_MUT,
@@ -295,7 +297,7 @@ impl AstDebug for (FunctionName, &Function) {
         signature.ast_debug(w);
         if !acquires.is_empty() {
             w.write(" acquires ");
-            w.comma(acquires, |w, s| w.write(&format!("{}", s)));
+            w.comma(acquires.keys(), |w, s| w.write(&format!("{}", s)));
             w.write(" ");
         }
         match &body.value {
@@ -526,7 +528,7 @@ impl AstDebug for ModuleCall {
             w.write("[");
             if !acquires.is_empty() {
                 w.write("acquires: [");
-                w.comma(acquires, |w, s| w.write(&format!("{}", s)));
+                w.comma(acquires.keys(), |w, s| w.write(&format!("{}", s)));
                 w.write("], ");
             }
             if !parameter_types.is_empty() {
@@ -553,6 +555,7 @@ impl AstDebug for BuiltinFunction_ {
         use BuiltinFunction_ as F;
         let (n, bt) = match self {
             F::MoveToSender(bt) => (NF::MOVE_TO_SENDER, bt),
+            F::MoveTo(bt) => (NF::MOVE_TO, bt),
             F::MoveFrom(bt) => (NF::MOVE_FROM, bt),
             F::BorrowGlobal(true, bt) => (NF::BORROW_GLOBAL_MUT, bt),
             F::BorrowGlobal(false, bt) => (NF::BORROW_GLOBAL, bt),

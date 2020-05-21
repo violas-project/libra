@@ -11,8 +11,7 @@ use crate::{
     },
 };
 use itertools::Itertools;
-use libra_types::account_address::AccountAddress;
-use move_vm_types::values::Value as VMValue;
+use move_core_types::value::MoveValue;
 use spec_lang::{
     env::{FunctionEnv, Loc, ModuleEnv, StructId},
     ty::{PrimitiveType, Type},
@@ -103,6 +102,7 @@ impl<'a> StacklessBytecodeGenerator<'a> {
             code: self.code,
             local_types: self.local_types,
             return_types: self.func_env.get_return_types(),
+            ref_param_map: BTreeMap::new(),
             acquires_global_resources: self.func_env.get_acquires_global_resources(),
             locations: self.location_table,
             annotations: Annotations::default(),
@@ -276,16 +276,10 @@ impl<'a> StacklessBytecodeGenerator<'a> {
             | MoveBytecode::MutBorrowFieldGeneric(field_inst_index) => {
                 let field_inst = self.module.field_instantiation_at(*field_inst_index);
                 let struct_ref_index = self.temp_stack.pop().unwrap();
-                let (struct_id, field_offset, field_signature) =
+                let (struct_id, field_offset, base_field_type) =
                     self.get_field_info(field_inst.handle);
-                let type_sigs = self
-                    .func_env
-                    .module_env
-                    .globalize_signatures(&self.module.signature_at(field_inst.type_parameters).0);
-                let field_type = match field_signature {
-                    Type::TypeParameter(i) => type_sigs[i as usize].clone(),
-                    _ => field_signature,
-                };
+                let actuals = self.get_type_params(field_inst.type_parameters);
+                let field_type = base_field_type.instantiate(&actuals);
                 let field_ref_index = self.temp_count;
                 self.temp_stack.push(field_ref_index);
 
@@ -293,7 +287,7 @@ impl<'a> StacklessBytecodeGenerator<'a> {
                     Operation::BorrowField(
                         self.func_env.module_env.get_id(),
                         struct_id,
-                        type_sigs,
+                        actuals,
                         field_offset,
                     ),
                     vec![field_ref_index],
@@ -372,7 +366,7 @@ impl<'a> StacklessBytecodeGenerator<'a> {
                     .globalize_signature(&constant.type_);
                 let value = Self::translate_value(
                     &ty,
-                    self.func_env.module_env.get_constant_value(constant),
+                    &self.func_env.module_env.get_constant_value(constant),
                 );
                 self.local_types.push(ty);
                 self.code.push(Bytecode::Load(attr_id, temp_index, value));
@@ -513,7 +507,6 @@ impl<'a> StacklessBytecodeGenerator<'a> {
                     self.temp_count += 1;
                 }
                 arg_temp_indices.reverse();
-                return_temp_indices.reverse();
                 let callee_env = self
                     .func_env
                     .module_env
@@ -1034,6 +1027,11 @@ impl<'a> StacklessBytecodeGenerator<'a> {
                 ));
             }
 
+            MoveBytecode::MoveTo(_) => unimplemented!("Not yet supported instruction: MoveTo"),
+            MoveBytecode::MoveToGeneric(_) => {
+                unimplemented!("Not yet supported instruction: MoveToGeneric")
+            }
+
             MoveBytecode::GetTxnSenderAddress => {
                 let temp_index = self.temp_count;
                 self.temp_stack.push(temp_index);
@@ -1051,12 +1049,11 @@ impl<'a> StacklessBytecodeGenerator<'a> {
         }
     }
 
-    fn translate_value(ty: &Type, value: VMValue) -> Constant {
-        match ty {
-            Type::Vector(inner) => {
-                let vs = value.value_as::<Vec<VMValue>>().unwrap();
+    fn translate_value(ty: &Type, value: &MoveValue) -> Constant {
+        match (ty, &value) {
+            (Type::Vector(inner), MoveValue::Vector(vs)) => {
                 let b = vs
-                    .into_iter()
+                    .iter()
                     .map(|v| match Self::translate_value(inner, v) {
                         Constant::U8(u) => u,
                         _ => unimplemented!("Not yet supported constant vector type: {:?}", ty),
@@ -1064,17 +1061,12 @@ impl<'a> StacklessBytecodeGenerator<'a> {
                     .collect::<Vec<u8>>();
                 Constant::ByteArray(b)
             }
-            Type::Primitive(PrimitiveType::Bool) => {
-                Constant::Bool(value.value_as::<bool>().unwrap())
-            }
-            Type::Primitive(PrimitiveType::U8) => Constant::U8(value.value_as::<u8>().unwrap()),
-            Type::Primitive(PrimitiveType::U64) => Constant::U64(value.value_as::<u64>().unwrap()),
-            Type::Primitive(PrimitiveType::U128) => {
-                Constant::U128(value.value_as::<u128>().unwrap())
-            }
-            Type::Primitive(PrimitiveType::Address) => {
-                let a = value.value_as::<AccountAddress>().unwrap();
-                Constant::Address(ModuleEnv::addr_to_big_uint(&a))
+            (Type::Primitive(PrimitiveType::Bool), MoveValue::Bool(b)) => Constant::Bool(*b),
+            (Type::Primitive(PrimitiveType::U8), MoveValue::U8(b)) => Constant::U8(*b),
+            (Type::Primitive(PrimitiveType::U64), MoveValue::U64(b)) => Constant::U64(*b),
+            (Type::Primitive(PrimitiveType::U128), MoveValue::U128(b)) => Constant::U128(*b),
+            (Type::Primitive(PrimitiveType::Address), MoveValue::Address(a)) => {
+                Constant::Address(ModuleEnv::addr_to_big_uint(a))
             }
             _ => panic!("Unexpected (and possibly invalid) constant type: {:?}", ty),
         }

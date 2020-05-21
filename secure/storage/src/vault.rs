@@ -206,8 +206,12 @@ impl VaultStorage {
 }
 
 impl KVStorage for VaultStorage {
-    fn available(&self) -> bool {
-        self.client.unsealed().unwrap_or(false) && self.client.transit_enabled().unwrap_or(false)
+    fn available(&self) -> Result<(), Error> {
+        if !self.client.unsealed()? {
+            Err(Error::InternalError("Vault is not unsealed".into()))
+        } else {
+            Ok(())
+        }
     }
 
     fn get(&self, key: &str) -> Result<GetResponse, Error> {

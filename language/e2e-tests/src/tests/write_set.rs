@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    account::{Account, AccountData},
+    account::{self, Account, AccountData},
     executor::FakeExecutor,
 };
 use libra_types::{
     access_path::AccessPath,
-    account_config::{lbr_type_tag, CORE_CODE_ADDRESS},
+    account_config::{lbr_type_tag, CORE_CODE_ADDRESS, LBR_NAME},
     contract_event::ContractEvent,
     on_chain_config::new_epoch_event_key,
     transaction::{ChangeSet, TransactionPayload, TransactionStatus},
@@ -18,6 +18,36 @@ use move_core_types::{
     identifier::Identifier,
     language_storage::{ResourceKey, StructTag},
 };
+
+#[test]
+fn invalid_write_set_sender() {
+    // create a FakeExecutor with a genesis from file
+    let mut executor = FakeExecutor::from_genesis_file();
+    executor.new_block();
+
+    // (1) Create a WriteSet that adds an account on a new address
+    let sender_account = AccountData::new(1000, 10);
+    executor.add_account_data(&sender_account);
+
+    let new_account_data = AccountData::new(1000, 10);
+    let write_set = new_account_data.to_writeset();
+
+    let writeset_txn = sender_account.account().create_signed_txn_impl(
+        *sender_account.address(),
+        TransactionPayload::WriteSet(ChangeSet::new(write_set, vec![])),
+        0,
+        100_000,
+        1,
+        LBR_NAME.to_owned(),
+    );
+
+    let output = executor.execute_transaction(writeset_txn);
+    assert_eq!(
+        output.status().vm_status().major_status,
+        StatusCode::ABORTED
+    );
+    assert_eq!(output.status().vm_status().sub_status, Some(33));
+}
 
 #[test]
 fn verify_and_execute_writeset() {
@@ -36,6 +66,7 @@ fn verify_and_execute_writeset() {
         0,
         100_000,
         1,
+        LBR_NAME.to_owned(),
     );
 
     let output = executor.execute_transaction(writeset_txn.clone());
@@ -50,8 +81,11 @@ fn verify_and_execute_writeset() {
 
     executor.apply_write_set(output.write_set());
 
-    let (updated_sender, updated_sender_balance) = executor
-        .read_account_info(new_account_data.account())
+    let updated_sender = executor
+        .read_account_resource(new_account_data.account())
+        .expect("sender must exist");
+    let updated_sender_balance = executor
+        .read_balance_resource(new_account_data.account(), account::lbr_currency_code())
         .expect("sender balance must exist");
 
     assert_eq!(1000, updated_sender_balance.coin());
@@ -75,6 +109,7 @@ fn verify_and_execute_writeset() {
         10,
         100_000,
         1,
+        LBR_NAME.to_owned(),
     );
     let output = executor.execute_transaction(writeset_txn.clone());
     let status = output.status();
@@ -105,6 +140,7 @@ fn bad_writesets() {
         0,
         100_000,
         1,
+        LBR_NAME.to_owned(),
     );
 
     let output = executor.execute_transaction(writeset_txn);
@@ -121,6 +157,7 @@ fn bad_writesets() {
         0,
         100_000,
         1,
+        LBR_NAME.to_owned(),
     );
 
     let output = executor.execute_transaction(writeset_txn);
@@ -150,6 +187,7 @@ fn bad_writesets() {
         0,
         100_000,
         0,
+        LBR_NAME.to_owned(),
     );
 
     let output = executor.execute_transaction(writeset_txn);

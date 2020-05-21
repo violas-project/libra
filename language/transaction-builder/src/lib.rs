@@ -107,17 +107,6 @@ encode_txn_script! {
 }
 
 encode_txn_script! {
-    name: encode_approved_payment_script,
-    type_arg: type_,
-    args: [payee: Address, amount: U64, metadata: Bytes, signature: Bytes],
-    script: ApprovedPayment,
-    doc: "Encode a program that deposits `amount` LBR in `payee`'s account if the `signature` on the\
-          payment metadata matches the public key stored in the `payee`'s ApprovedPayment` resource.\
-          Aborts if the signature does not match, `payee` does not have an `ApprovedPayment` resource, or\
-          the sender's balance is less than `amount`."
-}
-
-encode_txn_script! {
     name: encode_burn_script,
     type_arg: type_,
     args: [preburn_address: Address],
@@ -260,14 +249,6 @@ encode_txn_script! {
 }
 
 encode_txn_script! {
-    name: encode_register_approved_payment_script,
-    args: [public_key: Bytes],
-    script: RegisterApprovedPayment,
-    doc: "Publish a newly created `ApprovedPayment` resource under the sender's account with approval key\
-         `public_key`. Aborts if the sender already has a published `ApprovedPayment` resource."
-}
-
-encode_txn_script! {
     name: encode_add_currency_to_account_script,
     type_arg: currency,
     args: [],
@@ -311,6 +292,13 @@ encode_txn_script! {
 }
 
 encode_txn_script! {
+    name: encode_rotate_compliance_public_key_script,
+    args: [vasp_root_addr: Address, new_key: Bytes],
+    script: RotateCompliancePublicKey,
+    doc: "Encode a program that rotates `vasp_root_addr`'s compliance public key to `new_key`."
+}
+
+encode_txn_script! {
     name: encode_rotate_consensus_pubkey_script,
     args: [new_key: Bytes],
     script: RotateConsensusPubkey,
@@ -351,6 +339,24 @@ pub fn encode_mint_script(
         vec![token],
         vec![
             TransactionArgument::Address(*sender),
+            TransactionArgument::U8Vector(auth_key_prefix),
+            TransactionArgument::U64(amount),
+        ],
+    )
+}
+
+/// Encode a program creating `amount` LBR for `address`
+pub fn encode_mint_lbr_to_address_script(
+    address: &AccountAddress,
+    auth_key_prefix: Vec<u8>,
+    amount: u64,
+) -> Script {
+    validate_auth_key_prefix(&auth_key_prefix);
+    Script::new(
+        StdlibScript::MintLbrToAddress.compiled_bytes().into_vec(),
+        vec![],
+        vec![
+            TransactionArgument::Address(*address),
             TransactionArgument::U8Vector(auth_key_prefix),
             TransactionArgument::U64(amount),
         ],
@@ -517,7 +523,7 @@ encode_txn_script! {
 
 encode_txn_script! {
     name: encode_apply_for_root_vasp,
-    args: [human_name: Bytes, base_url: Bytes, ca_cert: Bytes],
+    args: [human_name: Bytes, base_url: Bytes, travel_rule_public_key: Bytes],
     script: ApplyForRootVasp,
     doc: "Applies for the sending account to be added as a root VASP account."
 }
@@ -572,4 +578,18 @@ encode_txn_script! {
     args: [parent_address: Address],
     script: RemoveParentAccount,
     doc: "Removes the parent account at `parent_address`. It can be recertified in the future however."
+}
+
+encode_txn_script! {
+    name: encode_freeze_account,
+    args: [addr: Address],
+    script: FreezeAccount,
+    doc: "Freezes account with address addr."
+}
+
+encode_txn_script! {
+    name: encode_unfreeze_account,
+    args: [addr: Address],
+    script: UnfreezeAccount,
+    doc: "Unfreezes account with address addr."
 }

@@ -29,7 +29,7 @@ use move_vm_types::{
     loaded_data::types::{FatStructType, FatType},
     values::{Struct, Value},
 };
-use std::{str::FromStr, time::Duration};
+use std::{collections::BTreeMap, str::FromStr, time::Duration};
 use vm_genesis::GENESIS_KEYPAIR;
 
 // TTL is 86400s. Initial time was set to 0.
@@ -187,6 +187,7 @@ impl Account {
         sequence_number: u64,
         max_gas_amount: u64,
         gas_unit_price: u64,
+        gas_currency_code: String,
     ) -> SignedTransaction {
         Self::create_raw_user_txn(
             *self.address(),
@@ -194,6 +195,7 @@ impl Account {
             sequence_number,
             max_gas_amount,
             gas_unit_price,
+            gas_currency_code,
         )
         .sign(&self.privkey, self.pubkey.clone())
         .unwrap()
@@ -206,6 +208,7 @@ impl Account {
         sequence_number: u64,
         max_gas_amount: u64,
         gas_unit_price: u64,
+        gas_currency_code: String,
     ) -> RawTransaction {
         match payload {
             TransactionPayload::Program => RawTransaction::new(
@@ -214,6 +217,7 @@ impl Account {
                 TransactionPayload::Program,
                 max_gas_amount,
                 gas_unit_price,
+                gas_currency_code,
                 Duration::from_secs(DEFAULT_EXPIRATION_TIME),
             ),
             TransactionPayload::WriteSet(writeset) => {
@@ -225,6 +229,7 @@ impl Account {
                 module,
                 max_gas_amount,
                 gas_unit_price,
+                gas_currency_code,
                 Duration::from_secs(DEFAULT_EXPIRATION_TIME),
             ),
             TransactionPayload::Script(script) => RawTransaction::new_script(
@@ -233,6 +238,7 @@ impl Account {
                 script,
                 max_gas_amount,
                 gas_unit_price,
+                gas_currency_code,
                 Duration::from_secs(DEFAULT_EXPIRATION_TIME),
             ),
         }
@@ -248,6 +254,7 @@ impl Account {
         sequence_number: u64,
         max_gas_amount: u64,
         gas_unit_price: u64,
+        gas_currency_code: String,
     ) -> SignedTransaction {
         self.create_signed_txn_impl(
             *self.address(),
@@ -255,6 +262,7 @@ impl Account {
             sequence_number,
             max_gas_amount,
             gas_unit_price,
+            gas_currency_code,
         )
     }
 
@@ -266,6 +274,7 @@ impl Account {
         sequence_number: u64,
         max_gas_amount: u64,
         gas_unit_price: u64,
+        gas_currency_code: String,
     ) -> RawTransaction {
         Self::create_raw_txn_impl(
             address,
@@ -273,6 +282,7 @@ impl Account {
             sequence_number,
             max_gas_amount,
             gas_unit_price,
+            gas_currency_code,
         )
     }
 
@@ -288,6 +298,7 @@ impl Account {
         sequence_number: u64,
         max_gas_amount: u64,
         gas_unit_price: u64,
+        gas_currency_code: String,
     ) -> SignedTransaction {
         self.create_signed_txn_impl(
             sender,
@@ -295,6 +306,7 @@ impl Account {
             sequence_number,
             max_gas_amount,
             gas_unit_price,
+            gas_currency_code,
         )
     }
 
@@ -306,6 +318,7 @@ impl Account {
         sequence_number: u64,
         max_gas_amount: u64,
         gas_unit_price: u64,
+        gas_currency_code: String,
     ) -> RawTransaction {
         Self::create_raw_txn_impl(
             sender,
@@ -313,6 +326,7 @@ impl Account {
             sequence_number,
             max_gas_amount,
             gas_unit_price,
+            gas_currency_code,
         )
     }
 
@@ -326,6 +340,7 @@ impl Account {
         sequence_number: u64,
         max_gas_amount: u64,
         gas_unit_price: u64,
+        gas_currency_code: String,
     ) -> SignedTransaction {
         Self::create_raw_txn_impl(
             sender,
@@ -333,6 +348,7 @@ impl Account {
             sequence_number,
             max_gas_amount,
             gas_unit_price,
+            gas_currency_code,
         )
         .sign(&self.privkey, self.pubkey.clone())
         .unwrap()
@@ -348,6 +364,7 @@ impl Account {
             sequence_number,
             gas_costs::TXN_RESERVED,
             0, // gas price
+            LBR_NAME.to_owned(),
         )
     }
 
@@ -357,6 +374,7 @@ impl Account {
         sequence_number: u64,
         max_gas_amount: u64,
         gas_unit_price: u64,
+        gas_currency_code: String,
     ) -> RawTransaction {
         RawTransaction::new(
             sender,
@@ -364,6 +382,7 @@ impl Account {
             program,
             max_gas_amount,
             gas_unit_price,
+            gas_currency_code,
             // TTL is 86400s. Initial time was set to 0.
             Duration::from_secs(DEFAULT_EXPIRATION_TIME),
         )
@@ -513,7 +532,6 @@ impl AccountType {
                 FatType::Vector(Box::new(FatType::U8)),
                 FatType::U64,
                 FatType::Vector(Box::new(FatType::U8)),
-                FatType::Vector(Box::new(FatType::U8)),
             ],
         };
         FatStructType {
@@ -547,7 +565,6 @@ impl AccountType {
                 Value::vector_u8(vec![]),
                 Value::vector_u8(vec![]),
                 Value::u64(u64::MAX),
-                Value::vector_u8(vec![]),
                 Value::vector_u8(vec![0u8; 16]),
             ]))]),
             AccountTypeSpecifier::Unhosted => {
@@ -630,9 +647,8 @@ pub struct AccountData {
     sent_events: EventHandle,
     received_events: EventHandle,
     is_frozen: bool,
-    balance_currency_code: Identifier,
 
-    balance: Balance,
+    balances: BTreeMap<Identifier, Balance>,
     event_generator: EventHandleGenerator,
     account_type: AccountType,
 }
@@ -661,7 +677,7 @@ impl AccountData {
             0,
             lbr_currency_code(),
             0,
-            AccountTypeSpecifier::Vasp,
+            AccountTypeSpecifier::Empty,
         )
     }
 
@@ -719,24 +735,25 @@ impl AccountData {
         account_specifier: AccountTypeSpecifier,
         is_frozen: bool,
     ) -> Self {
+        let mut balances = BTreeMap::new();
+        balances.insert(balance_currency_code, Balance::new(balance));
         Self {
             account_type: AccountType::new(*account.address(), account_specifier),
             event_generator: EventHandleGenerator::new_with_event_count(*account.address(), 2),
             account,
-            balance: Balance::new(balance),
+            balances,
             sequence_number,
             is_frozen,
             delegated_key_rotation_capability,
             delegated_withdrawal_capability,
             sent_events: new_event_handle(sent_events_count),
             received_events: new_event_handle(received_events_count),
-            balance_currency_code,
         }
     }
 
-    /// Changes the balance held by this account to the one represented as balance_currency_code
-    pub fn set_balance_currency(&mut self, balance_currency_code: Identifier) {
-        self.balance_currency_code = balance_currency_code;
+    /// Adds the balance held by this account to the one represented as balance_currency_code
+    pub fn add_balance_currency(&mut self, balance_currency_code: Identifier) {
+        self.balances.insert(balance_currency_code, Balance::new(0));
     }
 
     /// Changes the keys for this account to the provided ones.
@@ -805,7 +822,6 @@ impl AccountData {
                 )))),
                 FatType::U64,
                 FatType::Bool,
-                FatType::Vector(Box::new(FatType::U8)),
             ],
         }
     }
@@ -816,12 +832,15 @@ impl AccountData {
     }
 
     /// Creates and returns the top-level resources to be published under the account
-    pub fn to_value(&self) -> (Value, Value, Value, Value) {
+    pub fn to_value(&self) -> (Value, Vec<(Identifier, Value)>, Value, Value) {
         // TODO: publish some concept of Account
-        let balance = self.balance.to_value();
+        let balances: Vec<_> = self
+            .balances
+            .iter()
+            .map(|(code, balance)| (code.clone(), balance.to_value()))
+            .collect();
         let assoc_cap = self.account_type.to_value();
         let event_generator = self.event_generator.to_value();
-        let balance_currency_code = self.balance_currency_code.as_bytes();
         let account = Value::struct_(Struct::pack(vec![
             // TODO: this needs to compute the auth key instead
             Value::vector_u8(AuthenticationKey::ed25519(&self.account.pubkey).to_vec()),
@@ -837,9 +856,8 @@ impl AccountData {
             ])),
             Value::u64(self.sequence_number),
             Value::bool(self.is_frozen),
-            Value::vector_u8(balance_currency_code.to_vec()),
         ]));
-        (account, balance, assoc_cap, event_generator)
+        (account, balances, assoc_cap, event_generator)
     }
 
     /// Returns the AccessPath that describes the Account resource instance.
@@ -852,9 +870,8 @@ impl AccountData {
     /// Returns the AccessPath that describes the Account balance resource instance.
     ///
     /// Use this to retrieve or publish the Account blob.
-    pub fn make_balance_access_path(&self) -> AccessPath {
-        self.account
-            .make_balance_access_path(self.balance_currency_code.to_owned())
+    pub fn make_balance_access_path(&self, code: Identifier) -> AccessPath {
+        self.account.make_balance_access_path(code)
     }
 
     /// Returns the AccessPath that describes the EventHandleGenerator resource instance.
@@ -879,41 +896,43 @@ impl AccountData {
     /// directly.
     pub fn to_writeset(&self) -> WriteSet {
         let account_type_specifier = self.account_type();
-        let (account_blob, balance_blob, account_type_blob, event_generator_blob) = self.to_value();
+        let (account_blob, balance_blobs, account_type_blob, event_generator_blob) =
+            self.to_value();
+        let mut write_set = Vec::new();
         let account = account_blob
             .value_as::<Struct>()
             .unwrap()
             .simple_serialize(&AccountData::type_())
             .unwrap();
-        let balance = balance_blob
-            .value_as::<Struct>()
-            .unwrap()
-            .simple_serialize(&Balance::type_())
-            .unwrap();
+        write_set.push((self.make_account_access_path(), WriteOp::Value(account)));
+        for (code, balance_blob) in balance_blobs.into_iter() {
+            let balance = balance_blob
+                .value_as::<Struct>()
+                .unwrap()
+                .simple_serialize(&Balance::type_())
+                .unwrap();
+            write_set.push((self.make_balance_access_path(code), WriteOp::Value(balance)));
+        }
         let account_type = account_type_blob
             .value_as::<Struct>()
             .unwrap()
             .simple_serialize(&AccountType::type_(account_type_specifier))
             .unwrap();
+        write_set.push((
+            self.make_account_type_access_path(account_type_specifier),
+            WriteOp::Value(account_type),
+        ));
+
         let event_generator = event_generator_blob
             .value_as::<Struct>()
             .unwrap()
             .simple_serialize(&EventHandleGenerator::type_())
             .unwrap();
-        WriteSetMut::new(vec![
-            (self.make_account_access_path(), WriteOp::Value(account)),
-            (
-                self.make_event_generator_access_path(),
-                WriteOp::Value(event_generator),
-            ),
-            (self.make_balance_access_path(), WriteOp::Value(balance)),
-            (
-                self.make_account_type_access_path(account_type_specifier),
-                WriteOp::Value(account_type),
-            ),
-        ])
-        .freeze()
-        .unwrap()
+        write_set.push((
+            self.make_event_generator_access_path(),
+            WriteOp::Value(event_generator),
+        ));
+        WriteSetMut::new(write_set).freeze().unwrap()
     }
 
     /// Returns the address of the account. This is a hash of the public key the account was created
@@ -935,8 +954,8 @@ impl AccountData {
     }
 
     /// Returns the initial balance.
-    pub fn balance(&self) -> u64 {
-        self.balance.coin()
+    pub fn balance(&self, currency_code: &IdentStr) -> u64 {
+        self.balances.get(currency_code).unwrap().coin()
     }
 
     /// Returns the initial sequence number.
@@ -962,9 +981,5 @@ impl AccountData {
     /// Returns the initial received events count.
     pub fn received_events_count(&self) -> u64 {
         self.received_events.count()
-    }
-
-    pub fn balance_currency_code(&self) -> &IdentStr {
-        &self.balance_currency_code
     }
 }
