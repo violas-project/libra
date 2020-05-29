@@ -6,8 +6,8 @@ use crate::{
     quorum_cert::QuorumCert,
     vote_data::VoteData,
 };
-use libra_crypto::hash::{CryptoHash, CryptoHasher, HashValue};
-use libra_crypto_derive::CryptoHasher;
+use libra_crypto::hash::HashValue;
+use libra_crypto_derive::{CryptoHasher, LCSCryptoHash};
 use libra_types::{
     block_info::BlockInfo,
     ledger_info::{LedgerInfo, LedgerInfoWithSignatures},
@@ -34,7 +34,7 @@ pub enum BlockType<T> {
     Genesis,
 }
 
-#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq, CryptoHasher)]
+#[derive(Deserialize, Serialize, Clone, Debug, PartialEq, Eq, CryptoHasher, LCSCryptoHash)]
 /// Block has the core data of a consensus block that should be persistent when necessary.
 /// Each block must know the id of its parent and keep the QuorurmCertificate to that parent.
 pub struct BlockData<T> {
@@ -130,7 +130,7 @@ where
     T: Default + Serialize,
 {
     pub fn new_genesis_from_ledger_info(ledger_info: &LedgerInfo) -> Self {
-        assert!(ledger_info.next_epoch_info().is_some());
+        assert!(ledger_info.next_epoch_state().is_some());
         let ancestor = BlockInfo::new(
             ledger_info.epoch(),
             0,                 /* round */
@@ -194,18 +194,5 @@ where
             quorum_cert,
             block_type: BlockType::Proposal { payload, author },
         }
-    }
-}
-
-impl<T> CryptoHash for BlockData<T>
-where
-    T: Serialize,
-{
-    type Hasher = BlockDataHasher;
-
-    fn hash(&self) -> HashValue {
-        let mut state = Self::Hasher::default();
-        lcs::serialize_into(&mut state, self).expect("BlockData serialization failed");
-        state.finish()
     }
 }

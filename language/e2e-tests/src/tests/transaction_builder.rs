@@ -25,7 +25,6 @@ use move_core_types::{
     language_storage::{StructTag, TypeTag},
 };
 use transaction_builder::*;
-
 #[test]
 fn register_preburn_burn() {
     // TODO: use Coin1 or Coin2 in this test instead of LBR
@@ -80,8 +79,6 @@ fn register_preburn_burn() {
 fn freeze_unfreeze_account() {
     // create a FakeExecutor with a genesis from file
     let mut executor = FakeExecutor::from_genesis_file();
-    // association account to do the actual burning
-    let association = Account::new_association();
 
     let account = {
         let data = AccountData::new(1_000_000, 0);
@@ -89,27 +86,16 @@ fn freeze_unfreeze_account() {
         data.into_account()
     };
 
-    let lbr_ty = TypeTag::Struct(StructTag {
+    let _lbr_ty = TypeTag::Struct(StructTag {
         address: account_config::CORE_CODE_ADDRESS,
         module: Identifier::new("LibraAccount").unwrap(),
         name: Identifier::new("FreezingPrivilege").unwrap(),
         type_params: vec![],
     });
-
-    // Request freezing privilege
-    executor.execute_and_apply(
-        association.signed_script_txn(encode_apply_for_association_privilege(lbr_ty.clone()), 1),
-    );
-
-    // Grant freezing privilege to assocation account
-    executor.execute_and_apply(association.signed_script_txn(
-        encode_grant_association_privilege(lbr_ty, *association.address()),
-        2,
-    ));
+    let blessed = Account::new_blessed_tc();
     // Execute freeze on account
-    executor.execute_and_apply(
-        association.signed_script_txn(encode_freeze_account(*account.address()), 3),
-    );
+    executor
+        .execute_and_apply(blessed.signed_script_txn(encode_freeze_account(*account.address()), 0));
 
     // Attempt rotate key txn from frozen account
     let privkey = Ed25519PrivateKey::generate_for_testing();
@@ -125,7 +111,7 @@ fn freeze_unfreeze_account() {
 
     // Execute unfreeze on account
     executor.execute_and_apply(
-        association.signed_script_txn(encode_unfreeze_account(*account.address()), 4),
+        blessed.signed_script_txn(encode_unfreeze_account(*account.address()), 1),
     );
     // execute rotate key transaction from unfrozen account now succeeds
     let output = &executor.execute_transaction(txn);
@@ -136,9 +122,45 @@ fn freeze_unfreeze_account() {
 }
 
 #[test]
-fn dual_attestation_payment() {
+fn create_parent_and_child_vasp() {
     let mut executor = FakeExecutor::from_genesis_file();
     let association = Account::new_association();
+    let parent = Account::new();
+    let child = Account::new();
+
+    let mut keygen = KeyGen::from_seed([9u8; 32]);
+    let (_vasp_compliance_private_key, vasp_compliance_public_key) = keygen.generate_keypair();
+
+    // create a parent VASP
+    let add_all_currencies = false;
+    executor.execute_and_apply(association.signed_script_txn(
+        encode_create_parent_vasp_account(
+            account_config::lbr_type_tag(),
+            *parent.address(),
+            parent.auth_key_prefix(),
+            vec![],
+            vec![],
+            vasp_compliance_public_key.to_bytes().to_vec(),
+            add_all_currencies,
+        ),
+        1,
+    ));
+
+    // create a child VASP
+    executor.execute_and_apply(parent.signed_script_txn(
+        encode_create_child_vasp_account(
+            account_config::lbr_type_tag(),
+            *child.address(),
+            child.auth_key_prefix(),
+            add_all_currencies,
+        ),
+        0,
+    ));
+}
+
+#[test]
+fn dual_attestation_payment() {
+    let mut executor = FakeExecutor::from_genesis_file();
     // account that will receive the dual attestation payment
     let payment_receiver = {
         let data = AccountData::new_empty();
@@ -153,17 +175,10 @@ fn dual_attestation_payment() {
     };
 
     let mut keygen = KeyGen::from_seed([9u8; 32]);
-    let (private_key, public_key) = keygen.generate_keypair();
-    // apply for the recipient to be a vasp
-    executor.execute_and_apply(payment_receiver.signed_script_txn(
-        encode_apply_for_root_vasp(vec![], vec![], public_key.to_bytes().to_vec()),
-        0,
-    ));
+    let (private_key, _public_key) = keygen.generate_keypair();
 
-    // approve the request from association account
-    executor.execute_and_apply(
-        association.signed_script_txn(encode_grant_vasp_account(*payment_receiver.address()), 1),
-    );
+    // TODO: this is testing nothing for now. make receiver and sender VASPs + add test that a bad
+    // signature fails
 
     // Do the offline protocol: generate a payment id, sign with the receiver's private key, include
     // in transaction from sender's account

@@ -29,8 +29,8 @@ use vm::file_format::CodeOffset;
 use crate::{
     boogie_helpers::{
         boogie_byte_blob, boogie_field_name, boogie_function_name, boogie_local_type,
-        boogie_struct_name, boogie_struct_type_value, boogie_type_value, boogie_type_values,
-        boogie_well_formed_check, WellFormedMode,
+        boogie_requires_well_formed, boogie_struct_name, boogie_struct_type_value,
+        boogie_type_value, boogie_type_values, boogie_well_formed_check, WellFormedMode,
     },
     cli::{Options, VerificationScope},
     spec_translator::SpecTranslator,
@@ -108,7 +108,7 @@ impl<'env> ModuleTranslator<'env> {
     /// Translates this module.
     fn translate(&mut self) {
         log!(
-            if self.module_env.is_in_dependency() {
+            if self.module_env.is_dependency() {
                 Level::Debug
             } else {
                 Level::Info
@@ -120,7 +120,8 @@ impl<'env> ModuleTranslator<'env> {
         );
         self.writer
             .set_location(&self.module_env.env.internal_loc());
-        let spec_translator = SpecTranslator::new(self.writer, &self.module_env, false);
+        let spec_translator =
+            SpecTranslator::new(self.writer, self.module_env.clone(), self.options, false);
         spec_translator.translate_spec_vars();
         spec_translator.translate_spec_funs();
         self.translate_structs();
@@ -174,13 +175,13 @@ impl<'env> ModuleTranslator<'env> {
             .map(|(i, _)| format!("$tv{}: TypeValue", i))
             .join(", ");
 
-        let mut param_types = String::from("MapConstTypeValue(DefaultTypeValue)");
+        let mut param_types = String::from("MapConstTypeValue(DefaultTypeValue())");
         let type_param_count = struct_env.get_type_parameters().len();
         for i in 0..type_param_count {
             param_types = format!("{}[{} := $tv{}]", param_types, i, i);
         }
         let type_param_array = format!("TypeValueArray({}, {})", param_types, type_param_count);
-        let mut field_types = String::from("MapConstTypeValue(DefaultTypeValue)");
+        let mut field_types = String::from("MapConstTypeValue(DefaultTypeValue())");
         for field_env in struct_env.get_fields() {
             field_types = format!(
                 "{}[{} := {}]",
@@ -227,8 +228,9 @@ impl<'env> ModuleTranslator<'env> {
         }
 
         // Emit invariant functions.
-        let spec_translator = SpecTranslator::new(self.writer, &struct_env.module_env, false);
-        spec_translator.translate_invariant_functions(&struct_env);
+        let spec_translator =
+            SpecTranslator::new(self.writer, struct_env.clone(), self.options, false);
+        spec_translator.translate_invariant_functions();
     }
 
     /// Translates struct accessors (pack/unpack).
@@ -257,7 +259,7 @@ impl<'env> ModuleTranslator<'env> {
             separate(vec![type_args_str.clone(), args_str.clone()], ", ")
         );
         self.writer.indent();
-        let mut ctor_expr = "MapConstValue(DefaultValue)".to_owned();
+        let mut ctor_expr = "MapConstValue(DefaultValue())".to_owned();
         for field_env in struct_env.get_fields() {
             let field_param =
                 &format!("{}", field_env.get_name().display(struct_env.symbol_pool()));
@@ -290,8 +292,9 @@ impl<'env> ModuleTranslator<'env> {
         );
 
         // Insert invariant code.
-        let spec_translator = SpecTranslator::new(self.writer, &struct_env.module_env, false);
-        spec_translator.emit_pack_invariants(struct_env, "$struct");
+        let spec_translator =
+            SpecTranslator::new(self.writer, struct_env.clone(), self.options, false);
+        spec_translator.emit_pack_invariants("$struct");
 
         self.writer.unindent();
         emitln!(self.writer, "}\n");
@@ -323,8 +326,9 @@ impl<'env> ModuleTranslator<'env> {
         }
 
         // Insert invariant checking code.
-        let spec_translator = SpecTranslator::new(self.writer, &struct_env.module_env, false);
-        spec_translator.emit_unpack_invariants(struct_env, "$struct");
+        let spec_translator =
+            SpecTranslator::new(self.writer, struct_env.clone(), self.options, false);
+        spec_translator.emit_unpack_invariants("$struct");
 
         self.writer.unindent();
         emitln!(self.writer, "}\n");
@@ -351,7 +355,7 @@ impl<'env> ModuleTranslator<'env> {
             self.writer.set_location(&func_env.get_loc());
             self.translate_function(&self.targets.get_target(&func_env));
         }
-        if num_fun > 0 && !self.module_env.is_in_dependency() {
+        if num_fun > 0 && !self.module_env.is_dependency() {
             debug!(
                 "{} out of {} functions have (directly or indirectly) \
                  specifications in module `{}`",
@@ -369,7 +373,7 @@ impl<'env> ModuleTranslator<'env> {
     /// Translates the given function.
     fn translate_function(&self, func_target: &FunctionTarget<'_>) {
         if func_target.is_native() {
-            if self.options.native_stubs {
+            if self.options.prover.native_stubs {
                 self.generate_function_sig(func_target, true);
                 emit!(self.writer, ";");
                 self.generate_function_spec(func_target);
@@ -380,6 +384,7 @@ impl<'env> ModuleTranslator<'env> {
 
         // generate inline function with function body
         self.generate_function_sig(func_target, true); // inlined version of function
+        self.generate_function_args_requires_well_formed(func_target);
         self.generate_function_spec(func_target);
         self.generate_inline_function_body(func_target);
         emitln!(self.writer);
@@ -392,19 +397,20 @@ impl<'env> ModuleTranslator<'env> {
         // generate the _verify version of the function which calls inline version for standalone
         // verification.
         self.generate_function_sig(func_target, false); // no inline
+        self.generate_function_args_requires_well_formed(func_target);
         self.generate_verify_function_body(func_target); // function body just calls inlined version
     }
 
     /// Determines whether we should generate the `_verify` entry point for a function, which
     /// triggers its standalone verification.
     fn should_generate_verify(&self, func_target: &FunctionTarget<'_>) -> bool {
-        if func_target.func_env.module_env.is_in_dependency() {
+        if func_target.func_env.module_env.is_dependency() {
             // Never generate verify method for functions from dependencies.
             return false;
         }
         // We look up the `verify` pragma property first in this function, then in
         // the module, and finally fall back to the value of option `--verify`.
-        let default = || match self.options.verify_scope {
+        let default = || match self.options.prover.verify_scope {
             VerificationScope::Public => func_target.func_env.is_public(),
             VerificationScope::All => true,
             VerificationScope::None => false,
@@ -468,10 +474,36 @@ impl<'env> ModuleTranslator<'env> {
         (args, rets)
     }
 
+    /// Generate preconditions to make sure procedure parameters are well formed
+    fn generate_function_args_requires_well_formed(&self, func_target: &FunctionTarget<'_>) {
+        emitln!(self.writer);
+        let num_args = func_target.get_parameter_count();
+        let mode = if func_target.is_public() {
+            // For public functions, we always include invariants in type assumptions for parameters,
+            // even for mutable references.
+            WellFormedMode::WithInvariant
+        } else {
+            WellFormedMode::Default
+        };
+        for i in 0..num_args {
+            let local_name = func_target.get_local_name(i);
+            let local_str = format!("{}", local_name.display(func_target.symbol_pool()));
+            let local_type = func_target.get_local_type(i);
+            let type_check = boogie_requires_well_formed(
+                self.module_env.env,
+                &local_str,
+                local_type,
+                mode,
+                &self.options.backend.type_requires,
+            );
+            emit!(self.writer, &type_check);
+        }
+    }
+
     /// Emit code for the function specification.
     fn generate_function_spec(&self, func_target: &FunctionTarget<'_>) {
-        emitln!(self.writer);
-        SpecTranslator::new_for_spec_in_impl(self.writer, func_target, true).translate_conditions();
+        SpecTranslator::new(self.writer, func_target.clone(), self.options, true)
+            .translate_conditions();
     }
 
     /// Emit code for spec inside function implementation.
@@ -480,7 +512,7 @@ impl<'env> ModuleTranslator<'env> {
         func_target: &FunctionTarget<'_>,
         block_id: SpecBlockId,
     ) {
-        SpecTranslator::new_for_spec_in_impl(self.writer, func_target, true)
+        SpecTranslator::new(self.writer, func_target.clone(), self.options, true)
             .translate_conditions_inside_impl(block_id);
     }
 
@@ -498,7 +530,8 @@ impl<'env> ModuleTranslator<'env> {
         emitln!(self.writer, "call $InitVerification();");
 
         // (b) assume implicit preconditions.
-        let spec_translator = SpecTranslator::new_for_spec_in_impl(self.writer, func_target, false);
+        let spec_translator =
+            SpecTranslator::new(self.writer, func_target.clone(), self.options, false);
         spec_translator.assume_preconditions();
 
         // (c) assume reference parameters to be based on the Param(i) Location, ensuring
@@ -619,23 +652,6 @@ impl<'env> ModuleTranslator<'env> {
         emitln!(self.writer, "assert !$abort_flag;");
         emitln!(self.writer, "$saved_m := $m;");
 
-        emitln!(self.writer, "\n// process and type check arguments");
-        let mode = if func_target.is_public() {
-            // For public functions, we always include invariants in type assumptions for parameters,
-            // even for mutable references.
-            WellFormedMode::WithInvariant
-        } else {
-            WellFormedMode::Default
-        };
-        for i in 0..num_args {
-            let local_name = func_target.get_local_name(i);
-            let local_str = format!("{}", local_name.display(func_target.symbol_pool()));
-            let local_type = func_target.get_local_type(i);
-            let type_check =
-                boogie_well_formed_check(self.module_env.env, &local_str, local_type, mode);
-            emit!(self.writer, &type_check);
-        }
-
         emitln!(self.writer, "\n// bytecode translation starts here");
 
         // Generate bytecode
@@ -656,7 +672,7 @@ impl<'env> ModuleTranslator<'env> {
             if ty.is_reference() {
                 emitln!(self.writer, "{} := DefaultReference;", &ret_str);
             } else {
-                emitln!(self.writer, "{} := DefaultValue;", &ret_str);
+                emitln!(self.writer, "{} := DefaultValue();", &ret_str);
             }
         }
         self.writer.unindent();
@@ -914,11 +930,15 @@ impl<'env> ModuleTranslator<'env> {
                         if callee_env.module_env.get_id()
                             != func_target.func_env.module_env.get_id()
                         {
-                            let spec_translator =
-                                SpecTranslator::new(self.writer, &callee_env.module_env, false)
-                                    .set_type_args(type_actuals.clone());
-                            spec_translator
-                                .assume_module_preconditions(&self.targets.get_target(&callee_env));
+                            let callee_target = self.targets.get_target(&callee_env).clone();
+                            let spec_translator = SpecTranslator::new(
+                                self.writer,
+                                callee_target,
+                                self.options,
+                                false,
+                            )
+                            .set_type_args(type_actuals.clone());
+                            spec_translator.assume_module_preconditions();
                         }
 
                         let mut dest_str = String::new();
@@ -1171,15 +1191,29 @@ impl<'env> ModuleTranslator<'env> {
                         );
                         emitln!(self.writer, &update_and_track_local(dest, "$tmp"));
                     }
+                    MoveTo(mid, sid, type_actuals) => {
+                        let value = srcs[0];
+                        let signer = srcs[1];
+                        let resource_type =
+                            boogie_struct_type_value(self.module_env.env, *mid, *sid, type_actuals);
+                        emitln!(
+                            self.writer,
+                            "call $MoveTo({}, {}, {});",
+                            resource_type,
+                            str_local(value),
+                            str_local(signer),
+                        );
+                        emitln!(self.writer, &propagate_abort());
+                    }
                     MoveToSender(mid, sid, type_actuals) => {
-                        let src = srcs[0];
+                        let value = srcs[0];
                         let resource_type =
                             boogie_struct_type_value(self.module_env.env, *mid, *sid, type_actuals);
                         emitln!(
                             self.writer,
                             "call $MoveToSender({}, {});",
                             resource_type,
-                            str_local(src),
+                            str_local(value),
                         );
                         emitln!(self.writer, &propagate_abort());
                     }

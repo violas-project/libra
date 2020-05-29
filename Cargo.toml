@@ -19,12 +19,12 @@ members = [
     "common/num-variants",
     "common/option-future",
     "common/proptest-helpers",
-    "common/prost-ext",
+    "common/prost-test-helpers",
+    "common/retrier",
     "common/security-logger",
     "common/stream-ratelimiter",
     "common/subscription-service",
     "common/temppath",
-    "common/util",
     "common/workspace-builder",
     "common/workspace-hack",
     "config",
@@ -44,8 +44,8 @@ members = [
     "execution/execution-correctness",
     "execution/executor",
     "execution/executor-benchmark",
+    "execution/executor-test-helpers",
     "execution/executor-types",
-    "execution/executor-utils",
     "grpc/types",
     "json-rpc",
     "json-rpc/types",
@@ -127,14 +127,26 @@ members = [
     "vm-validator",
 ]
 
-# NOTE: These members should never include crates that require fuzzing
-# features or test features. These are the crates we want built with no extra
+# NOTE: default-members is the complete list of binaries that form the "production Libra codebase". These members should
+# never include crates that require fuzzing features or test features. These are the crates we want built with no extra
 # test-only code included.
+#
+# For more, see the "Conditional compilation for tests" section in documentation/coding_guidelines.md.
 default-members = [
+    "config/config-builder",
+    "config/management",
+    "client/libra-dev",
+    "execution/db-bootstrapper",
     "testsuite/cli",
     "language/compiler",
+    "language/move-prover",
+    "language/tools/disassembler",
+    "language/tools/genesis-viewer",
     "language/tools/vm-genesis",
     "libra-node",
+    "secure/key-manager",
+    "storage/backup/backup-cli",
+    "storage/inspector",
     "storage/storage-service",
 ]
 

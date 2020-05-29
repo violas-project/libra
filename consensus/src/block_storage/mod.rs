@@ -13,6 +13,7 @@ mod block_tree;
 mod pending_votes;
 
 pub use block_store::{sync_manager::BlockRetriever, BlockStore};
+use consensus_types::sync_info::SyncInfo;
 pub use pending_votes::PendingVotes;
 
 /// Result of the vote processing. The failure case (Verification error) is returned
@@ -32,6 +33,8 @@ pub enum VoteReceptionResult {
     NewTimeoutCertificate(Arc<TimeoutCertificate>),
     /// There might be some issues adding a vote
     ErrorAddingVote(VerifyError),
+    /// The vote is not for the current round.
+    UnexpectedRound(u64, u64),
 }
 
 pub trait BlockReader: Send + Sync {
@@ -69,4 +72,7 @@ pub trait BlockReader: Send + Sync {
 
     /// Return the highest timeout certificate if available.
     fn highest_timeout_cert(&self) -> Option<Arc<TimeoutCertificate>>;
+
+    /// Return the combination of highest quorum cert, timeout cert and commit cert.
+    fn sync_info(&self) -> SyncInfo;
 }

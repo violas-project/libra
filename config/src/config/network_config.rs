@@ -20,6 +20,13 @@ use std::{collections::HashMap, convert::TryFrom, path::PathBuf, string::ToStrin
 const NETWORK_PEERS_DEFAULT: &str = "network_peers.config.toml";
 const SEED_PEERS_DEFAULT: &str = "seed_peers.toml";
 
+/// Current supported protocol negotiation handshake version.
+///
+/// See [`perform_handshake`] in `network/src/transport.rs`
+// TODO(philiphayes): ideally this constant lives somewhere in network/ ...
+// might need to extract into a separate network_constants crate or something.
+pub const HANDSHAKE_VERSION: u8 = 0;
+
 #[cfg_attr(any(test, feature = "fuzzing"), derive(Clone, PartialEq))]
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -101,6 +108,7 @@ impl NetworkConfig {
         if !self.seed_peers_file.as_os_str().is_empty() {
             let path = root_dir.full_path(&self.seed_peers_file);
             self.seed_peers = SeedPeersConfig::load_config(&path)?;
+            self.seed_peers.verify_libranet_addrs()?;
         }
         if self.advertised_address.to_string().is_empty() {
             self.advertised_address =
@@ -198,6 +206,23 @@ impl NetworkConfig {
 pub struct SeedPeersConfig {
     // All peers config. Key:a unique peer id, will be PK in future, Value: peer discovery info
     pub seed_peers: HashMap<PeerId, Vec<NetworkAddress>>,
+}
+
+impl SeedPeersConfig {
+    /// Check that all seed peer addresses look like canonical LibraNet addresses
+    pub fn verify_libranet_addrs(&self) -> Result<()> {
+        for (peer_id, addrs) in self.seed_peers.iter() {
+            for addr in addrs {
+                ensure!(
+                    addr.is_libranet_addr(),
+                    "Unexpected seed peer address format: peer_id: {}, addr: '{}'",
+                    peer_id.short_str(),
+                    addr,
+                );
+            }
+        }
+        Ok(())
+    }
 }
 
 // Leveraged to store the network keypairs together on disk separate from this config

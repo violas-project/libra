@@ -33,6 +33,7 @@ use libra_types::{
         parse_transaction_argument, Module, RawTransaction, Script, SignedTransaction,
         TransactionArgument, TransactionPayload, Version,
     },
+    vm_error::StatusCode,
     waypoint::Waypoint,
 };
 use libra_wallet::{io_utils, WalletLibrary};
@@ -345,9 +346,22 @@ impl ClientProxy {
         })?;
 
         let gas_unit_price = if space_delim_strings.len() > 3 {
-            Some(space_delim_strings[4].parse::<u64>().map_err(|error| {
+            Some(space_delim_strings[3].parse::<u64>().map_err(|error| {
                 format_parse_data_error(
                     "gas_unit_price",
+                    InputType::UnsignedInt,
+                    space_delim_strings[3],
+                    error,
+                )
+            })?)
+        } else {
+            None
+        };
+
+        let max_gas_amount = if space_delim_strings.len() > 4 {
+            Some(space_delim_strings[4].parse::<u64>().map_err(|error| {
+                format_parse_data_error(
+                    "max_gas_amount",
                     InputType::UnsignedInt,
                     space_delim_strings[4],
                     error,
@@ -357,21 +371,8 @@ impl ClientProxy {
             None
         };
 
-        let max_gas_amount = if space_delim_strings.len() > 4 {
-            Some(space_delim_strings[5].parse::<u64>().map_err(|error| {
-                format_parse_data_error(
-                    "max_gas_amount",
-                    InputType::UnsignedInt,
-                    space_delim_strings[5],
-                    error,
-                )
-            })?)
-        } else {
-            None
-        };
-
         let gas_currency_code = if space_delim_strings.len() > 5 {
-            Some(space_delim_strings[6].to_owned())
+            Some(space_delim_strings[5].to_owned())
         } else {
             None
         };
@@ -391,7 +392,7 @@ impl ClientProxy {
         self.client
             .submit_transaction(self.accounts.get_mut(sender_ref_id), txn)?;
         if is_blocking {
-            self.wait_for_transaction(sender_address, sequence_number);
+            self.wait_for_transaction(sender_address, sequence_number)?;
         }
         Ok(())
     }
@@ -598,15 +599,19 @@ impl ClientProxy {
         )?;
         self.client.submit_transaction(Some(&mut sender), txn)?;
         if is_blocking {
-            self.wait_for_transaction(sender.address, sender.sequence_number);
+            self.wait_for_transaction(sender.address, sender.sequence_number)?;
         }
         Ok(())
     }
 
     /// Waits for the next transaction for a specific address and prints it
-    pub fn wait_for_transaction(&mut self, account: AccountAddress, sequence_number: u64) {
+    pub fn wait_for_transaction(
+        &mut self,
+        account: AccountAddress,
+        sequence_number: u64,
+    ) -> Result<()> {
         let mut max_iterations = 5000;
-        print!(
+        println!(
             "waiting for {} with sequence number {}",
             account, sequence_number
         );
@@ -618,11 +623,18 @@ impl ClientProxy {
                 .get_txn_by_acc_seq(account, sequence_number - 1, true)
             {
                 Ok(Some(txn_view)) => {
-                    println!("transaction is stored!");
-                    if txn_view.events.is_empty() {
-                        println!("no events emitted");
+                    if txn_view.vm_status == StatusCode::EXECUTED {
+                        println!("transaction executed!");
+                        if txn_view.events.is_empty() {
+                            println!("no events emitted");
+                        }
+                        break Ok(());
+                    } else {
+                        break Err(format_err!(
+                            "transaction failed to execute; status: {:?}!",
+                            txn_view.vm_status
+                        ));
                     }
-                    break;
                 }
                 Err(e) => {
                     println!("Response with error: {:?}", e);
@@ -689,7 +701,7 @@ impl ClientProxy {
         }
 
         if is_blocking {
-            self.wait_for_transaction(sender_address, sender_sequence);
+            self.wait_for_transaction(sender_address, sender_sequence)?;
         }
 
         Ok(IndexAndSequence {
@@ -821,7 +833,7 @@ impl ClientProxy {
         self.temp_files.push(tmp_output_path.to_path_buf());
 
         let mut args = format!(
-            "run -p move-lang --bin move-build -- -f {} -s {} -o {}",
+            "run -p move-lang --bin move-build -- {} -s {} -o {}",
             file_path,
             address,
             tmp_output_path.display(),
@@ -873,9 +885,7 @@ impl ClientProxy {
 
         self.client.submit_transaction(None, transaction)?;
         // blocking by default (until transaction completion)
-        self.wait_for_transaction(sender_address, sender_sequence + 1);
-
-        Ok(())
+        self.wait_for_transaction(sender_address, sender_sequence + 1)
     }
 
     fn submit_program(
@@ -893,9 +903,7 @@ impl ClientProxy {
 
         self.client
             .submit_transaction(self.accounts.get_mut(sender_ref_id), txn)?;
-        self.wait_for_transaction(sender_address, sequence_number + 1);
-
-        Ok(())
+        self.wait_for_transaction(sender_address, sequence_number + 1)
     }
 
     /// Publish Move module
@@ -1334,7 +1342,7 @@ impl ClientProxy {
             self.wait_for_transaction(
                 sender_address,
                 self.faucet_account.as_ref().unwrap().sequence_number,
-            );
+            )?;
         }
         resp
     }
@@ -1369,7 +1377,7 @@ impl ClientProxy {
         }
         let sequence_number = body.parse::<u64>()?;
         if is_blocking {
-            self.wait_for_transaction(association_address(), sequence_number);
+            self.wait_for_transaction(association_address(), sequence_number)?;
         }
 
         Ok(())

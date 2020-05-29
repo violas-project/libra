@@ -8,7 +8,7 @@ use libra_global_constants::{
     OWNER_KEY, PREFERRED_ROUND, VALIDATOR_NETWORK_KEY, WAYPOINT,
 };
 use libra_network_address::NetworkAddress;
-use libra_secure_storage::{NamespacedStorage, OnDiskStorage, Policy, Storage, Value};
+use libra_secure_storage::{NamespacedStorage, OnDiskStorage, Storage, Value};
 use libra_types::{account_address::AccountAddress, transaction::Transaction, waypoint::Waypoint};
 use std::fs::File;
 use structopt::StructOpt;
@@ -35,15 +35,14 @@ impl StorageHelper {
     }
 
     pub fn initialize(&self, namespace: String) {
-        let policy = Policy::public();
         let mut storage = self.storage(namespace);
 
-        storage.create_key(ASSOCIATION_KEY, &policy).unwrap();
-        storage.create_key(CONSENSUS_KEY, &policy).unwrap();
-        storage.create_key(FULLNODE_NETWORK_KEY, &policy).unwrap();
-        storage.create_key(OWNER_KEY, &policy).unwrap();
-        storage.create_key(OPERATOR_KEY, &policy).unwrap();
-        storage.create_key(VALIDATOR_NETWORK_KEY, &policy).unwrap();
+        storage.create_key(ASSOCIATION_KEY).unwrap();
+        storage.create_key(CONSENSUS_KEY).unwrap();
+        storage.create_key(FULLNODE_NETWORK_KEY).unwrap();
+        storage.create_key(OWNER_KEY).unwrap();
+        storage.create_key(OPERATOR_KEY).unwrap();
+        storage.create_key(VALIDATOR_NETWORK_KEY).unwrap();
 
         storage.set(EPOCH, Value::U64(0)).unwrap();
         storage.set(LAST_VOTED_ROUND, Value::U64(0)).unwrap();
@@ -160,7 +159,7 @@ impl StorageHelper {
     pub fn set_layout(&self, path: &str, namespace: &str) -> Result<crate::layout::Layout, Error> {
         let args = format!(
             "
-                validator_config
+                management
                 set-layout
                 --path {path}
                 --backend backend={backend};\
@@ -215,7 +214,7 @@ impl StorageHelper {
     pub fn verify(&self, namespace: &str) -> Result<String, Error> {
         let args = format!(
             "
-                validator_config
+                management
                 verify
                 --backend backend={backend};\
                     path={path};\

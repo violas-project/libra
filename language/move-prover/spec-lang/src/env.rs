@@ -37,7 +37,10 @@ use crate::{
     symbol::{Symbol, SymbolPool},
     ty::{PrimitiveType, Type},
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ffi::OsStr,
+};
 use vm::{file_format::Bytecode, CompiledModule};
 
 // =================================================================================================
@@ -147,6 +150,10 @@ pub struct SpecVarId(RawIndex);
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
 pub struct NodeId(RawIndex);
 
+/// A global id. Instances of this type represent unique identifiers relative to `GlobalEnv`.
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Clone, Copy)]
+pub struct GlobalId(usize);
+
 impl FunId {
     pub fn new(sym: Symbol) -> Self {
         Self(sym)
@@ -211,6 +218,10 @@ impl NodeId {
     pub fn new(idx: usize) -> Self {
         Self(idx as RawIndex)
     }
+
+    pub fn as_usize(self) -> usize {
+        self.0 as usize
+    }
 }
 
 impl ModuleId {
@@ -220,6 +231,16 @@ impl ModuleId {
 
     pub fn to_usize(self) -> usize {
         self.0 as usize
+    }
+}
+
+impl GlobalId {
+    pub fn new(idx: usize) -> Self {
+        Self(idx)
+    }
+
+    pub fn as_usize(self) -> usize {
+        self.0
     }
 }
 
@@ -260,6 +281,8 @@ pub struct GlobalEnv {
     symbol_pool: SymbolPool,
     /// List of loaded modules, in order they have been provided using `add`.
     module_data: Vec<ModuleData>,
+    /// A counter for issuing global ids.
+    global_id_counter: RefCell<usize>,
 }
 
 impl GlobalEnv {
@@ -296,7 +319,16 @@ impl GlobalEnv {
             diags: RefCell::new(vec![]),
             symbol_pool: SymbolPool::new(),
             module_data: vec![],
+            global_id_counter: RefCell::new(0),
         }
+    }
+
+    /// Create a new global id unique to this environment.
+    pub fn new_global_id(&self) -> GlobalId {
+        let mut counter = self.global_id_counter.borrow_mut();
+        let id = GlobalId::new(*counter);
+        *counter += 1;
+        id
     }
 
     /// Returns a reference to the symbol pool owned by this environment.
@@ -337,6 +369,12 @@ impl GlobalEnv {
     /// Adds an error to this environment, without notes.
     pub fn error(&self, loc: &Loc, msg: &str) {
         self.error_with_notes(loc, msg, vec![]);
+    }
+
+    /// Adds a warning to this environment.
+    pub fn warn(&self, loc: &Loc, msg: &str) {
+        let diag = Diagnostic::new_warning(msg, Label::new(loc.file_id, loc.span, ""));
+        self.add_diag(diag);
     }
 
     /// Returns the unknown location.
@@ -420,9 +458,34 @@ impl GlobalEnv {
             .any(|d| d.severity >= Severity::Error)
     }
 
-    /// Writes accumulated diagnostics to writer.
+    /// Returns true if diagnostics have warning severity or worse.
+    pub fn has_warnings(&self) -> bool {
+        self.diags
+            .borrow()
+            .iter()
+            .any(|d| d.severity >= Severity::Warning)
+    }
+
+    /// Writes accumulated errors to writer.
     pub fn report_errors<W: WriteColor>(&self, writer: &mut W) {
-        for diag in self.diags.borrow().iter() {
+        for diag in self
+            .diags
+            .borrow()
+            .iter()
+            .filter(|d| d.severity >= Severity::Error)
+        {
+            emit(writer, &Config::default(), &self.source_files, diag).expect("emit must not fail");
+        }
+    }
+
+    /// Writes accumulated diagnostics with warning severity or worse to writer.
+    pub fn report_warnings<W: WriteColor>(&self, writer: &mut W) {
+        for diag in self
+            .diags
+            .borrow()
+            .iter()
+            .filter(|d| d.severity >= Severity::Warning)
+        {
             emit(writer, &Config::default(), &self.source_files, diag).expect("emit must not fail");
         }
     }
@@ -774,9 +837,15 @@ impl<'env> ModuleEnv<'env> {
     }
 
     /// Returns true of this module is from a dependency, i.e. not the target of verification.
-    pub fn is_in_dependency(&self) -> bool {
+    pub fn is_dependency(&self) -> bool {
         let file_id = self.data.loc.file_id;
         self.env.file_id_is_dep.contains(&file_id)
+    }
+
+    /// Returns the path to source file of this module.
+    pub fn get_source_path(&self) -> &OsStr {
+        let file_id = self.data.loc.file_id;
+        self.env.source_files.name(file_id)
     }
 
     /// Returns documentation associated with this module.
@@ -1028,6 +1097,15 @@ impl<'env> ModuleEnv<'env> {
         self.data.spec_vars.get(&id).expect("spec var id defined")
     }
 
+    /// Find spec var by name.
+    pub fn find_spec_var(&self, name: Symbol) -> Option<&SpecVarDecl> {
+        self.data
+            .spec_vars
+            .iter()
+            .find(|(_, svar)| svar.name == name)
+            .map(|(_, svar)| svar)
+    }
+
     /// Returns specification functions of this module.
     pub fn get_spec_funs(&'env self) -> impl Iterator<Item = (&'env SpecFunId, &'env SpecFunDecl)> {
         self.data.spec_funs.iter()
@@ -1258,10 +1336,10 @@ impl<'env> StructEnv<'env> {
                     .get_struct_source_map(self.data.def_idx)
                     .ok()
                     .and_then(|smap| smap.type_parameters.get(i))
-                    .map(|(s, _)| s.as_str())
-                    .unwrap_or_else(|| "?");
+                    .map(|(s, _)| s.clone())
+                    .unwrap_or_else(|| format!("unknown#{}", i));
                 TypeParameter(
-                    self.module_env.env.symbol_pool.make(name),
+                    self.module_env.env.symbol_pool.make(&name),
                     TypeConstraint::from(*k),
                 )
             })
@@ -1546,10 +1624,10 @@ impl<'env> FunctionEnv<'env> {
                     .get_function_source_map(self.data.def_idx)
                     .ok()
                     .and_then(|fmap| fmap.type_parameters.get(i))
-                    .map(|(s, _)| s.as_str())
-                    .unwrap_or_else(|| "?");
+                    .map(|(s, _)| s.clone())
+                    .unwrap_or_else(|| format!("unknown#{}", i));
                 TypeParameter(
-                    self.module_env.env.symbol_pool.make(name),
+                    self.module_env.env.symbol_pool.make(&name),
                     TypeConstraint::from(*k),
                 )
             })

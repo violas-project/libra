@@ -2,9 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use crate::{
-    adapter::local_storage::LocalStorage,
     backup::{backup_account_state, BackupServiceClient},
     restore::restore_account_state,
+    storage::local_fs::LocalFs,
 };
 use backup_service::start_backup_service;
 use libra_config::config::NodeConfig;
@@ -42,32 +42,28 @@ fn tmp_db_with_random_content() -> (TempPath, LibraDB) {
 
 #[test]
 fn end_to_end() {
-    let (_src_db_dir, db_src) = tmp_db_with_random_content();
-    let db_src = Arc::new(db_src);
+    let (_src_db_dir, src_db) = tmp_db_with_random_content();
+    let src_db = Arc::new(src_db);
     let tgt_db_dir = TempPath::new();
     let backup_dir = TempPath::new();
     backup_dir.create_as_dir().unwrap();
-    let adaptor = LocalStorage::new(backup_dir.path().to_path_buf());
+    let store = LocalFs::new(backup_dir.path().to_path_buf());
 
     let config = NodeConfig::random();
-    let mut rt = start_backup_service(config.storage.backup_service_port, db_src);
+    let mut rt = start_backup_service(config.storage.backup_service_port, src_db);
     let client = BackupServiceClient::new(config.storage.backup_service_port);
     let (version, state_root_hash) = rt.block_on(client.get_latest_state_root()).unwrap();
     let handles = rt
-        .block_on(backup_account_state(
-            &client,
-            version,
-            &adaptor,
-            1024 * 1024,
-        ))
+        .block_on(backup_account_state(&client, version, &store, 500))
         .unwrap();
 
-    restore_account_state(
+    rt.block_on(restore_account_state(
         PRE_GENESIS_VERSION,
         state_root_hash,
         &tgt_db_dir,
-        handles.into_iter().map(Ok),
-    );
+        handles.into_iter(),
+    ))
+    .unwrap();
     let tgt_db = LibraDB::open(
         &tgt_db_dir,
         true, /* readonly */

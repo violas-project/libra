@@ -6,7 +6,8 @@ use libra_crypto::HashValue;
 use libra_types::{
     account_config::{
         AccountResource, BalanceResource, BurnEvent, CancelBurnEvent, CurrencyInfoResource,
-        MintEvent, PreburnEvent, ReceivedPaymentEvent, SentPaymentEvent,
+        MintEvent, NewBlockEvent, NewEpochEvent, PreburnEvent, ReceivedPaymentEvent,
+        SentPaymentEvent, UpgradeEvent,
     },
     account_state_blob::AccountStateWithProof,
     contract_event::ContractEvent,
@@ -108,6 +109,16 @@ pub enum EventDataView {
         receiver: BytesView,
         metadata: BytesView,
     },
+    #[serde(rename = "upgrade")]
+    Upgrade { write_set: BytesView },
+    #[serde(rename = "newepoch")]
+    NewEpoch { epoch: u64 },
+    #[serde(rename = "newblock")]
+    NewBlock {
+        round: u64,
+        proposer: BytesView,
+        proposed_time: u64,
+    },
     #[serde(rename = "unknown")]
     Unknown {},
 }
@@ -162,7 +173,7 @@ impl From<(u64, ContractEvent)> for EventView {
                     preburn_address,
                 })
             } else {
-                Err(format_err!("Unable to parse BurnEvent"))
+                Err(format_err!("Unable to parse CancelBurnEvent"))
             }
         } else if event.type_tag() == &TypeTag::Struct(MintEvent::struct_tag()) {
             if let Ok(mint_event) = MintEvent::try_from(&event) {
@@ -183,7 +194,33 @@ impl From<(u64, ContractEvent)> for EventView {
                     preburn_address,
                 })
             } else {
-                Err(format_err!("Unable to parse BurnEvent"))
+                Err(format_err!("Unable to parse PreBurnEvent"))
+            }
+        } else if event.type_tag() == &TypeTag::Struct(NewBlockEvent::struct_tag()) {
+            if let Ok(new_block_event) = NewBlockEvent::try_from(&event) {
+                Ok(EventDataView::NewBlock {
+                    proposer: BytesView::from(new_block_event.proposer().as_ref()),
+                    round: new_block_event.round(),
+                    proposed_time: new_block_event.proposed_time(),
+                })
+            } else {
+                Err(format_err!("Unable to parse NewBlockEvent"))
+            }
+        } else if event.type_tag() == &TypeTag::Struct(NewEpochEvent::struct_tag()) {
+            if let Ok(new_epoch_event) = NewEpochEvent::try_from(&event) {
+                Ok(EventDataView::NewEpoch {
+                    epoch: new_epoch_event.epoch(),
+                })
+            } else {
+                Err(format_err!("Unable to parse NewEpochEvent"))
+            }
+        } else if event.type_tag() == &TypeTag::Struct(UpgradeEvent::struct_tag()) {
+            if let Ok(upgrade_event) = UpgradeEvent::try_from(&event) {
+                Ok(EventDataView::Upgrade {
+                    write_set: BytesView::from(upgrade_event.write_set()),
+                })
+            } else {
+                Err(format_err!("Unable to parse UpgradeEvent"))
             }
         } else {
             Err(format_err!("Unknown events"))
@@ -366,7 +403,7 @@ impl From<TransactionPayload> for ScriptView {
                     Err(format_err!("Unable to parse PeerToPeer arguments"))
                 }
             }
-            "mint_transaction" => {
+            "mint" | "mint_lbr_to_address" => {
                 if let [TransactionArgument::Address(receiver), TransactionArgument::U8Vector(auth_key_prefix), TransactionArgument::U64(amount)] =
                     &args[..]
                 {
@@ -474,10 +511,14 @@ impl TryFrom<AccountStateProof> for AccountStateProofView {
     fn try_from(account_state_proof: AccountStateProof) -> Result<AccountStateProofView, Error> {
         Ok(AccountStateProofView {
             ledger_info_to_transaction_info_proof: BytesView::from(&lcs::to_bytes(
-                account_state_proof.ledger_info_to_transaction_info_proof(),
+                account_state_proof
+                    .transaction_info_with_proof()
+                    .ledger_info_to_transaction_info_proof(),
             )?),
             transaction_info: BytesView::from(&lcs::to_bytes(
-                account_state_proof.transaction_info(),
+                account_state_proof
+                    .transaction_info_with_proof()
+                    .transaction_info(),
             )?),
             transaction_info_to_account_proof: BytesView::from(&lcs::to_bytes(
                 account_state_proof.transaction_info_to_account_proof(),

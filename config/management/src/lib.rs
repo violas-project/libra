@@ -33,7 +33,6 @@ pub mod constants {
     pub const MAX_GAS_AMOUNT: u64 = 1_000_000;
     pub const GAS_CURRENCY_CODE: &str = LBR_NAME;
     pub const TXN_EXPIRATION_SECS: u64 = 3600;
-    pub const HANDSHAKE_VERSION: u8 = 0;
 }
 
 #[derive(Debug, StructOpt)]
@@ -209,7 +208,10 @@ pub struct SecureBackends {
     /// backends are represented as a semi-colon deliminted key value
     /// pair: "k0=v0;k1=v1;...".  The current supported formats are:
     ///     Vault: "backend=vault;server=URL;token=PATH_TO_TOKEN"
-    ///         vault has an optional namespace: "namespace=NAMESPACE"
+    ///         an optional namespace: "namespace=NAMESPACE"
+    ///         an optional server certificate: "ca_certificate=PATH_TO_CERT"
+    ///     GitHub: "backend=github;owner=OWNER;repository=REPOSITORY;token=PATH_TO_TOKEN"
+    ///         an optional namespace: "namespace=NAMESPACE"
     ///     InMemory: "backend=memory"
     ///     OnDisk: "backend=disk;path=LOCAL_PATH"
     #[structopt(long, verbatim_doc_comment)]
@@ -226,7 +228,10 @@ pub struct SingleBackend {
     /// deliminted key value pair: "k0=v0;k1=v1;...".
     /// The current supported formats are:
     ///     Vault: "backend=vault;server=URL;token=PATH_TO_TOKEN"
-    ///         vault has an optional namespace: "namespace=NAMESPACE"
+    ///         an optional namespace: "namespace=NAMESPACE"
+    ///         an optional server certificate: "ca_certificate=PATH_TO_CERT"
+    ///     GitHub: "backend=github;owner=OWNER;repository=REPOSITORY;token=PATH_TO_TOKEN"
+    ///         an optional namespace: "namespace=NAMESPACE"
     ///     InMemory: "backend=memory"
     ///     OnDisk: "backend=disk;path=LOCAL_PATH"
     #[structopt(long, verbatim_doc_comment)]

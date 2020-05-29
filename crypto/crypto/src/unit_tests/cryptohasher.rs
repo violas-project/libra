@@ -5,7 +5,7 @@
 
 use crate as libra_crypto;
 use crate::{
-    hash::{CryptoHash, CryptoHasher, LIBRA_HASH_SUFFIX},
+    hash::{CryptoHash, CryptoHasher, LIBRA_HASH_PREFIX},
     HashValue,
 };
 use libra_crypto_derive::{CryptoHasher, LCSCryptoHash};
@@ -22,6 +22,14 @@ pub struct Foo {
 // Used for testing the seed in FooHasher.
 pub struct Bar {}
 
+// Complex example with generics and serde-rename.
+#[derive(Serialize, Deserialize, CryptoHasher, LCSCryptoHash)]
+#[serde(rename = "Foo")]
+pub struct Baz<T> {
+    a: T,
+    b: u32,
+}
+
 impl CryptoHash for Bar {
     type Hasher = FooHasher;
 
@@ -33,51 +41,43 @@ impl CryptoHash for Bar {
 
 #[test]
 fn test_cryptohasher_name() {
-    let mut name = "libra_crypto::unit_tests::cryptohasher::Foo"
-        .as_bytes()
-        .to_vec();
-    name.extend_from_slice(LIBRA_HASH_SUFFIX);
+    let mut salt = LIBRA_HASH_PREFIX.to_vec();
+    salt.extend_from_slice(b"Foo");
 
     let value = Bar {};
     let expected = {
         let mut digest = Sha3::v256();
-        digest.update(HashValue::from_sha3_256(&name[..]).as_ref());
+        digest.update(HashValue::from_sha3_256(&salt[..]).as_ref());
         let mut hasher_bytes = [0u8; 32];
         digest.finalize(&mut hasher_bytes);
         hasher_bytes
     };
     let actual = CryptoHash::hash(&value);
-    assert_eq!(
-        &expected,
-        actual.as_ref(),
-        "\nexpected: {} actual: {}",
-        String::from_utf8_lossy(&expected),
-        String::from_utf8_lossy(actual.as_ref())
-    );
+    assert_eq!(&expected, actual.as_ref());
 }
 
 #[test]
 fn test_lcs_cryptohash() {
-    let mut name = "libra_crypto::unit_tests::cryptohasher::Foo"
-        .as_bytes()
-        .to_vec();
-    name.extend_from_slice(LIBRA_HASH_SUFFIX);
+    let mut salt = LIBRA_HASH_PREFIX.to_vec();
+    salt.extend_from_slice(b"Foo");
 
     let value = Foo { a: 5, b: 1025 };
     let expected = {
         let mut digest = Sha3::v256();
-        digest.update(HashValue::from_sha3_256(&name[..]).as_ref());
+        digest.update(HashValue::from_sha3_256(&salt[..]).as_ref());
         digest.update(&lcs::to_bytes(&value).unwrap());
         let mut hasher_bytes = [0u8; 32];
         digest.finalize(&mut hasher_bytes);
         hasher_bytes
     };
     let actual = CryptoHash::hash(&value);
-    assert_eq!(
-        &expected,
-        actual.as_ref(),
-        "\nexpected: {} actual: {}",
-        String::from_utf8_lossy(&expected),
-        String::from_utf8_lossy(actual.as_ref())
-    );
+    assert_eq!(&expected, actual.as_ref());
+}
+
+#[test]
+fn test_lcs_cryptohash_with_generics() {
+    let value = Baz { a: 5u64, b: 1025 };
+    let expected = CryptoHash::hash(&Foo { a: 5, b: 1025 });
+    let actual = CryptoHash::hash(&value);
+    assert_eq!(expected, actual);
 }

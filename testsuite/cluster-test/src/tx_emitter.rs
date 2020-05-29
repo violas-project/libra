@@ -36,15 +36,13 @@ use tokio::runtime::Handle;
 use futures::future::{try_join_all, FutureExt};
 use libra_json_rpc_client::JsonRpcAsyncClient;
 use libra_types::transaction::SignedTransaction;
-use reqwest::{Client, Url};
+use reqwest::Client;
 use std::{
     cmp::{max, min},
     ops::Sub,
-    str::FromStr,
     sync::atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::{task::JoinHandle, time};
-use util::retry;
 
 const MAX_TXN_BATCH_SIZE: usize = 100; // Max transactions per account in mempool
 
@@ -318,11 +316,7 @@ impl TxEmitter {
     }
 
     fn make_client(&self, instance: &Instance) -> JsonRpcAsyncClient {
-        JsonRpcAsyncClient::new_with_client(
-            self.http_client.clone(),
-            Url::from_str(format!("http://{}:{}", instance.ip(), instance.ac_port()).as_str())
-                .expect("Invalid URL."),
-        )
+        JsonRpcAsyncClient::new_with_client(self.http_client.clone(), instance.json_rpc_url())
     }
 
     pub async fn emit_txn_for(
@@ -651,7 +645,7 @@ async fn execute_and_wait_transactions(
         account.address
     );
     for request in txn {
-        retry::retry_async(retry::fixed_retry_strategy(5_000, 20), || {
+        libra_retrier::retry_async(libra_retrier::fixed_retry_strategy(5_000, 20), || {
             let request = request.clone();
             let c = client.clone();
             let client_name = format!("{:?}", client);

@@ -7,9 +7,9 @@ use crate::{
     executor::FakeExecutor,
 };
 use libra_types::vm_error::{StatusCode, VMStatus};
-use libra_vm::{data_cache::StateViewCache, LibraVM};
+use libra_vm::{data_cache::StateViewCache, transaction_metadata::TransactionMetadata, LibraVM};
 use move_core_types::gas_schedule::{GasAlgebra, GasPrice, GasUnits};
-use move_vm_types::{gas_schedule::zero_cost_schedule, transaction_metadata::TransactionMetadata};
+use move_vm_types::gas_schedule::zero_cost_schedule;
 
 #[test]
 fn failed_transaction_cleanup_test() {
@@ -39,7 +39,7 @@ fn failed_transaction_cleanup_test() {
         &account::lbr_currency_code(),
     );
     assert!(!out1.write_set().is_empty());
-    assert!(out1.gas_used() == 180_000);
+    assert_eq!(out1.gas_used(), 90_000);
     assert!(!out1.status().is_discarded());
     assert_eq!(
         out1.status().vm_status().major_status,

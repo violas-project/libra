@@ -4,10 +4,8 @@
 use crate::{BuildSwarm, Error, ValidatorConfig};
 use anyhow::{ensure, Result};
 use libra_config::{
-    config::{
-        NetworkPeersConfig, NodeConfig, PeerNetworkId, RoleType, SeedPeersConfig, UpstreamConfig,
-    },
-    utils,
+    config::{NetworkPeersConfig, NodeConfig, PeerNetworkId, RoleType, UpstreamConfig},
+    generator, utils,
 };
 use libra_crypto::ed25519::Ed25519PrivateKey;
 use libra_network_address::NetworkAddress;
@@ -123,8 +121,14 @@ impl FullNodeConfig {
 
     pub fn build(&self) -> Result<NodeConfig> {
         let (mut configs, _) = self.build_internal(false)?;
+
         let validator_config = configs.last().ok_or(Error::NoConfigs)?;
-        let seed_peers = self.build_seed_peers(&validator_config)?;
+        let seed_config = &validator_config
+            .full_node_networks
+            .last()
+            .ok_or(Error::MissingFullNodeNetwork)?;
+        let seed_peers = generator::build_seed_peers(&seed_config, self.bootstrap.clone());
+
         let mut config = configs.swap_remove(self.full_node_index);
         let network = &mut config
             .full_node_networks
@@ -139,8 +143,14 @@ impl FullNodeConfig {
 
     pub fn extend_validator(&self, config: &mut NodeConfig) -> Result<()> {
         let (mut configs, _) = self.build_internal(false)?;
+
         let mut new_net = configs.swap_remove(configs.len() - 1);
-        let seed_peers = self.build_seed_peers(&new_net)?;
+        let seed_config = &new_net
+            .full_node_networks
+            .last()
+            .ok_or(Error::MissingFullNodeNetwork)?;
+        let seed_peers = generator::build_seed_peers(&seed_config, self.bootstrap.clone());
+
         let mut network = new_net.full_node_networks.swap_remove(0);
         network.advertised_address = self.advertised.clone();
         network.listen_address = self.listen.clone();
@@ -227,7 +237,8 @@ impl FullNodeConfig {
             .full_node_networks
             .last()
             .ok_or(Error::MissingFullNodeNetwork)?;
-        let seed_peers = self.build_seed_peers(&validator_full_node_config)?;
+        let seed_peers =
+            generator::build_seed_peers(&validator_full_node_network, self.bootstrap.clone());
         let upstream_peer_id = validator_full_node_network.peer_id;
         for config in configs.iter_mut() {
             let network = config
@@ -244,16 +255,6 @@ impl FullNodeConfig {
         }
 
         Ok((configs, faucet_key))
-    }
-
-    fn build_seed_peers(&self, config: &NodeConfig) -> Result<SeedPeersConfig> {
-        let network = config
-            .full_node_networks
-            .last()
-            .ok_or(Error::MissingFullNodeNetwork)?;
-        let mut seed_peers = HashMap::new();
-        seed_peers.insert(network.peer_id, vec![self.bootstrap.clone()]);
-        Ok(SeedPeersConfig { seed_peers })
     }
 }
 
@@ -275,10 +276,13 @@ mod test {
         // should be the bootstrap
         let config = FullNodeConfig::new().build().unwrap();
         let network = &config.full_node_networks[0];
-        let (seed_peer_id, seed_peer_ips) = network.seed_peers.seed_peers.iter().next().unwrap();
+
+        network.seed_peers.verify_libranet_addrs().unwrap();
+        let (seed_peer_id, seed_addrs) = network.seed_peers.seed_peers.iter().next().unwrap();
+        assert_eq!(seed_addrs.len(), 1);
         assert_ne!(&network.peer_id, seed_peer_id);
-        // This is true because  we didn't update the DEFAULT_ADVERTISED
-        assert_eq!(network.advertised_address, seed_peer_ips[0]);
+        assert_ne!(&network.advertised_address, &seed_addrs[0]);
+
         assert_eq!(
             network.advertised_address,
             NetworkAddress::from_str(DEFAULT_ADVERTISED).unwrap()
@@ -287,6 +291,7 @@ mod test {
             network.listen_address,
             NetworkAddress::from_str(DEFAULT_LISTEN).unwrap()
         );
+
         assert!(config.execution.genesis.is_some());
     }
 

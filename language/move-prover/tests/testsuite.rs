@@ -14,9 +14,9 @@ use test_utils::{baseline_test::verify_or_update_baseline, extract_test_directiv
 #[allow(unused_imports)]
 use log::warn;
 
-const STDLIB_FLAGS: &[&str] = &["--search-path=../stdlib/modules"];
-const STDLIB_FLAGS_UNVERIFIED: &[&str] = &["--search-path=../stdlib/modules", "--verify=none"];
-const LEGACY_STDLIB_FLAGS: &[&str] = &["--search-path=tests/sources/stdlib/modules"];
+const STDLIB_FLAGS: &[&str] = &["--dependency=../stdlib/modules"];
+const STDLIB_FLAGS_UNVERIFIED: &[&str] = &["--dependency=../stdlib/modules", "--verify=none"];
+const LEGACY_STDLIB_FLAGS: &[&str] = &["--dependency=tests/sources/stdlib/modules"];
 
 fn test_runner(path: &Path) -> datatest_stable::Result<()> {
     let no_boogie = read_env_var("BOOGIE_EXE").is_empty() || read_env_var("Z3_EXE").is_empty();
@@ -28,13 +28,12 @@ fn test_runner(path: &Path) -> datatest_stable::Result<()> {
     args.push("--verbose=warn".to_owned());
     args.push(path.to_string_lossy().to_string());
 
-    let mut options = Options::default();
-    options.initialize_from_args(&args)?;
+    let mut options = Options::create_from_args(&args)?;
     options.setup_logging_for_test();
     if no_boogie {
-        options.generate_only = true;
+        options.prover.generate_only = true;
     }
-    options.stable_test_output = true;
+    options.prover.stable_test_output = true;
 
     let temp_path = TempPath::new();
     temp_path.create_as_dir()?;
@@ -86,7 +85,7 @@ fn get_flags(path: &Path) -> anyhow::Result<(Vec<String>, Option<PathBuf>)> {
         (LEGACY_STDLIB_FLAGS, Some(path.with_extension("exp")))
     } else {
         return Err(anyhow!(
-            "do not know how to run tests for `{}` because its directory is not configured",
+            "do not know how to run tests for `{}` because it's directory is not configured",
             path_str
         ));
     };

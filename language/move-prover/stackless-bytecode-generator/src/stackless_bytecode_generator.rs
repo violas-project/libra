@@ -1027,9 +1027,35 @@ impl<'a> StacklessBytecodeGenerator<'a> {
                 ));
             }
 
-            MoveBytecode::MoveTo(_) => unimplemented!("Not yet supported instruction: MoveTo"),
-            MoveBytecode::MoveToGeneric(_) => {
-                unimplemented!("Not yet supported instruction: MoveToGeneric")
+            MoveBytecode::MoveTo(idx) => {
+                let value_operand_index = self.temp_stack.pop().unwrap();
+                let signer_operand_index = self.temp_stack.pop().unwrap();
+                self.code.push(mk_call(
+                    Operation::MoveTo(
+                        self.func_env.module_env.get_id(),
+                        self.func_env.module_env.get_struct_id(*idx),
+                        vec![],
+                    ),
+                    vec![],
+                    vec![value_operand_index, signer_operand_index],
+                ));
+            }
+
+            MoveBytecode::MoveToGeneric(idx) => {
+                let struct_instantiation = self.module.struct_instantiation_at(*idx);
+                let value_operand_index = self.temp_stack.pop().unwrap();
+                let signer_operand_index = self.temp_stack.pop().unwrap();
+                self.code.push(mk_call(
+                    Operation::MoveTo(
+                        self.func_env.module_env.get_id(),
+                        self.func_env
+                            .module_env
+                            .get_struct_id(struct_instantiation.def),
+                        self.get_type_params(struct_instantiation.type_parameters),
+                    ),
+                    vec![],
+                    vec![value_operand_index, signer_operand_index],
+                ));
             }
 
             MoveBytecode::GetTxnSenderAddress => {
